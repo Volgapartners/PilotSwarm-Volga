@@ -190,7 +190,7 @@ function updateContextUsageFromEvents(
  *
  * @internal
  */
-export const CURRENT_ORCHESTRATION_VERSION = "1.0.30";
+export const CURRENT_ORCHESTRATION_VERSION = "1.0.29";
 
 /**
  * Long-lived durable session orchestration.
@@ -208,13 +208,13 @@ export const CURRENT_ORCHESTRATION_VERSION = "1.0.30";
  *
  * @internal
  */
-export function* durableSessionOrchestration_1_0_30(
+export function* durableSessionOrchestration_1_0_29(
     ctx: any,
     input: OrchestrationInput,
 ): Generator<any, string, any> {
     const rawTraceInfo = typeof ctx.traceInfo === "function" ? ctx.traceInfo.bind(ctx) : null;
     if (rawTraceInfo) {
-        ctx.traceInfo = (message: string) => rawTraceInfo(`[v1.0.30] ${message}`);
+        ctx.traceInfo = (message: string) => rawTraceInfo(`[v1.0.29] ${message}`);
     }
     const dehydrateThreshold = input.dehydrateThreshold ?? 30;
     const idleTimeout = input.idleTimeout ?? 30;
@@ -640,7 +640,8 @@ export function* durableSessionOrchestration_1_0_30(
                                 };
                                 yield* writeCommandResponse(resp);
                                 publishStatus("idle");
-                                continue;
+                                yield versionedContinueAsNew(continueInput());
+                                return "";
                             }
                             case "list_models": {
                                 publishStatus("idle", { cmdProcessing: cmdMsg.id });
