@@ -551,6 +551,7 @@ function showArtifactPicker() {
 const _promptAttachments = []; // [{ path, displayName, sessionId }]
 
 let _fileAttachModal = false;
+let _modelPickerModal = false;
 
 function showFileAttachPrompt() {
     _fileAttachModal = true;
@@ -2634,6 +2635,9 @@ inputBar._updateCursor = function updatePromptCursor(get) {
 inputBar._listener = function promptInputListener(ch, key) {
     if (!key) return;
 
+    // Block input when a modal picker (model switcher, file attach) is open
+    if (_modelPickerModal) return;
+
     // When the slash picker is open, delegate navigation keys to it
     if (slashPicker && slashPicker._pickerKeyHandler) {
         if (key.name === "up" || key.name === "down" ||
@@ -2854,10 +2858,16 @@ function showSlashPicker() {
             }
             const cmd = slashPickerFiltered[slashPickerSelectedIdx];
             dismissSlashPicker();
-            setInputValue(cmd.name + (cmd.name === "/model" ? " " : ""));
-            focusInput();
-            screen.render();
-            if (cmd.name !== "/model") {
+            if (cmd.name === "/model") {
+                // /model needs further input — keep input focused with partial value
+                setInputValue(cmd.name + " ");
+                focusInput();
+                screen.render();
+            } else {
+                // All other commands: execute immediately
+                // Don't focusInput() first — handleInput may show its own picker
+                setInputValue("");
+                screen.render();
                 handleInput(cmd.name);
             }
         } else if (key.name === "escape") {
@@ -6405,11 +6415,84 @@ async function ensureOrchestrationStarted(orchId = activeOrchId) {
     await new Promise(r => setTimeout(r, 1000));
 }
 
+// ─── Model picker ────────────────────────────────────────────────
+
+function showModelPicker(dc) {
+    const items = [];
+    const modelMap = new Map();
+    const byProvider = modelProviders.getModelsByProvider();
+    for (const group of byProvider) {
+        items.push(`{bold}{white-fg}── ${group.providerId} (${group.type}) ──{/white-fg}{/bold}`);
+        modelMap.set(items.length - 1, null); // header row
+        for (const m of group.models) {
+            const costTag = m.cost ? ` [${m.cost}]` : "";
+            const activeModel = sessionModels.get(activeOrchId) || currentModel;
+            const marker = m.qualifiedName === activeModel ? " ← current" : "";
+            items.push(`  ${m.qualifiedName}${costTag}${marker}`);
+            modelMap.set(items.length - 1, m.qualifiedName);
+        }
+    }
+
+    const picker = blessed.list({
+        parent: screen,
+        label: " {bold}Switch model{/bold} ",
+        tags: true,
+        top: "center",
+        left: "center",
+        width: Math.min(80, screen.width - 4),
+        height: Math.min(items.length + 2, 20),
+        border: { type: "line" },
+        style: {
+            border: { fg: "cyan" },
+            selected: { bg: "cyan", fg: "black", bold: true },
+            item: { fg: "white" },
+        },
+        items,
+        keys: true,
+        vi: true,
+        scrollable: true,
+    });
+
+    const closeModelPicker = () => {
+        _modelPickerModal = false;
+        picker.detach();
+        focusInput();
+        screen.render();
+    };
+
+    picker.on("select", async (_item, index) => {
+        const qualified = modelMap.get(index);
+        closeModelPicker();
+        if (!qualified) return; // header row
+
+        const cmdId = crypto.randomUUID().slice(0, 8);
+        currentModel = qualified;
+        appendChatRaw(`{yellow-fg}Switching model to ${qualified}...{/yellow-fg}`);
+        screen.render();
+        addPendingCommand(cmdId, "set_model");
+        try {
+            await ensureOrchestrationStarted();
+            await dc.enqueueEvent(activeOrchId, "messages", JSON.stringify({
+                type: "cmd", cmd: "set_model", args: { model: qualified }, id: cmdId,
+            }));
+        } catch (err) {
+            pendingCommands.delete(cmdId);
+            appendChatRaw(`{red-fg}Failed to send command: ${err.message}{/red-fg}`);
+        }
+    });
+
+    picker.key(["escape", "q"], closeModelPicker);
+
+    picker.focus();
+    screen.render();
+}
+
 // ─── Input handling ──────────────────────────────────────────────
 
 async function handleInput(text) {
-    // If file attach modal triggered cancellation, ignore this call
+    // If a modal triggered cancellation, ignore this call
     if (_fileAttachModal) return;
+    if (_modelPickerModal) return;
     // Expand file attachments before trimming — replaces 📎tokens with file content
     const expanded = expandAttachments(text || "");
     const trimmed = expanded.trim();
@@ -6433,51 +6516,43 @@ async function handleInput(text) {
 
         if (cmd === "/models" || cmd === "/model") {
             inputBar.clearValue();
-            focusInput();
 
             const dc = getDc();
             if (!dc) {
                 appendChatRaw("{red-fg}Not connected{/red-fg}");
+                focusInput();
                 screen.render();
                 return;
             }
 
             if (!arg) {
-                // List models
+                // Show interactive model picker
                 if (modelProviders) {
-                    // Use local registry — no need to go through duroxide
-                    appendChatRaw("{bold}Available models:{/bold}");
-                    const byProvider = modelProviders.getModelsByProvider();
-                    for (const group of byProvider) {
-                        appendChatRaw(`  {white-fg}${group.providerId}{/white-fg} {gray-fg}(${group.type}){/gray-fg}`);
-                        for (const m of group.models) {
-                            const marker = m.qualifiedName === currentModel ? " {green-fg}← default{/green-fg}" : "";
-                            const costTag = m.cost ? ` {gray-fg}[${m.cost}]{/gray-fg}` : "";
-                            appendChatRaw(`    {cyan-fg}${m.qualifiedName}{/cyan-fg}${costTag}${marker}`);
-                            if (m.description) {
-                                appendChatRaw(`      {gray-fg}${m.description}{/gray-fg}`);
-                            }
-                        }
-                    }
-                    appendChatRaw("{white-fg}Use /model <provider:model> to switch{/white-fg}");
-                } else {
-                    // Fall back to duroxide command (GitHub Copilot API)
-                    const cmdId = crypto.randomUUID().slice(0, 8);
-                    appendChatRaw("{yellow-fg}Fetching models...{/yellow-fg}");
-                    screen.render();
-                    addPendingCommand(cmdId, "list_models");
-                    try {
-                        await ensureOrchestrationStarted();
-                        await dc.enqueueEvent(activeOrchId, "messages", JSON.stringify({
-                            type: "cmd", cmd: "list_models", id: cmdId,
-                        }));
-                    } catch (err) {
-                        pendingCommands.delete(cmdId);
-                        appendChatRaw(`{red-fg}Failed to send command: ${err.message}{/red-fg}`);
-                    }
+                    // Set modal flag FIRST, then cancel readInput so blessed
+                    // doesn't steal focus back. The flag prevents re-entrant
+                    // handleInput calls from interfering.
+                    _modelPickerModal = true;
+                    inputBar._done(null, null);
+                    setImmediate(() => showModelPicker(dc));
+                    return;
+                }
+                // Fall back to duroxide command (GitHub Copilot API)
+                const cmdId = crypto.randomUUID().slice(0, 8);
+                appendChatRaw("{yellow-fg}Fetching models...{/yellow-fg}");
+                screen.render();
+                addPendingCommand(cmdId, "list_models");
+                try {
+                    await ensureOrchestrationStarted();
+                    await dc.enqueueEvent(activeOrchId, "messages", JSON.stringify({
+                        type: "cmd", cmd: "list_models", id: cmdId,
+                    }));
+                } catch (err) {
+                    pendingCommands.delete(cmdId);
+                    appendChatRaw(`{red-fg}Failed to send command: ${err.message}{/red-fg}`);
                 }
             } else {
                 // Set model — normalize the reference
+                focusInput();
                 let normalizedModel = arg;
                 if (modelProviders) {
                     const normalized = modelProviders.normalize(arg);
@@ -6730,6 +6805,7 @@ async function handleInput(text) {
 inputBar.on("submit", handleInput);
 inputBar.key(["escape"], () => {
     if (_fileAttachModal) return; // Modal is handling escape
+    if (_modelPickerModal) return; // Model picker handles its own escape
     inputBar.clearValue();
     // Exit prompt — focus the sessions pane for navigation
     orchList.focus();
