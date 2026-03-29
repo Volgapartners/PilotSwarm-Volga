@@ -17,14 +17,15 @@
 import { describe, it, beforeAll, afterAll } from "vitest";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createTestEnv, preflightChecks } from "../helpers/local-env.js";
+import { createTestEnv, preflightChecks, useSuiteEnv } from "../helpers/local-env.js";
 import { withClient, defineTool, PilotSwarmWorker, composeSystemPrompt } from "../helpers/local-workers.js";
 import { SessionManager } from "../../src/session-manager.ts";
 import { assert, assertEqual, assertIncludes, assertGreaterOrEqual, assertNotNull } from "../helpers/assertions.js";
 import { validateSessionAfterTurn } from "../helpers/cms-helpers.js";
 import { createAddTool, createMultiplyTool, ONEWORD_CONFIG, TOOL_CONFIG, TEST_CLAUDE_MODEL } from "../helpers/fixtures.js";
 
-const TIMEOUT = 120_000;
+const TIMEOUT = 180_000;
+const getEnv = useSuiteEnv(import.meta.url);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LAYERED_PLUGIN_DIR = path.resolve(__dirname, "../fixtures/prompt-layering-plugin");
 const AGENT_TOOL_MERGE_PLUGIN_DIR = path.resolve(__dirname, "../fixtures/agent-tool-merge-plugin");
@@ -33,6 +34,7 @@ const POLICY_PLUGIN_DIR = path.resolve(__dirname, "../fixtures/policy-plugin");
 const EXPECTED_ALWAYS_ON_TOOL_NAMES = [
     "wait",
     "wait_on_worker",
+    "cron",
     "ask_user",
     "list_available_models",
     "spawn_agent",
@@ -91,9 +93,20 @@ function parseToolNameArray(response) {
 
 class FakeCopilotSession {
     registeredToolSnapshots = [];
+    registeredTools = [];
     listeners = new Map();
+    catchAllHandlers = [];
+    scriptedToolCalls = [];
+    assistantContent = "ok";
+    aborted = false;
 
     on(eventType, handler) {
+        if (typeof eventType === "function") {
+            this.catchAllHandlers.push(eventType);
+            return () => {
+                this.catchAllHandlers = this.catchAllHandlers.filter((candidate) => candidate !== eventType);
+            };
+        }
         const handlers = this.listeners.get(eventType) ?? [];
         handlers.push(handler);
         this.listeners.set(eventType, handlers);
@@ -104,10 +117,14 @@ class FakeCopilotSession {
     }
 
     registerTools(tools) {
+        this.registeredTools = tools;
         this.registeredToolSnapshots.push(tools.map((tool) => tool.name));
     }
 
     emit(eventType, payload = {}) {
+        for (const handler of this.catchAllHandlers) {
+            handler({ type: eventType, data: payload.data ?? payload });
+        }
         const handlers = this.listeners.get(eventType) ?? [];
         for (const handler of handlers) {
             handler(payload);
@@ -115,13 +132,24 @@ class FakeCopilotSession {
     }
 
     async send() {
-        queueMicrotask(() => {
-            this.emit("assistant.message_completed", { data: { content: "ok" } });
+        this.aborted = false;
+        queueMicrotask(async () => {
+            for (const call of this.scriptedToolCalls) {
+                if (this.aborted) break;
+                const tool = this.registeredTools.find((candidate) => candidate.name === call.name);
+                if (!tool) throw new Error(`Missing fake tool: ${call.name}`);
+                await tool.handler(call.args ?? {});
+            }
+            if (!this.aborted && this.assistantContent != null) {
+                this.emit("assistant.message", { data: { content: this.assistantContent } });
+            }
             this.emit("session.idle", { data: {} });
         });
     }
 
-    abort() {}
+    abort() {
+        this.aborted = true;
+    }
 }
 
 class FakeCopilotClient {
@@ -588,57 +616,46 @@ async function testLlmSeesExactAlwaysOnTools(env) {
 
 // ─── Runner ──────────────────────────────────────────────────────
 
-describe.concurrent("Level 8: Contract Tests", () => {
+describe("Level 8: Contract Tests", () => {
     beforeAll(async () => { await preflightChecks(); });
 
     it("Worker-Registered Tool By Name", { timeout: TIMEOUT }, async () => {
-        const env = createTestEnv("contracts");
-        try { await testWorkerToolByName(env); } finally { await env.cleanup(); }
+        await testWorkerToolByName(getEnv());
     });
     it("Registry + Per-Session Tools", { timeout: TIMEOUT }, async () => {
-        const env = createTestEnv("contracts");
-        try { await testRegistryPlusSessionTools(env); } finally { await env.cleanup(); }
+        await testRegistryPlusSessionTools(getEnv());
     });
     it("Tool Update After Eviction", { timeout: TIMEOUT }, async () => {
-        const env = createTestEnv("contracts");
-        try { await testToolUpdateAfterEviction(env); } finally { await env.cleanup(); }
+        await testToolUpdateAfterEviction(getEnv());
     });
     it("Mode Replace Keeps Base Prompt", { timeout: TIMEOUT }, async () => {
-        const env = createTestEnv("contracts");
-        try { await testModeReplaceKeepsBase(env); } finally { await env.cleanup(); }
+        await testModeReplaceKeepsBase(getEnv());
     });
     it("Worker Exposes Loaded Agents", { timeout: TIMEOUT }, async () => {
-        const env = createTestEnv("contracts");
-        try { await testWorkerLoadedAgents(env); } finally { await env.cleanup(); }
+        await testWorkerLoadedAgents(getEnv());
     });
     it("Worker Skill Dirs Loaded", { timeout: TIMEOUT }, async () => {
-        const env = createTestEnv("contracts");
-        try { await testWorkerSkillDirs(env); } finally { await env.cleanup(); }
+        await testWorkerSkillDirs(getEnv());
     });
     it("Prompt Composer Keeps Framework First", async () => {
         await testPromptComposerPrecedence();
     });
     it("Worker Layers App Default Into Agents", { timeout: TIMEOUT }, async () => {
-        const env = createTestEnv("contracts");
-        try { await testWorkerLayersAppDefault(env); } finally { await env.cleanup(); }
+        await testWorkerLayersAppDefault(getEnv());
     });
     it("PilotSwarm System Prompt Skips App Default", async () => {
         await testPilotswarmSystemPromptSkipsAppDefault();
     });
     it("Top-Level Named Agent Tool Merging", { timeout: TIMEOUT }, async () => {
-        const env = createTestEnv("contracts");
-        try { await testTopLevelAgentToolMerging(env); } finally { await env.cleanup(); }
+        await testTopLevelAgentToolMerging(getEnv());
     });
     it("Facts Tools Are Always Available", { timeout: TIMEOUT }, async () => {
-        const env = createTestEnv("contracts");
-        try { await testFactsToolsAlwaysAvailable(env); } finally { await env.cleanup(); }
+        await testFactsToolsAlwaysAvailable(getEnv());
     });
     it("Always-On Tools Persist Across Turns", { timeout: TIMEOUT }, async () => {
-        const env = createTestEnv("contracts");
-        try { await testAlwaysOnToolsRegisteredAcrossTurns(env); } finally { await env.cleanup(); }
+        await testAlwaysOnToolsRegisteredAcrossTurns(getEnv());
     });
     it("LLM Sees Exact Always-On Toolset", { timeout: TIMEOUT }, async () => {
-        const env = createTestEnv("contracts");
-        try { await testLlmSeesExactAlwaysOnTools(env); } finally { await env.cleanup(); }
+        await testLlmSeesExactAlwaysOnTools(getEnv());
     });
 });

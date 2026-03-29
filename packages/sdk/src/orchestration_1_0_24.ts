@@ -4,6 +4,9 @@ import {
     RESPONSE_LATEST_KEY,
     commandResponseKey,
 } from "./types.js";
+import {
+    SESSION_STATE_MISSING_PREFIX,
+} from "./types.js";
 import type {
     TurnAction,
     TurnResult,
@@ -18,6 +21,7 @@ import type {
     SessionStatusSignal,
 } from "./types.js";
 import { createSessionProxy, createSessionManagerProxy } from "./session-proxy.js";
+import { planWaitHandling } from "./wait-affinity.js";
 
 /**
  * Set custom status as a JSON blob of session state.
@@ -45,7 +49,7 @@ function setStatus(ctx: any, status: PilotSwarmSessionStatus, extra?: Record<str
  *
  * @internal
  */
-export const CURRENT_ORCHESTRATION_VERSION = "1.0.15";
+export const CURRENT_ORCHESTRATION_VERSION = "1.0.24";
 
 /**
  * Long-lived durable session orchestration.
@@ -63,13 +67,13 @@ export const CURRENT_ORCHESTRATION_VERSION = "1.0.15";
  *
  * @internal
  */
-export function* durableSessionOrchestration_1_0_15(
+export function* durableSessionOrchestration_1_0_24(
     ctx: any,
     input: OrchestrationInput,
 ): Generator<any, string, any> {
     const rawTraceInfo = typeof ctx.traceInfo === "function" ? ctx.traceInfo.bind(ctx) : null;
     if (rawTraceInfo) {
-        ctx.traceInfo = (message: string) => rawTraceInfo(`[v1.0.15] ${message}`);
+        ctx.traceInfo = (message: string) => rawTraceInfo(`[v1.0.23] ${message}`);
     }
     const dehydrateThreshold = input.dehydrateThreshold ?? 30;
     const idleTimeout = input.idleTimeout ?? 30;
@@ -79,6 +83,7 @@ export function* durableSessionOrchestration_1_0_15(
     const blobEnabled = input.blobEnabled ?? false;
     let needsHydration = input.needsHydration ?? false;
     let affinityKey = input.affinityKey ?? input.sessionId;
+    let preserveAffinityOnHydrate = input.preserveAffinityOnHydrate ?? false;
     let iteration = input.iteration ?? 0;
     let config = { ...input.config };
     let retryCount = input.retryCount ?? 0;
@@ -209,6 +214,7 @@ export function* durableSessionOrchestration_1_0_15(
             config,
             iteration,
             affinityKey,
+            preserveAffinityOnHydrate,
             needsHydration,
             blobEnabled,
             dehydrateThreshold,
@@ -219,6 +225,7 @@ export function* durableSessionOrchestration_1_0_15(
             nextSummarizeAt,
             taskContext,
             baseSystemMessage,
+            ...(pendingPrompt ? { bootstrapPrompt } : {}),
             subAgents,
             ...(pendingToolActions.length > 0 ? { pendingToolActions } : {}),
             ...(pendingMessage !== undefined ? { pendingMessage } : {}),
@@ -288,13 +295,16 @@ export function* durableSessionOrchestration_1_0_15(
         } catch {}
     }
 
-    // ─── Helper: dehydrate + reset affinity ──────────────────
-    function* dehydrateAndReset(reason: string): Generator<any, void, any> {
-        ctx.traceInfo(`[orch] dehydrating session (reason=${reason})`);
+    // ─── Helper: dehydrate and optionally release affinity ───
+    function* dehydrateForNextTurn(reason: string, resetAffinity = true): Generator<any, void, any> {
+        ctx.traceInfo(`[orch] dehydrating session (reason=${reason}, resetAffinity=${resetAffinity})`);
         yield session.dehydrate(reason);
         needsHydration = true;
-        affinityKey = yield ctx.newGuid();
-        session = createSessionProxy(ctx, input.sessionId, affinityKey, config);
+        preserveAffinityOnHydrate = !resetAffinity;
+        if (resetAffinity) {
+            affinityKey = yield ctx.newGuid();
+            session = createSessionProxy(ctx, input.sessionId, affinityKey, config);
+        }
     }
 
     // ─── Helper: checkpoint without releasing pin ────────────
@@ -333,13 +343,68 @@ export function* durableSessionOrchestration_1_0_15(
 
     // ─── Prompt carried from continueAsNew ───────────────────
     let pendingPrompt: string | undefined = input.prompt;
+    let bootstrapPrompt = input.bootstrapPrompt ?? false;
 
     ctx.traceInfo(`[orch] start: iter=${iteration} pending=${pendingPrompt ? `"${pendingPrompt.slice(0, 40)}"` : 'NONE'} queued=${pendingToolActions.length} hydrate=${needsHydration} blob=${blobEnabled}`);
+
+    // ─── Policy enforcement (orchestration-side) ─────────────
+    // Only check on the very first start (iteration 0, no parentSessionId — top-level only).
+    // Sub-agent spawns are internal and not subject to top-level policy.
+    if (iteration === 0 && !parentSessionId && !isSystem) {
+        // Fetch the WORKER's authoritative policy (not the client's — can't trust client input).
+        const workerPolicy: { policy: any; allowedAgentNames: string[] } = yield manager.getWorkerSessionPolicy();
+        const policy = workerPolicy.policy;
+        if (policy && policy.creation?.mode === "allowlist") {
+            const agentId = input.agentId;
+            const allowedNames = workerPolicy.allowedAgentNames;
+            if (!agentId && !policy.creation.allowGeneric) {
+                ctx.traceInfo(`[orch] policy rejection: generic session not allowed`);
+                publishStatus("failed", { policyRejected: true });
+                yield manager.updateCmsState(input.sessionId, "rejected");
+                return "[POLICY] Session rejected: generic sessions are not allowed by session creation policy.";
+            }
+            if (agentId && allowedNames.length > 0 && !allowedNames.includes(agentId)) {
+                ctx.traceInfo(`[orch] policy rejection: agent "${agentId}" not in allowed list`);
+                publishStatus("failed", { policyRejected: true });
+                yield manager.updateCmsState(input.sessionId, "rejected");
+                return `[POLICY] Session rejected: agent "${agentId}" is not in the allowed agent list.`;
+            }
+        }
+    }
+
+    // ─── Resolve agent config for top-level named-agent sessions ───
+    // When a session is created via createSessionForAgent("investigator"),
+    // the agent's tools/systemMessage from .agent.md need to be injected
+    // into the session config. Sub-agents get this via spawn_agent resolution,
+    // but top-level sessions need it here.
+    if (iteration === 0 && !parentSessionId && input.agentId) {
+        const agentDef: any = yield manager.resolveAgentConfig(input.agentId);
+        if (agentDef) {
+            const mergedToolNames = Array.from(new Set([
+                ...(agentDef.tools ?? []),
+                ...(config.toolNames ?? []),
+            ]));
+            if (mergedToolNames.length > 0) {
+                config.toolNames = mergedToolNames;
+                ctx.traceInfo(`[orch] merged top-level agent tools for ${input.agentId}: ${mergedToolNames.join(", ")}`);
+            }
+            // Rebuild session proxy with updated config (tools now included)
+            session = createSessionProxy(ctx, input.sessionId, affinityKey, config);
+        }
+    }
+
+    // ─── Set agent identity for namespace access control ─────────
+    // The agentId travels through the config so fact tool handlers can
+    // enforce knowledge pipeline namespace restrictions.
+    if (input.agentId) {
+        config.agentIdentity = input.agentId;
+    }
 
     // ─── MAIN LOOP ──────────────────────────────────────────
     while (true) {
         let result: TurnResult;
         let prompt = "";
+        let promptIsBootstrap = false;
         let replayingQueuedAction = false;
 
         if (pendingToolActions.length > 0) {
@@ -351,6 +416,8 @@ export function* durableSessionOrchestration_1_0_15(
             if (pendingPrompt) {
                 prompt = pendingPrompt;
                 pendingPrompt = undefined;
+                promptIsBootstrap = bootstrapPrompt;
+                bootstrapPrompt = false;
             } else {
                 publishStatus("idle");
 
@@ -422,6 +489,7 @@ export function* durableSessionOrchestration_1_0_15(
                                         iteration,
                                         sessionId: input.sessionId,
                                         affinityKey: affinityKey?.slice(0, 8),
+                                        preserveAffinityOnHydrate,
                                         needsHydration,
                                         blobEnabled,
                                     },
@@ -502,7 +570,18 @@ export function* durableSessionOrchestration_1_0_15(
                     }
 
                     prompt = msgData.prompt;
+                    promptIsBootstrap = Boolean(msgData.bootstrap);
                     gotPrompt = true;
+                }
+            }
+
+            // Detect archived state even when dehydration happened outside the orchestration,
+            // such as abrupt worker loss or direct worker-side shutdown dehydration.
+            if (blobEnabled && !needsHydration) {
+                try {
+                    needsHydration = yield session.needsHydration();
+                } catch (err: any) {
+                    ctx.traceInfo(`[orch] needsHydration probe failed: ${err.message ?? err}`);
                 }
             }
 
@@ -519,10 +598,13 @@ export function* durableSessionOrchestration_1_0_15(
                 let hydrateAttempts = 0;
                 while (true) {
                     try {
-                        affinityKey = yield ctx.newGuid();
+                        if (!preserveAffinityOnHydrate) {
+                            affinityKey = yield ctx.newGuid();
+                        }
                         session = createSessionProxy(ctx, input.sessionId, affinityKey, config);
                         yield session.hydrate();
                         needsHydration = false;
+                        preserveAffinityOnHydrate = false;
                         break;
                     } catch (hydrateErr: any) {
                         const hMsg = hydrateErr.message || String(hydrateErr);
@@ -531,6 +613,7 @@ export function* durableSessionOrchestration_1_0_15(
                         if (hMsg.includes("blob does not exist") || hMsg.includes("BlobNotFound") || hMsg.includes("404")) {
                             ctx.traceInfo(`[orch] hydrate skipped — blob not found, starting fresh session`);
                             needsHydration = false;
+                            preserveAffinityOnHydrate = false;
                             break;
                         }
 
@@ -554,14 +637,63 @@ export function* durableSessionOrchestration_1_0_15(
                 if (needsHydration) continue; // hydrate exhausted retries — go back to dequeue
             }
 
+            // ②½ LOAD KNOWLEDGE PIPELINE CONTEXT ────────────────
+            // Inject curated skills and active asks before running the turn.
+            // Skip for facts-manager to avoid circular context injection.
+            if (config.agentIdentity !== "facts-manager") {
+                try {
+                    const knowledgeIndex: any = yield manager.loadKnowledgeIndex();
+                    if (knowledgeIndex) {
+                        // Inject active asks into the prompt
+                        if (knowledgeIndex.asks?.length > 0) {
+                            const askLines = knowledgeIndex.asks.map((a: any) => `- ${a.key}`).join("\n");
+                            const askBlock = `[ACTIVE FACT REQUESTS]\n` +
+                                `The Facts Manager is seeking corroboration on these topics.\n` +
+                                `If any are relevant to your current task, read the full ask\n` +
+                                `with read_facts and contribute intake evidence if you can.\n${askLines}\n\n` +
+                                `[FACT NAMESPACE RULES]\n` +
+                                `- You can WRITE to: intake/<topic>/<session-id> (shared observations)\n` +
+                                `- You can READ from: skills/*, asks/* (curated knowledge, open requests)\n` +
+                                `- You CANNOT write to skills/ or asks/ (Facts Manager only)\n` +
+                                `- You CANNOT read from intake/ (Facts Manager only)\n\n`;
+                            prompt = askBlock + prompt;
+                        }
+                        // Inject curated skills with full body — matches the
+                        // presentation format of file-based SKILL.md skills.
+                        if (knowledgeIndex.skills?.length > 0) {
+                            const skillBlocks = knowledgeIndex.skills.map((s: any) => {
+                                let block = `### ${s.name}\n${s.description}\n`;
+                                if (s.prompt) block += `\n${s.prompt}\n`;
+                                if (s.toolNames?.length) block += `\nTools: ${s.toolNames.join(", ")}\n`;
+                                return block;
+                            }).join("\n");
+                            const skillBlock = `[CURATED SKILLS]\n` +
+                                `The following shared skills have been curated from operational experience.\n` +
+                                `Apply them when relevant to your current task.\n\n${skillBlocks}\n`;
+                            prompt = skillBlock + prompt;
+                        }
+                    }
+                } catch (knErr: any) {
+                    ctx.traceInfo(`[orch] loadKnowledgeIndex failed (non-fatal): ${knErr.message || knErr}`);
+                }
+            }
+
             // ③ RUN TURN via SessionProxy (with retry on failure)
             publishStatus("running");
             let turnResult: any;
             try {
-                turnResult = yield session.runTurn(prompt);
+                turnResult = yield session.runTurn(prompt, promptIsBootstrap, iteration);
             } catch (err: any) {
                 // Activity failed (e.g. Copilot timeout, network error).
                 const errorMsg = err.message || String(err);
+                const missingStateIndex = errorMsg.indexOf(SESSION_STATE_MISSING_PREFIX);
+                if (missingStateIndex >= 0) {
+                    const fatalError = errorMsg.slice(missingStateIndex + SESSION_STATE_MISSING_PREFIX.length).trim();
+                    ctx.traceInfo(`[orch] fatal missing session state: ${fatalError}`);
+                    publishStatus("failed", { error: fatalError, fatal: true });
+                    yield manager.updateCmsState(input.sessionId, "failed", fatalError);
+                    throw new Error(fatalError);
+                }
                 retryCount++;
                 ctx.traceInfo(`[orch] runTurn FAILED (attempt ${retryCount}/${MAX_RETRIES}): ${errorMsg}`);
 
@@ -587,7 +719,7 @@ export function* durableSessionOrchestration_1_0_15(
                 ctx.traceInfo(`[orch] retrying in ${retryDelay}s`);
 
                 if (blobEnabled) {
-                    yield* dehydrateAndReset("error");
+                    yield* dehydrateForNextTurn("error");
                 }
 
                 yield ctx.scheduleTimer(retryDelay * 1000);
@@ -657,9 +789,14 @@ export function* durableSessionOrchestration_1_0_15(
                 }
 
                 if (!blobEnabled || idleTimeout < 0) {
-                    // Checkpoint while idle (no dehydration path)
+                    // continueAsNew after each completed turn to reset history.
+                    // Without this, the same execution accumulates unbounded
+                    // history which breaks replay after a worker restart —
+                    // duroxide can match the second yield session.runTurn()
+                    // to the cached result of the first one.
                     yield* maybeCheckpoint();
-                    continue;
+                    yield versionedContinueAsNew(continueInput());
+                    return "";
                 }
 
                 // Race: next message vs idle timeout
@@ -696,7 +833,7 @@ export function* durableSessionOrchestration_1_0_15(
 
                     // Idle timeout → dehydrate. Next message will need resume context.
                     ctx.traceInfo("[session] idle timeout, dehydrating");
-                    yield* dehydrateAndReset("idle");
+                    yield* dehydrateForNextTurn("idle");
                     // Don't continueAsNew with a prompt — wait for the next user message,
                     // which will be wrapped with resume context because needsHydration=true.
                     yield versionedContinueAsNew(continueInput());
@@ -734,9 +871,14 @@ export function* durableSessionOrchestration_1_0_15(
                 ctx.traceInfo(`[orch] durable timer: ${result.seconds}s (${result.reason})`);
 
                 {
-                    const shouldDehydrate = blobEnabled && result.seconds > dehydrateThreshold;
-                    if (shouldDehydrate) {
-                        yield* dehydrateAndReset("timer");
+                    const waitPlan = planWaitHandling({
+                        blobEnabled,
+                        seconds: result.seconds,
+                        dehydrateThreshold,
+                        preserveWorkerAffinity: result.preserveWorkerAffinity,
+                    });
+                    if (waitPlan.shouldDehydrate) {
+                        yield* dehydrateForNextTurn("timer", waitPlan.resetAffinityOnDehydrate);
                     }
 
                     const waitStartedAt: number = yield ctx.utcNow();
@@ -757,10 +899,11 @@ export function* durableSessionOrchestration_1_0_15(
                         waitSeconds: result.seconds,
                         waitReason: result.reason,
                         waitStartedAt,
+                        preserveWorkerAffinity: waitPlan.preserveAffinityOnHydrate,
                     });
 
                     // Checkpoint before the blocking wait
-                    if (!shouldDehydrate) yield* maybeCheckpoint();
+                    if (!waitPlan.shouldDehydrate) yield* maybeCheckpoint();
 
                     const timerTask = ctx.scheduleTimer(result.seconds * 1000);
                     const interruptMsg = ctx.dequeueEvent("messages");
@@ -779,12 +922,12 @@ export function* durableSessionOrchestration_1_0_15(
                                 const timerPrompt = `The ${result.seconds} second wait is now complete. Continue with your task.`;
                                 yield versionedContinueAsNew(continueInputWithPrompt(
                                     timerPrompt,
-                                    { needsHydration: shouldDehydrate ? true : needsHydration },
+                                    { needsHydration: waitPlan.shouldDehydrate ? true : needsHydration },
                                 ));
                             } else {
                                 yield versionedContinueAsNew(continueInputWithPrompt(
                                     `The wait was partially completed (${elapsedSec}s elapsed, ${remainingSec}s remain). Resume the wait for the remaining ${remainingSec} seconds.`,
-                                    { needsHydration: shouldDehydrate ? true : needsHydration },
+                                    { needsHydration: waitPlan.shouldDehydrate ? true : needsHydration },
                                 ));
                             }
                             return "";
@@ -798,27 +941,33 @@ export function* durableSessionOrchestration_1_0_15(
                         const userPrompt = interruptData.prompt || "";
 
                         let finalPrompt: string;
-                        if (shouldDehydrate && userPrompt) {
+                        if (waitPlan.shouldDehydrate && userPrompt) {
                             finalPrompt = wrapWithResumeContext(
                                 userPrompt,
-                                `Your timer was interrupted by a USER MESSAGE. You MUST respond to the user's message below before doing anything else. ` +
+                                `Your timer was interrupted by a USER MESSAGE. ` +
+                                `RESPONSE FORMAT: You MUST first output a text response addressing the user's message. ` +
+                                `Then call wait(${remainingSec}) to resume your timer. ` +
+                                `IMPORTANT: A turn that calls wait() without any preceding text output is WRONG. ` +
+                                `The user is waiting to see your reply. Always write text first, then call wait. ` +
                                 `Timer context: ${result.seconds}s timer (reason: "${result.reason}"), ` +
-                                `${elapsedSec}s elapsed, ${remainingSec}s remain. ` +
-                                `After fully addressing the user's message, resume the wait for the remaining ${remainingSec} seconds.`,
+                                `${elapsedSec}s elapsed, ${remainingSec}s remain.`,
                             );
                         } else if (userPrompt) {
                             // Not dehydrated but still interrupted — give timing context
                             finalPrompt = `${userPrompt}\n\n` +
                                 `[SYSTEM: IMPORTANT — The above is a USER MESSAGE that interrupted your ${result.seconds}s timer (reason: "${result.reason}"). ` +
-                                `You MUST respond to the user's message FIRST. ${elapsedSec}s elapsed, ${remainingSec}s remain. ` +
-                                `After fully answering the user, resume the wait for the remaining ${remainingSec} seconds.]`;
+                                `RESPONSE FORMAT: You MUST first output a text response addressing the user's message. ` +
+                                `Then call wait(${remainingSec}) to resume your timer. ` +
+                                `A turn that calls wait() without any preceding text output is WRONG. ` +
+                                `The user is waiting to see your reply. Always write text first, then call wait. ` +
+                                `${elapsedSec}s elapsed, ${remainingSec}s remain.]`;
                         } else {
                             finalPrompt = userPrompt;
                         }
 
                         yield versionedContinueAsNew(continueInputWithPrompt(
                             finalPrompt,
-                            { needsHydration: shouldDehydrate ? true : needsHydration },
+                            { needsHydration: waitPlan.shouldDehydrate ? true : needsHydration },
                         ));
                         return "";
                     }
@@ -826,7 +975,7 @@ export function* durableSessionOrchestration_1_0_15(
                     const timerPrompt = `The ${result.seconds} second wait is now complete. Continue with your task.`;
                     yield versionedContinueAsNew(continueInputWithPrompt(
                         timerPrompt,
-                        { needsHydration: shouldDehydrate ? true : needsHydration },
+                        { needsHydration: waitPlan.shouldDehydrate ? true : needsHydration },
                     ));
                     return "";
                 }
@@ -857,7 +1006,7 @@ export function* durableSessionOrchestration_1_0_15(
 
                 if (inputGracePeriod === 0) {
                     publishStatus("input_required");
-                    yield* dehydrateAndReset("input_required");
+                    yield* dehydrateForNextTurn("input_required");
                     const answerMsg: any = yield ctx.dequeueEvent("messages");
                     const answerData = typeof answerMsg === "string"
                         ? JSON.parse(answerMsg) : answerMsg;
@@ -884,7 +1033,7 @@ export function* durableSessionOrchestration_1_0_15(
                         return "";
                     }
 
-                    yield* dehydrateAndReset("input_required");
+                    yield* dehydrateForNextTurn("input_required");
                     const answerMsg: any = yield ctx.dequeueEvent("messages");
                     const answerData = typeof answerMsg === "string"
                         ? JSON.parse(answerMsg) : answerMsg;
@@ -932,15 +1081,15 @@ export function* durableSessionOrchestration_1_0_15(
                 let agentTitle: string | undefined;
                 let agentId: string | undefined;
                 let agentSplash: string | undefined;
+                let boundAgentName: string | undefined;
+                let promptLayeringKind: "app-agent" | "app-system-agent" | "pilotswarm-system-agent" | undefined;
                 let resolvedAgentName = result.agentName;
 
                 const applyAgentDef = (agentDef: any, useDefinitionDefaults = false) => {
                     agentTask = useDefinitionDefaults
                         ? (agentDef.initialPrompt || `You are the ${agentDef.name} agent. Begin your work.`)
                         : (result.task || agentDef.initialPrompt || `You are the ${agentDef.name} agent. Begin your work.`);
-                    agentSystemMessage = useDefinitionDefaults
-                        ? ({ mode: "replace" as const, content: agentDef.prompt })
-                        : (result.systemMessage ?? { mode: "replace" as const, content: agentDef.prompt });
+                    agentSystemMessage = useDefinitionDefaults ? undefined : result.systemMessage;
                     agentToolNames = useDefinitionDefaults
                         ? (agentDef.tools ?? undefined)
                         : (result.toolNames ?? agentDef.tools ?? undefined);
@@ -948,16 +1097,28 @@ export function* durableSessionOrchestration_1_0_15(
                     agentTitle = agentDef.title;
                     agentId = agentDef.id ?? resolvedAgentName;
                     agentSplash = agentDef.splash;
+                    boundAgentName = agentDef.name;
+                    promptLayeringKind = agentDef.promptLayerKind
+                        ?? (agentDef.system
+                            ? ((agentDef.namespace || "pilotswarm") === "pilotswarm"
+                                ? "pilotswarm-system-agent"
+                                : "app-system-agent")
+                            : "app-agent");
                 };
 
                 if (!resolvedAgentName && input.isSystem && agentTask) {
+                    const compactTask = agentTask.trim();
                     const titleMatch = agentTask.match(/You are the \*{0,2}([^*\n]+?Agent)\*{0,2}/i);
-                    const inferredLookup = titleMatch?.[1]?.trim();
+                    const inferredLookup = (
+                        compactTask && compactTask.length <= 80 && !compactTask.includes("\n")
+                            ? compactTask
+                            : titleMatch?.[1]?.trim()
+                    );
                     if (inferredLookup) {
                         const inferredDef = yield manager.resolveAgentConfig(inferredLookup);
                         if (inferredDef?.system && inferredDef?.parent) {
                             resolvedAgentName = inferredDef.id ?? inferredDef.name;
-                            ctx.traceInfo(`[orch] normalized custom system spawn to named agent: ${resolvedAgentName}`);
+                            ctx.traceInfo(`[orch] normalized custom system spawn to named agent: ${resolvedAgentName} (from "${inferredLookup}")`);
                             applyAgentDef(inferredDef, true);
                         }
                     }
@@ -1006,10 +1167,17 @@ export function* durableSessionOrchestration_1_0_15(
                 ctx.traceInfo(`[orch] spawning sub-agent via SDK: task="${agentTask.slice(0, 80)}" model=${agentModel || "inherit"} agent=${resolvedAgentName || "custom"} nestingLevel=${childNestingLevel}`);
 
                 // Build child config — inherit parent's config with optional overrides
+                const {
+                    boundAgentName: _parentBoundAgentName,
+                    promptLayering: _parentPromptLayering,
+                    ...parentConfig
+                } = config;
                 const childConfig: SerializableSessionConfig = {
-                    ...config,
+                    ...parentConfig,
                     ...(agentModel ? { model: agentModel } : {}),
                     ...(agentSystemMessage ? { systemMessage: agentSystemMessage } : {}),
+                    ...(boundAgentName ? { boundAgentName } : {}),
+                    ...(promptLayeringKind ? { promptLayering: { kind: promptLayeringKind } } : {}),
                     ...(agentToolNames ? { toolNames: agentToolNames } : {}),
                 };
 
@@ -1039,7 +1207,7 @@ export function* durableSessionOrchestration_1_0_15(
                     `The wait tool is durable and survives process restarts.\n` +
                     (canSpawnMore
                         ? `- You CAN spawn your own sub-agents (you have ${MAX_NESTING_LEVEL - childNestingLevel} level(s) remaining). ` +
-                          `Use them for parallel independent tasks.\n`
+                          `Use them for parallel independent tasks. After spawning, call wait_for_agents to block until they finish.\n`
                         : `- You CANNOT spawn sub-agents — you are at the maximum nesting depth. Handle everything directly.\n`);
                 childConfig.systemMessage = subAgentPreamble + (parentSystemMsg ? "\n\n" + parentSystemMsg : "");
 
@@ -1072,9 +1240,9 @@ export function* durableSessionOrchestration_1_0_15(
                 const spawnMsg = `[SYSTEM: Sub-agent spawned successfully.\n` +
                     `  Agent ID: ${childOrchId}\n` +
                     `  ${resolvedAgentName ? `Agent: ${resolvedAgentName}\n  ` : ``}Task: "${agentTask.slice(0, 200)}"\n` +
-                    `  The agent is now running autonomously. Use check_agents to monitor progress, ` +
-                    `message_agent to send instructions. To wait for completion, use wait + check_agents ` +
-                    `in a loop (choose an appropriate interval) so you can report progress to the user.]`;
+                    `  The agent is now running autonomously. To wait for it to finish, call wait_for_agents ` +
+                    `(this blocks efficiently until the agent completes). You can also use check_agents to poll status, ` +
+                    `or message_agent to send instructions.]`;
 
                 if (yield* queueFollowupAndMaybeContinue(spawnMsg)) return "";
                 continue;
@@ -1415,6 +1583,15 @@ export function* durableSessionOrchestration_1_0_15(
             }
 
             case "error": {
+                const missingStateIndex = result.message.indexOf(SESSION_STATE_MISSING_PREFIX);
+                if (missingStateIndex >= 0) {
+                    const fatalError = result.message.slice(missingStateIndex + SESSION_STATE_MISSING_PREFIX.length).trim();
+                    ctx.traceInfo(`[orch] fatal missing session state: ${fatalError}`);
+                    publishStatus("failed", { error: fatalError, fatal: true });
+                    yield manager.updateCmsState(input.sessionId, "failed", fatalError);
+                    throw new Error(fatalError);
+                }
+
                 // Treat like an activity failure — retry with backoff.
                 retryCount++;
                 ctx.traceInfo(`[orch] turn returned error (attempt ${retryCount}/${MAX_RETRIES}): ${result.message}`);
@@ -1437,7 +1614,7 @@ export function* durableSessionOrchestration_1_0_15(
                 ctx.traceInfo(`[orch] retrying in ${errorRetryDelay}s after turn error`);
 
                 if (blobEnabled) {
-                    yield* dehydrateAndReset("error");
+                    yield* dehydrateForNextTurn("error");
                 }
 
                 yield ctx.scheduleTimer(errorRetryDelay * 1000);

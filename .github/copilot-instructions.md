@@ -9,9 +9,9 @@
 
 ## Sensitive Local Files
 
-**Do NOT modify `.model_providers.json` or `.env` without the user explicitly asking.** These files contain private API keys, endpoints, and credentials. Never read them to extract secrets, and never overwrite them with example/placeholder content.
+**Do NOT modify `.model_providers.json`, `.env`, or `.env.remote` without the user explicitly asking.** The checked-in `.model_providers.json` is part of the repo's real configuration surface, while the actual credentials live in `.env` / `.env.remote`. Never read env files to extract secrets, and never overwrite the real model catalog with placeholder content.
 
-When changes are made to the structure or fields of `.model_providers.json` or `.env`, keep the corresponding example files (`.model_providers.example.json`, `.env.example`) in sync — but **strip all private keys, real endpoint URLs, and credential values** from the example files. Example files should use placeholders like `YOUR-RESOURCE`, `your-api-key-here`, or empty values.
+When env shape changes, keep `.env.example` in sync with placeholder values. Do **not** recreate or require a `.model_providers.example.json` file — the checked-in `.model_providers.json` is the canonical catalog, and provider availability is controlled by env-backed keys.
 
 ## Project Overview
 
@@ -242,6 +242,8 @@ Each test function should:
 **No retries.** Never add `retry` to test configurations (vitest `retry`, `retries`, or manual retry loops). If a test fails, it means the product has a bug or the test prompt is wrong — fix the root cause.
 
 **No hacks.** Do not paper over product bugs by weakening assertions, adding arbitrary sleeps, or swallowing errors. Tests exist to catch real problems.
+
+**Default-model by default.** Tests should use the repo's configured default model unless the test is explicitly about model selection, multi-model behavior, cross-model behavior, or an intentional per-model compatibility sweep. Do not pin a specific model in ordinary behavior tests just to make them pass.
 
 **No custom system prompts to compensate for product behavior.** Tests should use `client.createSession()` without overriding `systemMessage` unless the test is specifically testing custom system messages. The default agent prompt and tool schemas should be sufficient for the LLM to use tools correctly. If the LLM isn't calling a tool, that's a product bug in the default prompt or tool schema — fix it there, not in the test.
 
