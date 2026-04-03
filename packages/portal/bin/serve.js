@@ -44,4 +44,4 @@ const port = portFlag !== -1 ? parseInt(process.argv[portFlag + 1], 10) : 3001;
 const workersFlag = process.argv.indexOf("--workers");
 const workers = workersFlag !== -1 ? parseInt(process.argv[workersFlag + 1], 10) : 4;
 
-startServer({ port, workers });
+await startServer({ port, workers });

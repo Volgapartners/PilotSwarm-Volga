@@ -45,9 +45,25 @@ export function PortalProvider({ children }: { children: ReactNode }) {
   const [thinking, setThinking] = useState<Set<string>>(new Set());
   const listenersRef = useRef<Map<string, Set<(data: any) => void>>>(new Map());
 
+  function upsertSessionList(list: SessionInfo[], nextSession: SessionInfo): SessionInfo[] {
+    const idx = list.findIndex((session) => session.id === nextSession.id);
+    if (idx === -1) return [...list, nextSession];
+    const next = [...list];
+    next[idx] = { ...next[idx], ...nextSession };
+    return next;
+  }
+
+  function dedupeSessions(list: SessionInfo[]): SessionInfo[] {
+    const byId = new Map<string, SessionInfo>();
+    for (const session of list) {
+      const existing = byId.get(session.id);
+      byId.set(session.id, existing ? { ...existing, ...session } : session);
+    }
+    return Array.from(byId.values());
+  }
+
   // ── WebSocket lifecycle ───────────────────────────────────────
   useEffect(() => {
-    const isDev = import.meta.env.DEV;
     const wsHost = location.host;  // Always same-origin; Vite proxies /portal-ws in dev
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${proto}//${wsHost}/portal-ws`;
@@ -64,6 +80,8 @@ export function PortalProvider({ children }: { children: ReactNode }) {
 
       ws.onopen = () => {
         console.log("[portal] WS connected");
+        setMessages(new Map());
+        setThinking(new Set());
         setConnected(true);
         ws!.send(JSON.stringify({ type: "listSessions" }));
       };
@@ -103,15 +121,28 @@ export function PortalProvider({ children }: { children: ReactNode }) {
     switch (msg.type) {
       case "sessionCreated": {
         const d = msg.data as { sessionId: string; title: string; agentId?: string; model?: string };
-        setSessions((prev) => [
-          ...prev,
-          { id: d.sessionId, title: d.title || d.sessionId.slice(0, 8), status: "idle", agentId: d.agentId, model: d.model },
-        ]);
+        setSessions((prev) => upsertSessionList(prev, {
+          id: d.sessionId,
+          title: d.title || d.sessionId.slice(0, 8),
+          status: "idle",
+          agentId: d.agentId,
+          model: d.model,
+        }));
         break;
       }
       case "sessionList": {
         const d = msg.data as { sessions: SessionInfo[] };
-        setSessions(d.sessions);
+        const nextSessions = dedupeSessions(d.sessions);
+        setSessions(nextSessions);
+        setThinking((prev) => {
+          const next = new Set(prev);
+          for (const session of nextSessions) {
+            if (session.status !== "running") {
+              next.delete(session.id);
+            }
+          }
+          return next;
+        });
         break;
       }
       case "message": {
@@ -128,6 +159,11 @@ export function PortalProvider({ children }: { children: ReactNode }) {
         }
         break;
       }
+      case "error": {
+        const d = msg.data as { message?: string };
+        console.error("[portal] server error:", d?.message ?? "unknown error");
+        break;
+      }
       case "thinking": {
         const d = msg.data as { sessionId: string; active: boolean };
         setThinking((prev) => {
@@ -140,6 +176,13 @@ export function PortalProvider({ children }: { children: ReactNode }) {
       case "statusUpdate": {
         const d = msg.data as { sessionId: string; status: string };
         setSessions((prev) => prev.map((s) => s.id === d.sessionId ? { ...s, status: d.status } : s));
+        if (d.status !== "running") {
+          setThinking((prev) => {
+            const next = new Set(prev);
+            next.delete(d.sessionId);
+            return next;
+          });
+        }
         break;
       }
       case "toolCall": {
@@ -187,14 +230,8 @@ export function PortalProvider({ children }: { children: ReactNode }) {
   }, [send]);
 
   const sendMessage = useCallback((sessionId: string, text: string) => {
-    // Optimistically add user message
-    setMessages((prev) => {
-      const next = new Map(prev);
-      const arr = [...(next.get(sessionId) || [])];
-      arr.push({ role: "user", content: text, timestamp: new Date().toISOString() });
-      next.set(sessionId, arr);
-      return next;
-    });
+    // Let the backend replay the persisted user.message event so browser
+    // state stays consistent after reconnects and refreshes.
     setThinking((prev) => { const s = new Set(prev); s.add(sessionId); return s; });
     send({ type: "send", data: { sessionId, message: text } });
   }, [send]);

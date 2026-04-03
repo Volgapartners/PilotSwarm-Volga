@@ -1,38 +1,41 @@
 # pilotswarm-web
 
-Web portal for PilotSwarm — browser-based durable agent orchestration UI.
+Web portal for PilotSwarm — React frontend with an Express + WebSocket backend.
 
-Full feature parity with the TUI: session management, real-time chat, agent
-splash screens (ASCII art), sequence diagrams, node maps, worker logs,
-artifact downloads, and keyboard shortcuts.
+The React app lives in `src/` and is the authoritative portal frontend. The
+Node server in `server.js` provides the backend API/WebSocket layer and can
+optionally embed local workers.
 
 ## Quick Start
 
 ```bash
-# Install
-npm install pilotswarm-web
+# Install workspace dependencies from the repo root
+npm install
 
-# Run (starts server + serves React app)
-npx pilotswarm-web --env .env.remote
+# Terminal 1: React app (Vite)
+npm run dev --workspace=packages/portal
 
-# Development (Vite HMR)
-cd packages/portal
-npm run dev              # React app at http://localhost:5173
-node server.js           # API server at http://localhost:3001
+# Terminal 2: portal backend / WebSocket server
+node --env-file=.env.remote packages/portal/server.js
 ```
+
+Development URLs:
+
+- React app: `http://localhost:5173`
+- Portal backend: `http://localhost:3001`
 
 ## Architecture
 
 ```
-Browser (React + Vite)
+Browser (React + Vite or built static assets)
   │
-  ├── WebSocket ──► Portal Server (Express + ws)
+  ├── WebSocket ──► Portal Server (Express + ws on /portal-ws)
   │                    │
   │                    ├── PilotSwarmClient
   │                    ├── PilotSwarmManagementClient
-  │                    └── PilotSwarmWorker (embedded or remote)
+  │                    └── PilotSwarmWorker (embedded or remote workers)
   │
-  └── REST (session list, models, artifacts)
+  └── REST (/api/health, /api/models)
 ```
 
 Same public API boundary as the TUI — only `PilotSwarmClient`,
@@ -43,15 +46,24 @@ module imports.
 
 ```
 pilotswarm-web         (this package)
-  ├── pilotswarm-sdk   (peer dependency)
+  ├── pilotswarm-sdk
   ├── express
   ├── ws
   ├── react, react-dom
-  └── vite             (devDependency)
+  └── vite             (devDependency for the frontend)
 
 pilotswarm-cli         (TUI — separate package)
   └── pilotswarm-sdk
 
 pilotswarm-sdk         (runtime — shared)
   └── duroxide, copilot-sdk, etc.
+```
+
+## Scripts
+
+```bash
+npm run dev --workspace=packages/portal         # Vite frontend
+npm run dev:server --workspace=packages/portal  # backend only
+npm run build --workspace=packages/portal       # build frontend to dist/
+npm run start --workspace=packages/portal       # serve backend + built dist/ if present
 ```

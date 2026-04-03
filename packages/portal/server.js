@@ -1,152 +1,486 @@
 /**
- * Portal server — Hosts the PilotSwarm TUI in the browser.
+ * Portal server — Hosts the React portal backend.
  *
  * Architecture:
- *   Browser (xterm.js) ↔ WebSocket ↔ node-pty (pseudo-terminal) ↔ TUI (neo-blessed)
- *
- * Each browser tab gets its own PTY + TUI process. The TUI runs exactly
- * as it does in a real terminal — same keybindings, layout, colors.
+ *   Browser (React + Vite / built app)
+ *     ↕ WebSocket JSON events
+ *   Express + ws backend
+ *     ↕ PilotSwarm public SDK APIs
+ *   PostgreSQL + workers
  */
+
+import fs from "node:fs";
+import http from "node:http";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import express from "express";
 import { WebSocketServer } from "ws";
-import http from "node:http";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import * as pty from "node-pty";
-
-import { createRequire } from "node:module";
+import {
+  PilotSwarmClient,
+  PilotSwarmManagementClient,
+  PilotSwarmWorker,
+} from "pilotswarm-sdk";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../..");
-const require = createRequire(import.meta.url);
+const DIST_DIR = path.join(__dirname, "dist");
 
-/** Resolve the directory of an npm package (handles workspace hoisting). */
-function findPkgDir(pkg) {
-  const pkgJson = require.resolve(`${pkg}/package.json`);
-  return path.dirname(pkgJson);
+function loadPluginDirs() {
+  if (process.env.PLUGIN_DIRS) {
+    return process.env.PLUGIN_DIRS.split(",").map((dir) => dir.trim()).filter(Boolean);
+  }
+
+  const defaultPluginDir = path.resolve(REPO_ROOT, "packages/sdk/plugin");
+  return fs.existsSync(path.join(defaultPluginDir, "plugin.json")) ? [defaultPluginDir] : [];
 }
 
-export function startServer(opts = {}) {
-  const { port = 3001 } = opts;
+function titleCaseAgent(agentId) {
+  return agentId
+    .split(/[-_]/g)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function fallbackSessionTitle(session) {
+  if (session.title) return session.title;
+  if (session.agentId) return `${titleCaseAgent(session.agentId)}: ${session.sessionId.slice(0, 8)}`;
+  return `Session: ${session.sessionId.slice(0, 8)}`;
+}
+
+function mapSessionView(session) {
+  return {
+    id: session.sessionId,
+    title: fallbackSessionTitle(session),
+    status: session.status,
+    parentId: session.parentSessionId ?? undefined,
+    agentId: session.agentId ?? undefined,
+    isSystem: session.isSystem ?? false,
+    model: session.model ?? undefined,
+  };
+}
+
+function wsSend(ws, type, data) {
+  if (ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify({ type, data }));
+  }
+}
+
+function createDevLandingPage(port) {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PilotSwarm Portal Backend</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        background: #0d0d1a;
+        color: #e5e7eb;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+      }
+      main {
+        width: min(720px, calc(100vw - 32px));
+        background: #16213e;
+        border: 1px solid #334155;
+        border-radius: 16px;
+        padding: 24px;
+      }
+      code {
+        background: #0f172a;
+        padding: 2px 6px;
+        border-radius: 6px;
+      }
+      a { color: #22d3ee; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>PilotSwarm portal backend is running</h1>
+      <p>No production frontend build was found in <code>packages/portal/dist</code>.</p>
+      <p>For local development, run the React app separately with <code>npm run dev --workspace=packages/portal</code> and open <a href="http://localhost:5173">http://localhost:5173</a>.</p>
+      <p>The backend API/WebSocket server is listening on <code>http://localhost:${port}</code>.</p>
+    </main>
+  </body>
+</html>`;
+}
+
+function mapSessionEventToPortalMessages(sessionId, event) {
+  const timestamp = event.createdAt instanceof Date
+    ? event.createdAt.toISOString()
+    : new Date().toISOString();
+  const data = event.data ?? {};
+
+  switch (event.eventType) {
+    case "user.message":
+      return [{
+        type: "message",
+        data: {
+          sessionId,
+          role: "user",
+          content: data.content ?? "",
+          timestamp,
+        },
+      }];
+    case "assistant.message":
+      return [
+        {
+          type: "message",
+          data: {
+            sessionId,
+            role: "assistant",
+            content: data.content ?? "",
+            timestamp,
+          },
+        },
+        {
+          type: "thinking",
+          data: { sessionId, active: false },
+        },
+      ];
+    case "tool.execution_start":
+      return [{
+        type: "toolCall",
+        data: {
+          sessionId,
+          name: data.toolName ?? data.name ?? "unknown",
+          args: typeof data.arguments === "string"
+            ? data.arguments
+            : JSON.stringify(data.arguments ?? data.args ?? {}, null, 2),
+          status: "started",
+          durationMs: data.durationMs,
+        },
+      }];
+    case "tool.execution_complete":
+      return [{
+        type: "toolCall",
+        data: {
+          sessionId,
+          name: data.toolName ?? data.name ?? "unknown",
+          args: typeof data.arguments === "string"
+            ? data.arguments
+            : JSON.stringify(data.arguments ?? data.args ?? {}, null, 2),
+          status: data.error ? "failed" : "completed",
+          result: typeof data.result === "string"
+            ? data.result
+            : JSON.stringify(data.result ?? data.output ?? data.error ?? "", null, 2),
+          durationMs: data.durationMs,
+        },
+      }];
+    case "session.idle":
+      return [{
+        type: "thinking",
+        data: { sessionId, active: false },
+      }];
+    case "session.error":
+      return [
+        {
+          type: "thinking",
+          data: { sessionId, active: false },
+        },
+        {
+          type: "error",
+          data: { message: data.message ?? "Session error" },
+        },
+      ];
+    default:
+      return [];
+  }
+}
+
+function getPortalWorkerCount(explicitWorkers) {
+  if (typeof explicitWorkers === "number" && Number.isFinite(explicitWorkers)) {
+    return explicitWorkers;
+  }
+
+  if (process.env.PORTAL_TUI_MODE === "remote") return 0;
+  return 1;
+}
+
+async function startRuntime(workersRequested) {
+  const store = process.env.DATABASE_URL;
+  if (!store) {
+    throw new Error("Missing DATABASE_URL. The portal backend requires PostgreSQL.");
+  }
+
+  const workerCount = getPortalWorkerCount(workersRequested);
+  const pluginDirs = loadPluginDirs();
+  const workers = [];
+
+  for (let i = 0; i < workerCount; i++) {
+    const worker = new PilotSwarmWorker({
+      store,
+      githubToken: process.env.GITHUB_TOKEN,
+      logLevel: process.env.LOG_LEVEL || "info",
+      awsS3BucketName: process.env.AWS_S3_BUCKET_NAME,
+      awsS3Region: process.env.AWS_S3_REGION,
+      awsAccessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      awsSecretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      awsS3Endpoint: process.env.AWS_S3_ENDPOINT,
+      workerNodeId: `portal-${os.hostname()}-${i}`,
+      pluginDirs,
+    });
+    await worker.start();
+    workers.push(worker);
+  }
+
+  const primaryWorker = workers[0] ?? null;
+  const client = new PilotSwarmClient({
+    store,
+    blobEnabled: true,
+    ...(primaryWorker?.sessionPolicy ? { sessionPolicy: primaryWorker.sessionPolicy } : {}),
+    ...(primaryWorker?.allowedAgentNames?.length ? { allowedAgentNames: primaryWorker.allowedAgentNames } : {}),
+  });
+  await client.start();
+
+  const management = new PilotSwarmManagementClient({ store });
+  await management.start();
+
+  return {
+    allowedAgentNames: primaryWorker?.allowedAgentNames ?? [],
+    client,
+    management,
+    workers,
+    workerCount,
+  };
+}
+
+export async function startServer(opts = {}) {
+  const { port = 3001, workers } = opts;
+  const runtime = await startRuntime(workers);
 
   const app = express();
   const server = http.createServer(app);
+  const hasDist = fs.existsSync(path.join(DIST_DIR, "index.html"));
 
-  // Serve static files (index.html + xterm assets)
-  app.use(express.static(path.join(__dirname, "public")));
-
-  // Serve xterm.js from node_modules (may be hoisted to repo root)
-  const xtermBase = findPkgDir("@xterm/xterm");
-  const fitBase = findPkgDir("@xterm/addon-fit");
-  const webLinksBase = findPkgDir("@xterm/addon-web-links");
-  app.use("/xterm", express.static(xtermBase));
-  app.use("/xterm-addon-fit", express.static(fitBase));
-  app.use("/xterm-addon-web-links", express.static(webLinksBase));
-
-  // Health check
   app.get("/api/health", (_req, res) => {
-    res.json({ ok: true, activePtys: activePtys.size });
+    res.json({
+      ok: true,
+      embeddedWorkers: runtime.workerCount,
+    });
   });
 
-  // Track active PTY processes
-  const activePtys = new Map();
+  app.get("/api/models", (_req, res) => {
+    res.json({
+      models: runtime.management.listModels(),
+    });
+  });
 
-  // ── WebSocket server ──────────────────────────────────────────
-  const wss = new WebSocketServer({ server, path: "/ws" });
+  if (hasDist) {
+    app.use(express.static(DIST_DIR));
+  } else {
+    app.get("/", (_req, res) => {
+      res.status(200).send(createDevLandingPage(port));
+    });
+  }
+
+  const wss = new WebSocketServer({ server, path: "/portal-ws" });
 
   wss.on("connection", (ws) => {
-    console.log("[portal] Browser connected — spawning TUI...");
+    const unsubscribers = new Map();
+    const sessionHandles = new Map();
+    let listTimer = null;
+    let closed = false;
 
-    // Determine the env file and TUI mode to use
-    const envFile = process.env.PORTAL_ENV_FILE || ".env";
-    const tuiMode = process.env.PORTAL_TUI_MODE || "local";
+    async function getSessionHandle(sessionId) {
+      if (sessionHandles.has(sessionId)) return sessionHandles.get(sessionId);
+      const session = await runtime.client.resumeSession(sessionId);
+      sessionHandles.set(sessionId, session);
+      return session;
+    }
 
-    // Spawn the TUI in a PTY
-    const tuiCmd = path.join(REPO_ROOT, "packages/cli/bin/tui.js");
-    const ptyProcess = pty.spawn(process.execPath, [tuiCmd, tuiMode], {
-      name: "xterm-256color",
-      cols: 120,
-      rows: 40,
-      cwd: REPO_ROOT,
-      env: {
-        ...process.env,
-        TERM: "xterm-256color",
-        COLORTERM: "truecolor",
-        FORCE_COLOR: "3",
-      },
-    });
+    async function subscribeToSession(sessionId) {
+      if (unsubscribers.has(sessionId) || closed) return;
+      const session = await getSessionHandle(sessionId);
+      const unsubscribe = session.on((event) => {
+        for (const msg of mapSessionEventToPortalMessages(sessionId, event)) {
+          wsSend(ws, msg.type, msg.data);
+        }
+      });
+      unsubscribers.set(sessionId, unsubscribe);
+    }
 
-    const ptyId = ptyProcess.pid;
-    activePtys.set(ptyId, ptyProcess);
-    console.log(`[portal] TUI spawned (PID ${ptyId})`);
+    async function pushSessionList() {
+      const sessions = await runtime.management.listSessions();
+      wsSend(ws, "sessionList", {
+        sessions: sessions.map(mapSessionView),
+      });
 
-    // PTY → Browser: forward terminal output
-    ptyProcess.onData((data) => {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({ type: "output", data }));
+      for (const session of sessions) {
+        if (session.status !== "pending") {
+          await subscribeToSession(session.sessionId);
+        }
       }
-    });
+    }
 
-    // PTY exit → close WebSocket
-    ptyProcess.onExit(({ exitCode }) => {
-      console.log(`[portal] TUI exited (PID ${ptyId}, code ${exitCode})`);
-      activePtys.delete(ptyId);
-      if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({ type: "exit", code: exitCode }));
-        ws.close();
+    async function handleCreateSession(data = {}) {
+      const agentId = data.agentId ?? undefined;
+      const model = data.model ?? undefined;
+
+      let session;
+      if (agentId && runtime.allowedAgentNames.includes(agentId)) {
+        session = await runtime.client.createSessionForAgent(agentId, { model });
+      } else {
+        session = await runtime.client.createSession({
+          model,
+          ...(agentId
+            ? {
+                agentId,
+                boundAgentName: agentId,
+                promptLayering: { kind: "app-agent" },
+              }
+            : {}),
+        });
       }
-    });
 
-    // Browser → PTY: forward keyboard input + resize
-    ws.on("message", (raw) => {
+      sessionHandles.set(session.sessionId, session);
+      const view = await runtime.management.getSession(session.sessionId);
+      wsSend(ws, "sessionCreated", {
+        sessionId: session.sessionId,
+        title: fallbackSessionTitle(view ?? {
+          sessionId: session.sessionId,
+          title: null,
+          agentId,
+        }),
+        agentId,
+        model,
+      });
+      await pushSessionList();
+    }
+
+    async function handleSendMessage(data = {}) {
+      const { sessionId, message } = data;
+      if (!sessionId || !message) return;
+
+      const session = await getSessionHandle(sessionId);
+      wsSend(ws, "thinking", { sessionId, active: true });
+      await session.send(message);
+      await subscribeToSession(sessionId);
+      await pushSessionList();
+    }
+
+    async function handleRenameSession(data = {}) {
+      const { sessionId, title } = data;
+      if (!sessionId || !title) return;
+      await runtime.management.renameSession(sessionId, title);
+      await pushSessionList();
+    }
+
+    async function handleCancelSession(data = {}) {
+      const { sessionId } = data;
+      if (!sessionId) return;
+      await runtime.management.cancelSession(sessionId, "Cancelled from portal");
+      wsSend(ws, "thinking", { sessionId, active: false });
+      await pushSessionList();
+    }
+
+    async function handleDeleteSession(data = {}) {
+      const { sessionId } = data;
+      if (!sessionId) return;
+      await runtime.management.deleteSession(sessionId, "Deleted from portal");
+      const unsubscribe = unsubscribers.get(sessionId);
+      if (unsubscribe) unsubscribe();
+      unsubscribers.delete(sessionId);
+      sessionHandles.delete(sessionId);
+      wsSend(ws, "thinking", { sessionId, active: false });
+      await pushSessionList();
+    }
+
+    ws.on("message", async (raw) => {
       try {
         const msg = JSON.parse(String(raw));
         switch (msg.type) {
-          case "input":
-            ptyProcess.write(msg.data);
+          case "listSessions":
+            await pushSessionList();
             break;
-          case "resize":
-            if (msg.cols > 0 && msg.rows > 0) {
-              ptyProcess.resize(msg.cols, msg.rows);
-            }
+          case "listModels":
+            wsSend(ws, "models", { models: runtime.management.listModels() });
             break;
+          case "createSession":
+            await handleCreateSession(msg.data);
+            break;
+          case "send":
+            await handleSendMessage(msg.data);
+            break;
+          case "renameSession":
+            await handleRenameSession(msg.data);
+            break;
+          case "cancelSession":
+            await handleCancelSession(msg.data);
+            break;
+          case "deleteSession":
+            await handleDeleteSession(msg.data);
+            break;
+          default:
+            wsSend(ws, "error", { message: `Unknown portal message type: ${msg.type}` });
         }
-      } catch {
-        // Ignore malformed messages
+      } catch (error) {
+        wsSend(ws, "error", { message: error.message || "Portal request failed" });
       }
     });
 
-    // Browser disconnect → kill PTY
+    listTimer = setInterval(() => {
+      pushSessionList().catch((error) => {
+        wsSend(ws, "error", { message: error.message || "Failed to refresh sessions" });
+      });
+    }, 3_000);
+
+    pushSessionList().catch((error) => {
+      wsSend(ws, "error", { message: error.message || "Failed to load sessions" });
+    });
+
     ws.on("close", () => {
-      console.log(`[portal] Browser disconnected — killing TUI (PID ${ptyId})`);
-      activePtys.delete(ptyId);
-      try { ptyProcess.kill(); } catch {}
+      closed = true;
+      if (listTimer) clearInterval(listTimer);
+      for (const unsubscribe of unsubscribers.values()) unsubscribe();
+      unsubscribers.clear();
+      sessionHandles.clear();
     });
   });
 
-  // ── Graceful shutdown ─────────────────────────────────────────
-  function shutdown() {
+  let shuttingDown = false;
+  async function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log("[portal] Shutting down...");
-    for (const [pid, p] of activePtys) {
-      try { p.kill(); } catch {}
-    }
-    activePtys.clear();
-    server.close();
+    wss.clients.forEach((client) => client.close());
+    await Promise.allSettled(runtime.workers.map((worker) => worker.stop()));
+    await Promise.allSettled([
+      runtime.management.stop(),
+      runtime.client.stop(),
+      new Promise((resolve) => server.close(resolve)),
+    ]);
   }
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
 
-  // ── Start ─────────────────────────────────────────────────────
-  server.listen(port, () => {
-    console.log(`[portal] PilotSwarm Web at http://localhost:${port}`);
+  process.on("SIGINT", () => {
+    shutdown().finally(() => process.exit(0));
   });
+  process.on("SIGTERM", () => {
+    shutdown().finally(() => process.exit(0));
+  });
+
+  if (hasDist) {
+    app.get(/^(?!\/api).*/, (_req, res) => {
+      res.sendFile(path.join(DIST_DIR, "index.html"));
+    });
+  }
+
+  await new Promise((resolve) => {
+    server.listen(port, resolve);
+  });
+
+  console.log(`[portal] PilotSwarm Web backend at http://localhost:${port}`);
+  console.log(`[portal] Embedded workers: ${runtime.workerCount}`);
 
   return server;
 }
 
-// Auto-start when run directly
-if (process.argv[1]?.endsWith("server.js") ||
-    import.meta.url === `file://${process.argv[1]}`) {
-  startServer();
+if (process.argv[1]?.endsWith("server.js") || import.meta.url === `file://${process.argv[1]}`) {
+  await startServer();
 }
