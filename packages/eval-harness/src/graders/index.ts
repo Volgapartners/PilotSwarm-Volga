@@ -4,12 +4,14 @@ import { gradeToolSelection } from "./tool-selection.js";
 import { gradeOrdering } from "./ordering.js";
 import { gradeResponse } from "./response.js";
 import { gradeCmsState } from "./cms-state.js";
+import { gradeDurability } from "./durability.js";
 
 export { matchArgs, sortKeys } from "./match-args.js";
 export { gradeToolSelection } from "./tool-selection.js";
 export { gradeOrdering } from "./ordering.js";
 export { gradeResponse } from "./response.js";
 export { gradeCmsState } from "./cms-state.js";
+export { gradeDurability } from "./durability.js";
 
 export function gradeEvalCase(observed: ObservedResult, expected: EvalExpected): Score[] {
   const scores: Score[] = [];
@@ -78,6 +80,10 @@ export function gradeEvalCase(observed: ObservedResult, expected: EvalExpected):
 
   const cmsScore = gradeCmsState(observed.cmsState, expected.cms);
   if (cmsScore) scores.push(cmsScore);
+
+  if (expected.durability || observed.durability) {
+    scores.push(...gradeDurability(observed.durability, expected.durability));
+  }
 
   return scores;
 }
