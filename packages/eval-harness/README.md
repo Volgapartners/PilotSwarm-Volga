@@ -65,7 +65,7 @@ packages/eval-harness/
 │   │   └── jsonl.ts          # Incremental JSONL + failure artifacts
 │   └── fixtures/
 │       └── eval-tools.ts     # test_add, test_multiply, test_weather
-├── test/                     # 21 test files, 331 tests
+├── test/                     # 26 test files, 469 tests (incl. integration.test.ts)
 ├── datasets/
 │   └── tool-call-correctness.v1.json   # Golden dataset v1 (6 cases)
 ├── package.json
@@ -297,13 +297,15 @@ File paths are sanitized — `runId` and `caseId` are stripped of path separator
 
 The harness is designed for incremental extension:
 
-| Interface | V1 Implementation | Future |
-|-----------|-------------------|--------|
-| `Driver` | FakeDriver, LiveDriver | MCP driver, remote AKS driver |
-| `Reporter` | Console, JSONL | Langfuse reporter, OTel exporter |
-| Graders | Code-only (deterministic) | LLM-as-judge, trajectory scoring |
-| Datasets | Static JSON | Synthetic generation, trace-to-dataset |
-| Matrix | Single model | Model × context × compaction × reasoning |
+| Interface | V1 Implementation | V2-V5 (shipped) |
+|-----------|-------------------|-----------------|
+| `Driver` | FakeDriver, LiveDriver | ScriptedDriver (V3), FakeMultiTurnDriver (V4) |
+| `Reporter` | Console, JSONL | PRCommentReporter (V5b) |
+| Graders | Code-only (deterministic) | gradeDurability (V3), gradeTrajectory (V4), LLMJudgeGrader (V5a) |
+| Runners | EvalRunner | MultiTrialRunner (V2), TrajectoryRunner (V4) |
+| Datasets | Static JSON | Durability + multi-turn fixtures (V3, V4) |
+| Matrix | Single model | Model × context × compaction × reasoning (V2) |
+| CI | passRateFloor only | RegressionDetector + CIGate + Baseline (V5b) |
 
 ### Writing a Custom Reporter
 
@@ -412,6 +414,163 @@ console.log(mc.pValue, mc.method); // p-value, "exact" or "chi2-yates"
 // Non-parametric comparison of two independent distributions
 const mw = mannWhitneyU([0.8, 0.9, 0.85], [0.6, 0.7, 0.65]);
 ```
+
+## V3: Crash Recovery & Durability
+
+V3 adds first-class scoring for the unique value PilotSwarm provides — durable execution across worker crashes, dehydration, and recovery. The `ScriptedDriver` injects faults at specific points and the durability grader scores recovery against `expected.durability` constraints.
+
+```typescript
+import {
+  EvalRunner,
+  ScriptedDriver,
+  gradeDurability,
+  type ScriptedScenario,
+  type EvalTask,
+} from "pilotswarm-eval-harness";
+
+const scenarios: ScriptedScenario[] = [
+  {
+    sampleId: "crash.recovers",
+    steps: [
+      { type: "respond", response: /* ObservedResult */ },
+      { type: "crash", faultPoint: "during_tool_call", faultMode: "worker_crash" },
+      {
+        type: "recover",
+        recoveryResponse: /* ObservedResult with cmsState: "idle" */,
+        durability: { dehydrated: true, hydrated: true, workerHandoff: true },
+      },
+    ],
+  },
+];
+
+const runner = new EvalRunner({ driver: new ScriptedDriver(scenarios) });
+const result = await runner.runTask(taskWithDurabilityExpectations);
+```
+
+The grader emits `crash-recovery`, `post-recovery-state`, `tool-calls-after-recovery`, `dehydration`, `hydration`, and `worker-handoff` scores. Fault points: `before_turn`, `during_tool_call`, `after_tool_call`, `after_turn`, `after_dehydrate`, `before_hydrate`. Fault modes: `worker_crash`, `tool_timeout`, `tool_throw`, `network_disconnect`. The `datasets/durability-scenarios.v1.json` fixture bundles canonical recovery scenarios.
+
+## V4: Multi-Turn & Trajectory Evaluation
+
+V4 grades trajectories — multi-turn conversations with per-turn, cross-turn, and holistic scoring. `TrajectoryRunner` drives a `TrajectoryTask` (turn-shaped fixtures) through a `Driver`-style `MultiTurnDriver` and feeds the observed trajectory through `gradeTrajectory()`.
+
+```typescript
+import {
+  TrajectoryRunner,
+  FakeMultiTurnDriver,
+  type TrajectoryTask,
+  type ObservedTrajectory,
+} from "pilotswarm-eval-harness";
+
+const task: TrajectoryTask = {
+  schemaVersion: 1,
+  id: "trajectory-demo",
+  // ...
+  samples: [
+    {
+      id: "remember-color",
+      turns: [
+        { input: { prompt: "Remember my favorite color is blue." }, expected: { noToolCall: true } },
+        { input: { prompt: "What is my favorite color?" }, expected: { response: { containsAny: ["blue"] } } },
+      ],
+      expected: {
+        goalCompleted: true,
+        maxTotalToolCalls: 0,
+        contextRetention: [{ term: "blue", mustAppearAfterTurn: 0 }],
+      },
+    },
+  ],
+};
+
+const runner = new TrajectoryRunner({
+  driver: new FakeMultiTurnDriver([{ sampleId: "remember-color", trajectory: observedTrajectory }]),
+});
+const result = await runner.runTask(task);
+// result.cases[0].trajectoryScore = { turnScores, crossTurnScores, holisticScores }
+```
+
+Holistic scores include `turn-count`, `goal-completed`, and `call-budget`. Cross-turn scores cover `context-retention` (terms must persist after a given turn). The `datasets/multi-turn-scenarios.v1.json` fixture bundles canonical multi-turn flows.
+
+## V5: LLM-as-Judge + CI Gates
+
+V5 has two halves.
+
+### V5a — LLM-as-Judge
+
+For subjective dimensions (helpfulness, accuracy, safety, …) `LLMJudgeGrader` runs a `Rubric` of criteria against a prompt+response pair using a pluggable `JudgeClient`. Cost is tracked per criterion and capped by `budgetUsd`. An optional `JudgeCache` (e.g. `InMemoryJudgeCache`) deduplicates by `(prompt, response, criterionId, rubricVersion, judgeId)`.
+
+```typescript
+import {
+  LLMJudgeGrader,
+  FakeJudgeClient,
+  InMemoryJudgeCache,
+  type Rubric,
+} from "pilotswarm-eval-harness";
+
+const rubric: Rubric = {
+  id: "quality",
+  name: "Quality",
+  version: "1.0.0",
+  criteria: [
+    { id: "helpfulness", description: "Is the response helpful?", scale: { min: 1, max: 5 }, passThreshold: 0.6 },
+    { id: "accuracy",    description: "Is the response accurate?", scale: { min: 1, max: 5 }, passThreshold: 0.6 },
+  ],
+};
+
+const grader = new LLMJudgeGrader({
+  client: judgeClient, // any JudgeClient impl
+  rubric,
+  cache: new InMemoryJudgeCache(),
+  budgetUsd: 0.50,
+});
+
+const { scores, costs, totalCostUsd } = await grader.grade(prompt, response);
+```
+
+When the running cost exceeds `budgetUsd` mid-batch, remaining criteria short-circuit with a `"Budget exceeded"` reason instead of being silently dropped. `JudgeResult.normalizedScore` is in `[0,1]` and `pass` is derived from `passThreshold`.
+
+### V5b — Baselines, Regression Detection, CI Gates, PR Comments
+
+V5b closes the loop: persist a `MultiTrialResult` as a `Baseline`, detect statistically significant regressions on the next run, and gate CI on `passRateFloor`/`maxRegressions`/`maxCostUsd`. A `PRCommentReporter` emits Markdown for surfacing in PR reviews.
+
+```typescript
+import {
+  saveBaseline,
+  loadBaseline,
+  RegressionDetector,
+  CIGate,
+  PRCommentReporter,
+} from "pilotswarm-eval-harness";
+
+// 1. Persist this run as the new baseline
+saveBaseline(currentResult, ".eval-results/baseline.json");
+
+// 2. On the next run: load baseline, detect regressions
+const baseline = loadBaseline(".eval-results/baseline.json");
+const regressions = new RegressionDetector(0.05).detect(baseline, nextResult);
+
+// 3. Gate CI on the combined signal
+const gate = new CIGate({ passRateFloor: 0.8, maxRegressions: 0, maxCostUsd: 5 });
+const verdict = gate.evaluate(nextResult, regressions, totalCostUsd);
+process.exit(gate.exitCode(verdict));
+
+// 4. Emit a PR-ready Markdown summary
+const pr = new PRCommentReporter(".eval-results/pr-comment.md");
+pr.onMultiTrialComplete(nextResult);
+pr.writeGateResult(verdict, regressions);
+```
+
+`RegressionDetector` uses a two-proportion z-test on baseline vs. current pass rates (baselines persist aggregate counts, not per-sample paired outcomes); `direction` is `"regressed" | "improved" | "unchanged"`. `CIGate.evaluate()` returns `{ pass, reasons[], passRate, regressionCount, totalCostUsd }`. McNemar's test is still exported as `mcNemarTest` for callers that have paired per-sample data.
+
+## Roadmap
+
+| Version | Scope | Status |
+|---------|-------|--------|
+| V1 | Schema, drivers, graders, runner, console + JSONL reporters, golden fixture | ✅ Shipped |
+| V2 | Multi-trial, matrix, statistical utilities (Wilson, bootstrap, McNemar, Mann-Whitney), pass@k | ✅ Shipped |
+| V3 | Scripted faults, durability scoring, recovery scenarios | ✅ Shipped |
+| V4 | Multi-turn / trajectory evaluation, per-turn + cross-turn + holistic scoring | ✅ Shipped |
+| V5a | LLM-as-judge, rubric schema, budget caps, judge cache | ✅ Shipped |
+| V5b | Baselines, regression detection (two-proportion z-test), CI gates, PR comment reporter | ✅ Shipped |
 
 ## Design Decisions
 

@@ -153,6 +153,28 @@ import {
   bootstrapCI,
   mcNemarTest,
   mannWhitneyU,
+  standardNormalCdf,
+
+  // V3: Durability
+  ScriptedDriver,
+  gradeDurability,
+
+  // V4: Trajectory
+  TrajectoryRunner,
+  FakeMultiTurnDriver,
+  gradeTrajectory,
+
+  // V5a: LLM-as-judge
+  LLMJudgeGrader,
+  FakeJudgeClient,
+  InMemoryJudgeCache,
+
+  // V5b: CI gates
+  saveBaseline,
+  loadBaseline,
+  RegressionDetector,
+  CIGate,
+  PRCommentReporter,
 
   // Types
   type EvalTask,
@@ -172,6 +194,28 @@ import {
   type MatrixConfigOverrides,
   type MatrixSummary,
   type AggregateReporter,
+
+  // V3-V5 Types
+  type DurabilityObservation,
+  type ScriptedScenario,
+  type ScriptedStep,
+  type TrajectoryTask,
+  type TrajectorySample,
+  type ObservedTrajectory,
+  type ObservedTurn,
+  type TrajectoryScore,
+  type TrajectoryRunResult,
+  type Rubric,
+  type RubricCriterion,
+  type JudgeResult,
+  type JudgeCost,
+  type JudgeClient,
+  type JudgeCache,
+  type Baseline,
+  type BaselineSample,
+  type RegressionResult,
+  type CIGateConfig,
+  type CIGateResult,
 } from "pilotswarm-eval-harness";
 ```
 
@@ -270,6 +314,125 @@ Pure functions exported from `stats.ts`:
 | `bootstrapCI(values, alpha?, reps?, rng?)` | Bootstrap percentile CI for the mean. Defaults: `alpha=0.05`, `reps=10_000`. Returns `{ lower, upper, point, reps, alpha }`. |
 | `mcNemarTest(pairs)` | McNemar's test for paired binary outcomes (regression detection). Picks exact binomial vs chi² with Yates continuity correction; returns `method` discriminator. |
 | `mannWhitneyU(a, b)` | Mann-Whitney U for two independent samples |
+| `standardNormalCdf(z)` | Standard normal CDF (used internally; exported for advanced custom stats) |
+
+## V3: Crash Recovery & Durability
+
+V3 adds first-class scoring for PilotSwarm's durable-execution guarantees. The `ScriptedDriver` injects faults at well-known points and the durability grader scores recovery against `expected.durability` constraints in the fixture.
+
+```typescript
+import {
+  EvalRunner,
+  ScriptedDriver,
+  type ScriptedScenario,
+} from "pilotswarm-eval-harness";
+
+const scenarios: ScriptedScenario[] = [{
+  sampleId: "crash.recovers",
+  steps: [
+    { type: "respond", response: /* ObservedResult */ },
+    { type: "crash", faultPoint: "during_tool_call", faultMode: "worker_crash" },
+    {
+      type: "recover",
+      recoveryResponse: /* ObservedResult with cmsState: "idle" */,
+      durability: { dehydrated: true, hydrated: true, workerHandoff: true },
+    },
+  ],
+}];
+
+const runner = new EvalRunner({ driver: new ScriptedDriver(scenarios) });
+const result = await runner.runTask(taskWithDurabilityExpectations);
+```
+
+`gradeDurability` emits `crash-recovery`, `post-recovery-state`, `tool-calls-after-recovery`, `dehydration`, `hydration`, and `worker-handoff` scores. Fault points: `before_turn`, `during_tool_call`, `after_tool_call`, `after_turn`, `after_dehydrate`, `before_hydrate`. Fault modes: `worker_crash`, `tool_timeout`, `tool_throw`, `network_disconnect`. Canonical scenarios: `datasets/durability-scenarios.v1.json`.
+
+## V4: Multi-Turn & Trajectory Evaluation
+
+V4 grades trajectories — multi-turn conversations with per-turn, cross-turn, and holistic scoring. `TrajectoryRunner` drives a `TrajectoryTask` through a `MultiTurnDriver` and feeds the observed trajectory through `gradeTrajectory()`.
+
+```typescript
+import {
+  TrajectoryRunner,
+  FakeMultiTurnDriver,
+  type TrajectoryTask,
+} from "pilotswarm-eval-harness";
+
+const task: TrajectoryTask = {
+  schemaVersion: 1, id: "trajectory-demo", name: "...", description: "...", version: "1.0.0",
+  samples: [{
+    id: "remember-color",
+    turns: [
+      { input: { prompt: "Remember my favorite color is blue." }, expected: { noToolCall: true } },
+      { input: { prompt: "What is my favorite color?" }, expected: { response: { containsAny: ["blue"] } } },
+    ],
+    expected: {
+      goalCompleted: true,
+      maxTotalToolCalls: 0,
+      contextRetention: [{ term: "blue", mustAppearAfterTurn: 0 }],
+    },
+  }],
+};
+
+const runner = new TrajectoryRunner({
+  driver: new FakeMultiTurnDriver([{ sampleId: "remember-color", trajectory: observed }]),
+});
+const result = await runner.runTask(task);
+// result.cases[0].trajectoryScore = { turnScores, crossTurnScores, holisticScores }
+```
+
+Holistic scores include `turn-count`, `goal-completed`, `call-budget`. Cross-turn scores include `context-retention`. Canonical fixtures: `datasets/multi-turn-scenarios.v1.json`.
+
+## V5: LLM-as-Judge + CI Gates
+
+### V5a — LLM-as-Judge
+
+`LLMJudgeGrader` runs a `Rubric` of criteria against a (prompt, response) pair via a pluggable `JudgeClient`. Cost is tracked per criterion and capped by `budgetUsd`; an optional `JudgeCache` (e.g. `InMemoryJudgeCache`) deduplicates by `(prompt, response, criterionId, rubricVersion, judgeId)`.
+
+```typescript
+import { LLMJudgeGrader, InMemoryJudgeCache, type Rubric } from "pilotswarm-eval-harness";
+
+const rubric: Rubric = {
+  id: "quality", name: "Quality", version: "1.0.0",
+  criteria: [
+    { id: "helpfulness", description: "Helpful?", scale: { min: 1, max: 5 }, passThreshold: 0.6 },
+    { id: "accuracy",    description: "Accurate?", scale: { min: 1, max: 5 }, passThreshold: 0.6 },
+  ],
+};
+
+const grader = new LLMJudgeGrader({
+  client: judgeClient,
+  rubric,
+  cache: new InMemoryJudgeCache(),
+  budgetUsd: 0.50,
+});
+
+const { scores, costs, totalCostUsd } = await grader.grade(prompt, response);
+```
+
+When the running cost exceeds `budgetUsd`, remaining criteria short-circuit with a `"Budget exceeded"` reason instead of being silently dropped. `JudgeResult.normalizedScore` is in `[0,1]`; `pass` is derived from `passThreshold`.
+
+### V5b — Baselines, Regression Detection, CI Gates, PR Comments
+
+V5b closes the loop: persist a `MultiTrialResult` as a `Baseline`, detect statistically significant regressions on the next run, gate CI on `passRateFloor`/`maxRegressions`/`maxCostUsd`, and emit a PR-ready Markdown summary.
+
+```typescript
+import { saveBaseline, loadBaseline, RegressionDetector, CIGate, PRCommentReporter } from "pilotswarm-eval-harness";
+
+saveBaseline(currentResult, ".eval-results/baseline.json");
+
+const baseline = loadBaseline(".eval-results/baseline.json");
+const regressions = new RegressionDetector(0.05).detect(baseline, nextResult);
+
+const gate = new CIGate({ passRateFloor: 0.8, maxRegressions: 0, maxCostUsd: 5 });
+const verdict = gate.evaluate(nextResult, regressions, totalCostUsd);
+process.exit(gate.exitCode(verdict));
+
+const pr = new PRCommentReporter(".eval-results/pr-comment.md");
+pr.onMultiTrialComplete(nextResult);
+pr.writeGateResult(verdict, regressions);
+```
+
+`RegressionDetector` uses a two-proportion z-test on baseline vs. current pass rates (baselines persist aggregate counts, not per-sample paired outcomes); `direction` is `"regressed" | "improved" | "unchanged"`. `CIGate.evaluate()` returns `{ pass, reasons[], passRate, regressionCount, totalCostUsd }`. McNemar's test is still exported as `mcNemarTest` for callers that have paired per-sample data.
 
 ## Roadmap
 
@@ -277,9 +440,9 @@ Pure functions exported from `stats.ts`:
 |-------|------|--------|
 | **V1** | Runner + code graders + golden dataset | ✅ Shipped |
 | **V2** | Multi-trial stats + parameter matrix (model × config) | ✅ Shipped |
-| **V3** | Crash recovery + durability evals | Planned |
-| **V4** | Multi-agent + multi-turn evals | Planned |
-| **V5** | LLM-as-judge + Langfuse + CI gates | Planned |
+| **V3** | Crash recovery + durability evals | ✅ Shipped |
+| **V4** | Multi-agent + multi-turn evals | ✅ Shipped |
+| **V5** | LLM-as-judge + baselines + CI gates + PR comments | ✅ Shipped |
 
 ## Related Docs
 
