@@ -65,7 +65,7 @@ packages/eval-harness/
 │   │   └── jsonl.ts          # Incremental JSONL + failure artifacts
 │   └── fixtures/
 │       └── eval-tools.ts     # test_add, test_multiply, test_weather
-├── test/                     # 15 test files, 196 tests
+├── test/                     # 21 test files, 331 tests
 ├── datasets/
 │   └── tool-call-correctness.v1.json   # Golden dataset v1 (6 cases)
 ├── package.json
@@ -152,8 +152,12 @@ Reporters receive events as evals execute:
 |----------|--------|----------|
 | `ConsoleReporter` | ✅/❌/⚠️ table to stdout | Interactive use |
 | `JsonlReporter` | `.eval-results/<runId>.jsonl` + failure artifacts | CI, history |
+| `ConsoleAggregateReporter` | Multi-trial / matrix summary to stdout | Interactive V2 runs |
+| `MarkdownReporter` | Markdown report to file | CI artifacts, PR comments |
 
 Reporter interface is async-ready (`void | Promise<void>`) for future Langfuse integration.
+
+V2 aggregate reporters implement a separate `AggregateReporter` interface with `onMultiTrialComplete(result)` and `onMatrixComplete(result)` hooks.
 
 ## Grading Reference
 
@@ -327,6 +331,88 @@ class RemoteDriver implements Driver {
 }
 ```
 
+## V2: Multi-Trial, Matrix, and Statistics
+
+### Multi-Trial Evaluation
+
+Run a task N times to get a statistically meaningful pass rate with confidence intervals and pass@k.
+
+```ts
+import { MultiTrialRunner, FakeDriver, ConsoleAggregateReporter } from "pilotswarm-eval-harness";
+
+const runner = new MultiTrialRunner({
+  driverFactory: () => new FakeDriver(scenarios),
+  trials: 10,
+  passAtKValues: [1, 5, 10],
+});
+
+const result = await runner.runTask(task);
+console.log(result.summary.meanPassRate); // 0.85
+new ConsoleAggregateReporter().onMultiTrialComplete(result);
+```
+
+`MultiTrialResult` includes per-sample aggregates (`passRate`, `passAtK`, `wilsonCI`, per-score mean/stddev) and a task-level summary (`meanPassRate`, `stddevPassRate`, `passRateCI`). The raw per-trial `RunResult[]` is preserved for deeper analysis.
+
+### Parameter Matrix
+
+Compare models × configs for a single task. Each cell runs its own multi-trial evaluation internally.
+
+```ts
+import { MatrixRunner, MarkdownReporter, LiveDriver } from "pilotswarm-eval-harness";
+
+const runner = new MatrixRunner({
+  driverFactory: () => new LiveDriver(),
+  models: ["gpt-4o", "claude-sonnet"],
+  configs: [
+    { id: "default", label: "Default", overrides: {} },
+    { id: "strict", label: "Strict Prompt", overrides: { systemMessage: "Be precise." } },
+  ],
+  trials: 5,
+});
+
+const result = await runner.runTask(task);
+new MarkdownReporter("/path/to/output.md").onMatrixComplete(result);
+```
+
+`MatrixConfigOverrides` currently supports `systemMessage` and `timeoutMs`. `MatrixResult.summary` surfaces `bestPassRate` and `worstPassRate` cells.
+
+### Statistical Utilities
+
+Pure functions exported from `stats.ts` — no eval dependencies, safe to use standalone.
+
+```ts
+import {
+  passAtK,
+  meanStddev,
+  wilsonInterval,
+  bootstrapCI,
+  mcNemarTest,
+  mannWhitneyU,
+} from "pilotswarm-eval-harness";
+
+// pass@k from Chen et al. (HumanEval) — unbiased estimator
+const pk = passAtK([true, false, true, false, true], 3);
+
+// Wilson score interval (binomial CI)
+const ci = wilsonInterval(17, 20); // { lower, upper, point, z }
+
+// Bootstrap percentile CI for the mean (default alpha=0.05, reps=10_000)
+// Signature: bootstrapCI(values, alpha?, reps?, rng?)
+const boot = bootstrapCI([0.7, 0.8, 0.9, 0.85], 0.05, 10_000);
+// { lower, upper, point, reps, alpha }
+
+// Regression detection between paired runs (A vs B)
+const mc = mcNemarTest([
+  [true, false],  // regression
+  [false, true],  // improvement
+  [true, true],   // concordant
+]);
+console.log(mc.pValue, mc.method); // p-value, "exact" or "chi2-yates"
+
+// Non-parametric comparison of two independent distributions
+const mw = mannWhitneyU([0.8, 0.9, 0.85], [0.6, 0.7, 0.65]);
+```
+
 ## Design Decisions
 
 | Decision | Rationale |
@@ -347,6 +433,6 @@ class RemoteDriver implements Driver {
 | Existing Tests (`packages/sdk/test/local/`) | Eval Harness (`packages/eval-harness/`) |
 |---------------------------------------------|----------------------------------------|
 | Assert **system** behavior (events fire, CMS persists, orchestration replays) | Measure **LLM** behavior (tool selection, arg accuracy, sequencing) |
-| One run, hard fail | passRateFloor, statistical signal (multi-trial in V2) |
+| One run, hard fail | passRateFloor, statistical signal (multi-trial + matrix in V2) |
 | vitest `describe`/`it` | Same runner, different semantics |
 | Share: `withClient()`, PilotSwarm SDK, CMS helpers | Share: tool definitions pattern, test env isolation |

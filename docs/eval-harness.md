@@ -138,6 +138,22 @@ import {
   // Fixtures (for custom tools)
   createEvalToolTracker,
 
+  // V2: Multi-trial + matrix runners
+  MultiTrialRunner,
+  MatrixRunner,
+
+  // V2: Aggregate reporters
+  ConsoleAggregateReporter,
+  MarkdownReporter,
+
+  // V2: Statistical utilities
+  passAtK,
+  meanStddev,
+  wilsonInterval,
+  bootstrapCI,
+  mcNemarTest,
+  mannWhitneyU,
+
   // Types
   type EvalTask,
   type EvalSample,
@@ -145,15 +161,122 @@ import {
   type RunResult,
   type Driver,
   type Reporter,
+
+  // V2 Types
+  type MultiTrialResult,
+  type MultiTrialSummary,
+  type SampleTrialResult,
+  type MatrixResult,
+  type MatrixCell,
+  type MatrixConfig,
+  type MatrixConfigOverrides,
+  type MatrixSummary,
+  type AggregateReporter,
 } from "pilotswarm-eval-harness";
 ```
+
+## V2: Multi-Trial, Matrix, and Statistics
+
+V2 adds statistical rigor on top of the V1 single-run runner: repeated trials with confidence intervals and pass@k, and a parameter matrix for comparing models × configs.
+
+### MultiTrialRunner
+
+Runs a task N times and aggregates per-sample and task-level results.
+
+```ts
+import { MultiTrialRunner, FakeDriver, ConsoleAggregateReporter } from "pilotswarm-eval-harness";
+
+const runner = new MultiTrialRunner({
+  driverFactory: () => new FakeDriver(scenarios),
+  trials: 10,
+  passAtKValues: [1, 5, 10],
+});
+
+const result = await runner.runTask(task);
+new ConsoleAggregateReporter().onMultiTrialComplete(result);
+```
+
+`MultiTrialRunnerOptions`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `driverFactory` | `() => Driver` | ✅ | Returns a fresh driver per trial |
+| `trials` | number | ✅ | Number of repetitions (≥ 1) |
+| `reporters` | `Reporter[]` | `[]` | Per-trial V1 reporters |
+| `concurrency` | number | `1` | Parallel trials |
+| `passAtKValues` | `number[]` | `[1, 5, 10]` | `k` values to compute |
+| `reporterFactory` | `() => Reporter[]` | | Required for stateful reporters when `concurrency > 1`; creates fresh reporters per trial |
+| `gitSha` / `model` | string | | Passed into the nested runners |
+
+`MultiTrialResult` shape:
+
+- `summary`: `{ total, trials, meanPassRate, stddevPassRate, passRateCI }`
+- `samples`: `SampleTrialResult[]` — per-sample `{ passRate, passCount/failCount/errorCount, passAtK, scores, wilsonCI }`
+- `rawRuns`: the underlying `RunResult[]` for deeper analysis
+
+### MatrixRunner
+
+Sweeps models × configs for a single task. Each cell delegates to `MultiTrialRunner`.
+
+```ts
+import { MatrixRunner, MarkdownReporter, LiveDriver } from "pilotswarm-eval-harness";
+
+const runner = new MatrixRunner({
+  driverFactory: () => new LiveDriver(),
+  models: ["gpt-4o", "claude-sonnet"],
+  configs: [
+    { id: "default", label: "Default", overrides: {} },
+    { id: "strict", label: "Strict Prompt", overrides: { systemMessage: "Be precise." } },
+  ],
+  trials: 5,
+});
+
+const result = await runner.runTask(task);
+new MarkdownReporter("eval-matrix.md").onMatrixComplete(result);
+```
+
+`MatrixConfig.overrides` (type `MatrixConfigOverrides`) currently supports:
+
+- `systemMessage` — overrides each sample's `input.systemMessage`
+- `timeoutMs` — overrides each sample's per-sample timeout
+
+`MatrixResult.summary` exposes `bestPassRate` and `worstPassRate` as `{ model, configId, passRate }` refs. `MatrixResult.cells` contains the full `MultiTrialResult` for each (model × config) pair.
+
+### Aggregate Reporters
+
+V2 introduces a new `AggregateReporter` interface distinct from V1's per-case `Reporter`:
+
+```ts
+interface AggregateReporter {
+  onMultiTrialComplete(result: MultiTrialResult): void | Promise<void>;
+  onMatrixComplete(result: MatrixResult): void | Promise<void>;
+}
+```
+
+| Reporter | Output |
+|----------|--------|
+| `ConsoleAggregateReporter` | Formatted summary (mean pass rate, CI, per-sample table, best/worst cell) |
+| `MarkdownReporter` | Markdown report written to a file path — suitable for CI artifacts / PR comments |
+
+### Statistical Utilities
+
+Pure functions exported from `stats.ts`:
+
+| Function | Use |
+|----------|-----|
+| `passAtK(results, k)` | Chen et al. unbiased `pass@k` estimator |
+| `meanStddev(values)` | Sample mean + stddev + n |
+| `wilsonInterval(successes, n, z?)` | Wilson score interval for binomial proportion |
+| `bootstrapCI(values, alpha?, reps?, rng?)` | Bootstrap percentile CI for the mean. Defaults: `alpha=0.05`, `reps=10_000`. Returns `{ lower, upper, point, reps, alpha }`. |
+| `mcNemarTest(pairs)` | McNemar's test for paired binary outcomes (regression detection). Picks exact binomial vs chi² with Yates continuity correction; returns `method` discriminator. |
+| `mannWhitneyU(a, b)` | Mann-Whitney U for two independent samples |
 
 ## Roadmap
 
 | Phase | What | Status |
 |-------|------|--------|
 | **V1** | Runner + code graders + golden dataset | ✅ Shipped |
-| **V2** | Multi-trial stats + parameter matrix (model × config) | Planned |
+| **V2** | Multi-trial stats + parameter matrix (model × config) | ✅ Shipped |
 | **V3** | Crash recovery + durability evals | Planned |
 | **V4** | Multi-agent + multi-turn evals | Planned |
 | **V5** | LLM-as-judge + Langfuse + CI gates | Planned |
