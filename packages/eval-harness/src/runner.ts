@@ -115,7 +115,11 @@ export class EvalRunner {
       let observed;
       try {
         observed = await Promise.race([
-          this.driver.run(sample, { timeout: timeoutMs, signal: controller.signal }),
+          this.driver.run(sample, {
+            timeout: timeoutMs,
+            signal: controller.signal,
+            model: this.model,
+          }),
           timeoutPromise,
         ]);
       } finally {

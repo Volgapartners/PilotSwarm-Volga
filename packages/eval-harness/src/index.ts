@@ -48,3 +48,48 @@ export {
 
 // Observers
 export { extractObservedCalls } from "./observers/tool-tracker.js";
+
+// --- V2: Stats ---
+export {
+  passAtK,
+  meanStddev,
+  wilsonInterval,
+  bootstrapCI,
+  mcNemarTest,
+  mannWhitneyU,
+} from "./stats.js";
+
+// --- V2: Multi-Trial ---
+export { MultiTrialRunner } from "./multi-trial.js";
+export type { MultiTrialRunnerOptions } from "./multi-trial.js";
+
+// --- V2: Matrix ---
+export { MatrixRunner } from "./matrix.js";
+export type { MatrixRunnerOptions } from "./matrix.js";
+
+// --- V2: Aggregate Reporters ---
+export type { AggregateReporter } from "./reporters/aggregate-types.js";
+export { ConsoleAggregateReporter } from "./reporters/console-aggregate.js";
+export { MarkdownReporter } from "./reporters/markdown.js";
+
+// --- V2: Types ---
+export type {
+  SampleTrialResult,
+  MultiTrialSummary,
+  MultiTrialResult,
+  MatrixConfigOverrides,
+  MatrixConfig,
+  MatrixCell,
+  MatrixSummary,
+  MatrixResult,
+} from "./types.js";
+export {
+  SampleTrialResultSchema,
+  MultiTrialSummarySchema,
+  MultiTrialResultSchema,
+  MatrixConfigOverridesSchema,
+  MatrixConfigSchema,
+  MatrixCellSchema,
+  MatrixSummarySchema,
+  MatrixResultSchema,
+} from "./types.js";
