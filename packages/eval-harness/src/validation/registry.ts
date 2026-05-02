@@ -485,6 +485,19 @@ export const STRICT_SCHEMA_REGISTRY: ReadonlyArray<RegistryEntry> = [
       samples: [],
     },
   },
+  {
+    // G9: a single persisted CMS session event captured by LiveDriver via
+    // `session.getMessages()`. Strict because we explicitly map fields from
+    // the SDK shape into this canonical form — no SDK passthrough is allowed.
+    // Lives in `ObservedResult.cmsEvents` (the parent is lenient).
+    name: "CmsObservedEventSchema",
+    schema: types.CmsObservedEventSchema,
+    valid: {
+      seq: 0,
+      eventType: "user.message",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    },
+  },
 ];
 
 const REGISTRY_NAMES: ReadonlySet<string> = new Set(

@@ -7,6 +7,15 @@ import { extractObservedCalls } from "../observers/tool-tracker.js";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyCtor = new (...args: any[]) => any;
 
+/**
+ * G9: hard cap on the number of CMS events captured per `LiveDriver.run()`.
+ * The SDK's `catalog.getSessionEvents` polls 200 at a time; LIVE evals are
+ * single-turn or small-trial sequences that rarely exceed a few dozen
+ * events. 1000 is a generous ceiling that prevents runaway memory in the
+ * unlikely case of a misbehaving session producing huge event tails.
+ */
+const LIVE_DRIVER_CMS_EVENT_CAP = 1000;
+
 export interface LiveDriverDeps {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   createEnv?: (suite: string) => any;
@@ -113,6 +122,10 @@ export class LiveDriver implements Driver {
     let sessionId = "";
     let finalResponse = "";
     let cmsState: string | undefined;
+    // G9: collected CMS events for system-tool evidence + worker-handoff
+    // verification. Captured between `getInfo()` and `client.stop()` via the
+    // SDK's `session.getMessages()` API (which reads from the CMS).
+    let cmsEvents: ObservedResult["cmsEvents"] | undefined;
     // F25: track whether the primary try-body succeeded. Cleanup errors must
     // surface when primary succeeded, but must NOT mask a primary failure —
     // they are logged to stderr instead.
@@ -211,6 +224,41 @@ export class LiveDriver implements Driver {
       // older field name still produce a non-undefined cmsState. Current
       // SDK contract: `status` is authoritative.
       cmsState = info?.status ?? (info as any)?.state ?? undefined;
+
+      // G9: capture the full CMS event log via the public SDK API.
+      // `session.getMessages(limit)` reads from CMS via `catalog.getSessionEvents`.
+      // We bound the limit defensively (matches the SDK's polling cap of 200
+      // per call) but request a generous total so even long-running sessions
+      // surface their full event tail. Failures here MUST NOT abort the run —
+      // event capture is supplementary observability, not the primary signal.
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const events: any[] = (await session.getMessages?.(LIVE_DRIVER_CMS_EVENT_CAP)) ?? [];
+        if (Array.isArray(events) && events.length > 0) {
+          cmsEvents = events.map((e) => {
+            const createdAt =
+              e?.createdAt instanceof Date
+                ? e.createdAt.toISOString()
+                : typeof e?.createdAt === "string"
+                  ? e.createdAt
+                  : new Date().toISOString();
+            const out: NonNullable<ObservedResult["cmsEvents"]>[number] = {
+              seq: typeof e?.seq === "number" ? e.seq : 0,
+              eventType: typeof e?.eventType === "string" ? e.eventType : "unknown",
+              createdAt,
+            };
+            if (e?.data !== undefined) out.data = e.data;
+            if (typeof e?.workerNodeId === "string") out.workerNodeId = e.workerNodeId;
+            return out;
+          });
+        }
+      } catch (err) {
+        // Don't surface as primaryError — capture is best-effort. Log to stderr
+        // so a recurring capture regression is still visible during dev.
+        process.stderr.write(
+          `LiveDriver: cmsEvents capture failed for session ${sessionId}: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+      }
     } catch (err) {
       primaryError = err;
     } finally {
@@ -292,6 +340,7 @@ export class LiveDriver implements Driver {
     };
     if (opts.model) result.model = opts.model;
     if (cmsState) result.cmsState = cmsState;
+    if (cmsEvents) result.cmsEvents = cmsEvents;
     return result;
   }
 

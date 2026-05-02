@@ -221,6 +221,25 @@ export const ObservedToolCallSchema = z.object({
 }).passthrough();
 export type ObservedToolCall = z.infer<typeof ObservedToolCallSchema>;
 
+/**
+ * G9: a single persisted CMS session event. Mirrors the SDK's `SessionEvent`
+ * shape but kept independent so eval-harness types stay decoupled from SDK
+ * internals. The `data` field is intentionally `unknown` to match the SDK
+ * contract; downstream graders narrow it via inspection.
+ *
+ * `workerNodeId` is included so durability tests can detect a real worker
+ * handoff by observing different worker IDs across consecutive events for
+ * the same session.
+ */
+export const CmsObservedEventSchema = z.object({
+  seq: safeIntCount(),
+  eventType: z.string(),
+  data: z.unknown().optional(),
+  createdAt: z.string(),
+  workerNodeId: z.string().optional(),
+}).strict();
+export type CmsObservedEvent = z.infer<typeof CmsObservedEventSchema>;
+
 export const ObservedResultSchema = z.object({
   toolCalls: z.array(ObservedToolCallSchema),
   finalResponse: z.string(),
@@ -229,6 +248,22 @@ export const ObservedResultSchema = z.object({
   latencyMs: finiteNonNegative(),
   cmsState: z.string().optional(),
   durability: z.lazy(() => DurabilityObservationSchema).optional(),
+  /**
+   * G9: full ordered list of persisted CMS events for this session.
+   *
+   * Captured by drivers that have access to a real CMS (e.g. LiveDriver via
+   * `session.getMessages()`). Allows graders / durability tests to assert
+   * on REAL system-tool evidence (e.g. "did `spawn_agent` actually fire and
+   * persist?") rather than just trusting the LLM's self-reported tool-calls
+   * list. Also surfaces `workerNodeId` per event, which is the canonical
+   * signal for cross-worker handoff verification.
+   *
+   * Optional because synthetic / fake drivers don't have a CMS to query.
+   * Drivers that fail to capture events (e.g. session deleted before
+   * read) leave this undefined — callers should treat `undefined` as
+   * "unknown / not captured" rather than "no events occurred".
+   */
+  cmsEvents: z.array(CmsObservedEventSchema).optional(),
 }).passthrough();
 export type ObservedResult = z.infer<typeof ObservedResultSchema>;
 

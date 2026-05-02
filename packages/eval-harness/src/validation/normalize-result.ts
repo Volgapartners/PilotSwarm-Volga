@@ -91,6 +91,13 @@ function projectObservedResult(parsed: ObservedResult): ObservedResult {
   if (parsed.model !== undefined) out.model = parsed.model;
   if (parsed.cmsState !== undefined) out.cmsState = parsed.cmsState;
   if (parsed.durability !== undefined) out.durability = parsed.durability;
+  // G9: preserve `cmsEvents` through projection. The lenient passthrough
+  // parse accepts arbitrary extras, but `projectObservedResult` strips
+  // anything not explicitly copied here. Drivers that capture CMS events
+  // (LiveDriver via `session.getMessages()`) need this projection slot so
+  // graders / durability tests can assert on real system-tool evidence
+  // and worker-handoff via `workerNodeId` fields.
+  if (parsed.cmsEvents !== undefined) out.cmsEvents = parsed.cmsEvents;
   return out;
 }
 

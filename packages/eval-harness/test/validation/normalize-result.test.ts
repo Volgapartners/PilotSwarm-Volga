@@ -204,3 +204,91 @@ describe("validation/normalize-result", () => {
     // deep-walk path is exercised through trust-boundary.test.ts directly.
   });
 });
+
+describe("normalizeObservedResult: cmsEvents projection (G9)", () => {
+  it("preserves cmsEvents through projection when present", () => {
+    const raw = {
+      toolCalls: [],
+      finalResponse: "ok",
+      sessionId: "sid",
+      latencyMs: 10,
+      cmsEvents: [
+        {
+          seq: 1,
+          eventType: "user.message",
+          data: { content: "hi" },
+          createdAt: "2026-01-01T00:00:00.000Z",
+          workerNodeId: "worker-a",
+        },
+        {
+          seq: 2,
+          eventType: "session.turn_completed",
+          createdAt: "2026-01-01T00:00:01.000Z",
+          workerNodeId: "worker-b",
+        },
+      ],
+    };
+    const r = normalizeObservedResult(raw);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(Array.isArray(r.data.cmsEvents)).toBe(true);
+    expect(r.data.cmsEvents).toHaveLength(2);
+    expect(r.data.cmsEvents![0]!.workerNodeId).toBe("worker-a");
+    expect(r.data.cmsEvents![1]!.workerNodeId).toBe("worker-b");
+    // Worker handoff verification: distinct workerNodeId across consecutive
+    // events is the canonical signal the durability suite uses.
+    const ids = r.data.cmsEvents!.map((e) => e.workerNodeId);
+    expect(new Set(ids).size).toBeGreaterThan(1);
+  });
+
+  it("leaves cmsEvents undefined when absent from input (back-compat)", () => {
+    const raw = {
+      toolCalls: [],
+      finalResponse: "ok",
+      sessionId: "sid",
+      latencyMs: 10,
+    };
+    const r = normalizeObservedResult(raw);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.data.cmsEvents).toBeUndefined();
+  });
+
+  it("rejects malformed cmsEvents entries (strict per-event schema)", () => {
+    const raw = {
+      toolCalls: [],
+      finalResponse: "",
+      sessionId: "sid",
+      latencyMs: 0,
+      cmsEvents: [
+        {
+          seq: -1, // invalid: must be non-negative
+          eventType: "x",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+    };
+    const r = normalizeObservedResult(raw);
+    expect(r.ok).toBe(false);
+  });
+
+  it("rejects unknown extra keys on cmsEvents entries (strict)", () => {
+    const raw = {
+      toolCalls: [],
+      finalResponse: "",
+      sessionId: "sid",
+      latencyMs: 0,
+      cmsEvents: [
+        {
+          seq: 0,
+          eventType: "x",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          // strict — unknown key must be rejected.
+          surprise: "no-passthrough",
+        },
+      ],
+    };
+    const r = normalizeObservedResult(raw);
+    expect(r.ok).toBe(false);
+  });
+});
