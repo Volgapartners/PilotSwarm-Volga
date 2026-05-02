@@ -220,6 +220,11 @@ export {
 } from "./graders/fake-judge-client.js";
 export { OpenAIJudgeClient } from "./graders/openai-judge-client.js";
 export type { OpenAIJudgeClientOptions, OpenAIJudgeCostRates } from "./graders/openai-judge-client.js";
+export { PilotSwarmJudgeClient } from "./graders/pilotswarm-judge-client.js";
+export type {
+  PilotSwarmJudgeClientOptions,
+  PilotSwarmJudgeCostRates,
+} from "./graders/pilotswarm-judge-client.js";
 export type { FakeJudgeScenario } from "./graders/fake-judge-client.js";
 export { InMemoryJudgeCache } from "./graders/judge-cache.js";
 export { LLMJudgeGrader } from "./graders/llm-judge.js";

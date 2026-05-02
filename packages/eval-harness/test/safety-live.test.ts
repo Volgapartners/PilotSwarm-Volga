@@ -5,7 +5,9 @@
  * Gating:
  *   LIVE=1                        — runs deterministic safety tests
  *   LIVE=1 LIVE_JUDGE=1           — additionally runs the rubric-graded tests
- *                                   (requires OPENAI_API_KEY)
+ *                                   (requires either OPENAI_API_KEY OR
+ *                                   GITHUB_TOKEN + PS_MODEL_PROVIDERS_PATH; see
+ *                                   `test/helpers/judge-client-helper.ts`)
  *
  * Without these env vars the suite skips cleanly.
  *
@@ -30,7 +32,7 @@ import {
   SecretLeakPatterns,
 } from "../src/graders/secret-leak.js";
 import { LLMJudgeGrader } from "../src/graders/llm-judge.js";
-import { OpenAIJudgeClient } from "../src/graders/openai-judge-client.js";
+import { makeLiveJudgeClient } from "./helpers/judge-client-helper.js";
 import { makeRubric } from "./fixtures/builders.js";
 import type { EvalSample, EvalTask } from "../src/types.js";
 
@@ -293,12 +295,9 @@ describe("Safety — subjective (LLM judge)", () => {
       "safety-subjective-refusal",
     );
     logEvidence("subjective.refusal", r);
-    const apiKey = process.env.OPENAI_API_KEY;
-    expect(apiKey).toBeTruthy();
-    const client = new OpenAIJudgeClient({
-      apiKey: apiKey!,
-      model: process.env.LIVE_JUDGE_MODEL ?? "gpt-4o-mini",
-    });
+    const sel = makeLiveJudgeClient();
+    expect(sel, "no judge client could be constructed (set OPENAI_API_KEY or GITHUB_TOKEN+model providers)").toBeTruthy();
+    const client = sel!.client;
     const grader = new LLMJudgeGrader({
       client,
       rubric: makeRubric({
@@ -341,12 +340,9 @@ describe("Safety — subjective (LLM judge)", () => {
       "safety-subjective-helpfulness",
     );
     logEvidence("subjective.helpfulness", r);
-    const apiKey = process.env.OPENAI_API_KEY;
-    expect(apiKey).toBeTruthy();
-    const client = new OpenAIJudgeClient({
-      apiKey: apiKey!,
-      model: process.env.LIVE_JUDGE_MODEL ?? "gpt-4o-mini",
-    });
+    const sel = makeLiveJudgeClient();
+    expect(sel, "no judge client could be constructed (set OPENAI_API_KEY or GITHUB_TOKEN+model providers)").toBeTruthy();
+    const client = sel!.client;
     const grader = new LLMJudgeGrader({
       client,
       rubric: makeRubric({
