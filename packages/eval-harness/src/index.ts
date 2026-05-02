@@ -30,7 +30,12 @@ export { EvalRunner } from "./runner.js";
 export type { RunnerOptions } from "./runner.js";
 
 // Loader
-export { loadEvalTask, loadEvalTaskFromDir } from "./loader.js";
+export {
+  loadEvalTask,
+  loadEvalTaskFromDir,
+  loadTrajectoryTask,
+  loadTrajectoryTaskFromDir,
+} from "./loader.js";
 
 // Graders
 export { gradeEvalCase } from "./graders/index.js";
@@ -41,14 +46,36 @@ export { gradeOrdering } from "./graders/ordering.js";
 export { gradeResponse } from "./graders/response.js";
 export { gradeCmsState } from "./graders/cms-state.js";
 export { gradeDurability } from "./graders/durability.js";
+export {
+  gradeNoSecretLeak,
+  findSecretLeaks,
+  SecretLeakPatterns,
+} from "./graders/secret-leak.js";
+export type { SecretLeakOptions, SecretLeakHit } from "./graders/secret-leak.js";
 
 // Drivers
 export type { Driver, DriverOptions } from "./drivers/types.js";
 export { FakeDriver } from "./drivers/fake-driver.js";
 export { LiveDriver } from "./drivers/live-driver.js";
-export { ScriptedDriver } from "./drivers/scripted-driver.js";
+export type { LiveDriverDeps } from "./drivers/live-driver.js";
+/**
+ * Wraps an inner Driver and injects a fault drawn from
+ * {@link DurabilityFaultPoint}/{@link DurabilityFaultMode}. Designed for
+ * crash-recovery / handoff / dehydrate-hydrate evals on top of LiveDriver.
+ */
+export { ChaosDriver } from "./drivers/chaos-driver.js";
+export type { ChaosDriverOptions } from "./drivers/chaos-driver.js";
+export {
+  DurabilityFixtureDriver,
+  /** @deprecated Use DurabilityFixtureDriver. */
+  ScriptedDriver,
+} from "./drivers/scripted-driver.js";
 export type {
+  DurabilityFixtureScenario,
+  DurabilityFixtureStep,
+  /** @deprecated Use DurabilityFixtureScenario. */
   ScriptedScenario,
+  /** @deprecated Use DurabilityFixtureStep. */
   ScriptedStep,
 } from "./drivers/scripted-driver.js";
 
@@ -183,6 +210,7 @@ export {
 } from "./types.js";
 export type {
   JudgeRequest,
+  JudgeOptions,
   JudgeResponse,
   JudgeClient,
   JudgeCache,
@@ -190,6 +218,8 @@ export type {
 export {
   FakeJudgeClient,
 } from "./graders/fake-judge-client.js";
+export { OpenAIJudgeClient } from "./graders/openai-judge-client.js";
+export type { OpenAIJudgeClientOptions, OpenAIJudgeCostRates } from "./graders/openai-judge-client.js";
 export type { FakeJudgeScenario } from "./graders/fake-judge-client.js";
 export { InMemoryJudgeCache } from "./graders/judge-cache.js";
 export { LLMJudgeGrader } from "./graders/llm-judge.js";
@@ -202,6 +232,7 @@ export type {
 export type {
   CIGateConfig,
   CIGateResult,
+  RegressionDetectionResult,
   RegressionResult,
   Baseline,
   BaselineSample,
@@ -209,11 +240,105 @@ export type {
 export {
   CIGateConfigSchema,
   CIGateResultSchema,
+  RegressionDetectionResultSchema,
   RegressionResultSchema,
   BaselineSchema,
+  BaselineSchemaAllowEmpty,
   BaselineSampleSchema,
 } from "./types.js";
 export { CIGate } from "./ci-gate.js";
 export { RegressionDetector } from "./regression.js";
+export type {
+  MultipleTestingCorrection,
+  RegressionDetectorConfig,
+  RegressionDetectorOptions,
+} from "./regression.js";
 export { saveBaseline, loadBaseline } from "./baseline.js";
+export type { SaveBaselineOptions, LoadBaselineOptions } from "./baseline.js";
 export { PRCommentReporter } from "./reporters/pr-comment.js";
+
+// --- iter18: Validation layer (trust-boundary, normalizers, registry) ---
+export {
+  parseAtBoundary,
+  parseAtBoundaryOrInfraError,
+} from "./validation/trust-boundary.js";
+export type {
+  ParseResult,
+  ParseSuccess,
+  ParseFailure,
+  ParseOptions,
+} from "./validation/trust-boundary.js";
+export {
+  normalizeObservedResult,
+  normalizeRunResult,
+  normalizeMultiTrialResult,
+  normalizeMatrixConfig,
+  normalizeMatrixResult,
+  normalizeBaseline,
+} from "./validation/normalize-result.js";
+export {
+  STRICT_SCHEMA_REGISTRY,
+  REGISTRY_CARVE_OUTS,
+  assertRegistryComplete,
+} from "./validation/registry.js";
+
+// Performance / cost trackers (suite 5)
+export { LatencyTracker, CostTracker } from "./perf/latency-tracker.js";
+export type { LatencyPercentiles, CostBreakdown } from "./perf/latency-tracker.js";
+
+// Performance evals — DB calls, durability, resource, concurrency, budgets, reporter.
+export {
+  DbTracker,
+  PgStatStatementsRequiredError,
+  categorizeQuery,
+  diffSnapshots,
+  emptySnapshot,
+  PgActivityPoller,
+  DurabilityTracker,
+  percentilesOf,
+  ResourceTracker,
+  ConcurrencyProfiler,
+  computeScalingFactor,
+  BudgetChecker,
+  BaselineComparator,
+  PerfReporter,
+  renderMarkdown as renderPerfMarkdown,
+  renderJson as renderPerfJson,
+} from "./perf/index.js";
+export type {
+  DbCategory,
+  DbStatementRow,
+  DbStatementSnapshot,
+  DbCallDelta,
+  DbTrackerOptions,
+  PgLikeClient,
+  PgStatStatementsCheck,
+  ActivitySample,
+  PgActivityResult,
+  PgActivityPollerOptions,
+  TrackerPercentiles,
+  DurabilityRecord,
+  DurabilityPercentiles,
+  CmsLikeEvent,
+  CmsPairingResult,
+  MemorySnapshot,
+  MemoryWatchResult,
+  ResourceTrackerOptions,
+  ConcurrencyLevelStat,
+  ConcurrencyProfile,
+  ConcurrencyProfilerOptions,
+  CapacityGuardOptions,
+  PerfBudget,
+  PerfReport,
+  PerfBaseline,
+  BaselineComparisonOptions,
+  LatencyBudgetShape,
+  CostBudgetShape,
+  DbBudget,
+  DurabilityBudget,
+  ResourceBudget,
+  ConcurrencyBudgetShape,
+  BudgetCheckResult,
+  OptionalDim,
+  RenderOptions as PerfRenderOptions,
+} from "./perf/index.js";

@@ -2,28 +2,49 @@
   "schemaVersion": 1,
   "id": "durability-scenarios",
   "name": "Durability & Crash Recovery Scenarios",
-  "description": "Scenarios exercising crash injection, dehydrate/hydrate, worker handoff, and durable timer behavior for the PilotSwarm runtime.",
+  "description": "[ILLUSTRATIVE FIXTURE — NOT LIVE-RUNNABLE] Scenarios exercising crash injection, dehydrate/hydrate, worker handoff, and durable timer behavior for the PilotSwarm runtime.",
   "version": "1.0.0",
+  "runnable": false,
   "passRateFloor": 0.8,
   "samples": [
     {
       "id": "crash.worker-crash-mid-tool",
       "description": "Worker crashes while a tool call is in-flight; orchestration replays and the tool re-executes after recovery.",
       "input": {
-        "prompt": "Look up the weather in Tokyo and summarize it.",
-        "systemMessage": "You have tools available. Use test_weather to answer."
+        "prompt": "Look up the weather in Tokyo and summarize it."
       },
       "expected": {
-        "toolCalls": [{ "name": "test_weather", "args": { "location": "Tokyo" }, "match": "subset" }],
-        "cms": { "stateIn": ["idle", "completed"] },
+        "toolCalls": [
+          {
+            "name": "test_weather",
+            "args": {
+              "city": "Tokyo"
+            },
+            "match": "subset"
+          }
+        ],
+        "cms": {
+          "stateIn": [
+            "idle",
+            "completed"
+          ]
+        },
         "durability": {
           "mustRecover": true,
-          "finalStateIn": ["idle", "completed"],
+          "finalStateIn": [
+            "idle",
+            "completed"
+          ],
           "minToolCallsAfterRecovery": 1
         }
       },
-      "tools": ["test_weather"],
-      "tags": ["crash", "mid-tool"]
+      "tools": [
+        "test_weather"
+      ],
+      "tags": [
+        "crash",
+        "mid-tool"
+      ]
     },
     {
       "id": "crash.worker-crash-after-turn",
@@ -32,15 +53,37 @@
         "prompt": "Add 2 and 3 using the test_add tool."
       },
       "expected": {
-        "toolCalls": [{ "name": "test_add", "args": { "a": 2, "b": 3 }, "match": "subset" }],
-        "cms": { "stateIn": ["idle", "completed"] },
+        "toolCalls": [
+          {
+            "name": "test_add",
+            "args": {
+              "a": 2,
+              "b": 3
+            },
+            "match": "subset"
+          }
+        ],
+        "cms": {
+          "stateIn": [
+            "idle",
+            "completed"
+          ]
+        },
         "durability": {
           "mustRecover": true,
-          "finalStateIn": ["idle", "completed"]
+          "finalStateIn": [
+            "idle",
+            "completed"
+          ]
         }
       },
-      "tools": ["test_add"],
-      "tags": ["crash", "after-turn"]
+      "tools": [
+        "test_add"
+      ],
+      "tags": [
+        "crash",
+        "after-turn"
+      ]
     },
     {
       "id": "crash.tool-timeout",
@@ -49,14 +92,29 @@
         "prompt": "Call the slow_tool and report its result."
       },
       "expected": {
-        "cms": { "stateIn": ["idle", "completed", "errored"] },
+        "cms": {
+          "stateIn": [
+            "idle",
+            "completed",
+            "errored"
+          ]
+        },
         "durability": {
           "mustRecover": true,
-          "finalStateIn": ["idle", "completed", "errored"]
+          "finalStateIn": [
+            "idle",
+            "completed",
+            "errored"
+          ]
         }
       },
-      "tools": ["slow_tool"],
-      "tags": ["crash", "tool-timeout"]
+      "tools": [
+        "slow_tool"
+      ],
+      "tags": [
+        "crash",
+        "tool-timeout"
+      ]
     },
     {
       "id": "crash.tool-throw",
@@ -65,14 +123,29 @@
         "prompt": "Call the throwing_tool and handle the error."
       },
       "expected": {
-        "cms": { "stateIn": ["idle", "completed", "errored"] },
+        "cms": {
+          "stateIn": [
+            "idle",
+            "completed",
+            "errored"
+          ]
+        },
         "durability": {
           "mustRecover": true,
-          "finalStateIn": ["idle", "completed", "errored"]
+          "finalStateIn": [
+            "idle",
+            "completed",
+            "errored"
+          ]
         }
       },
-      "tools": ["throwing_tool"],
-      "tags": ["crash", "tool-throw"]
+      "tools": [
+        "throwing_tool"
+      ],
+      "tags": [
+        "crash",
+        "tool-throw"
+      ]
     },
     {
       "id": "recovery.dehydrate-hydrate",
@@ -81,16 +154,31 @@
         "prompt": "Remember that my favorite color is blue, then tell me what it is."
       },
       "expected": {
-        "response": { "containsAny": ["blue"] },
-        "cms": { "stateIn": ["idle", "completed"] },
+        "response": {
+          "containsAny": [
+            "blue"
+          ]
+        },
+        "cms": {
+          "stateIn": [
+            "idle",
+            "completed"
+          ]
+        },
         "durability": {
           "mustRecover": true,
           "requireDehydrated": true,
           "requireHydrated": true,
-          "finalStateIn": ["idle", "completed"]
+          "finalStateIn": [
+            "idle",
+            "completed"
+          ]
         }
       },
-      "tags": ["dehydrate", "hydrate"]
+      "tags": [
+        "dehydrate",
+        "hydrate"
+      ]
     },
     {
       "id": "recovery.worker-handoff",
@@ -99,16 +187,29 @@
         "prompt": "Run a multi-step task that survives worker handoff."
       },
       "expected": {
-        "cms": { "stateIn": ["idle", "completed"] },
+        "cms": {
+          "stateIn": [
+            "idle",
+            "completed"
+          ]
+        },
         "durability": {
           "mustRecover": true,
           "requireWorkerHandoff": true,
           "minToolCallsAfterRecovery": 1,
-          "finalStateIn": ["idle", "completed"]
+          "finalStateIn": [
+            "idle",
+            "completed"
+          ]
         }
       },
-      "tools": ["test_add"],
-      "tags": ["handoff", "multi-worker"]
+      "tools": [
+        "test_add"
+      ],
+      "tags": [
+        "handoff",
+        "multi-worker"
+      ]
     },
     {
       "id": "timer.fires-after-crash",
@@ -117,15 +218,30 @@
         "prompt": "Wait 100ms then say done."
       },
       "expected": {
-        "response": { "containsAny": ["done"] },
-        "cms": { "stateIn": ["idle", "completed"] },
+        "response": {
+          "containsAny": [
+            "done"
+          ]
+        },
+        "cms": {
+          "stateIn": [
+            "idle",
+            "completed"
+          ]
+        },
         "durability": {
           "mustRecover": true,
           "maxTimerDriftMs": 500,
-          "finalStateIn": ["idle", "completed"]
+          "finalStateIn": [
+            "idle",
+            "completed"
+          ]
         }
       },
-      "tags": ["timer", "durable"]
+      "tags": [
+        "timer",
+        "durable"
+      ]
     },
     {
       "id": "timer.drift-within-tolerance",
@@ -134,13 +250,21 @@
         "prompt": "Schedule a short timer and report completion."
       },
       "expected": {
-        "cms": { "stateIn": ["idle", "completed"] },
+        "cms": {
+          "stateIn": [
+            "idle",
+            "completed"
+          ]
+        },
         "durability": {
           "mustRecover": true,
           "maxTimerDriftMs": 250
         }
       },
-      "tags": ["timer", "drift"]
+      "tags": [
+        "timer",
+        "drift"
+      ]
     }
   ]
 }

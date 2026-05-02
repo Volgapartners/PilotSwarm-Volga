@@ -1,5 +1,3 @@
-import { defineTool } from "pilotswarm-sdk";
-
 export interface ToolInvocation {
   name: string;
   args: Record<string, unknown>;
@@ -11,6 +9,20 @@ export interface ToolInvocation {
 export interface EvalToolTracker {
   invocations: ToolInvocation[];
   reset(): void;
+}
+
+interface EvalToolDefinition<Args extends Record<string, unknown>, Result> {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  handler(args: Args): Promise<Result>;
+}
+
+function defineEvalTool<Args extends Record<string, unknown>, Result>(
+  name: string,
+  definition: Omit<EvalToolDefinition<Args, Result>, "name">,
+): EvalToolDefinition<Args, Result> {
+  return { name, ...definition };
 }
 
 export function createEvalToolTracker(): {
@@ -53,7 +65,7 @@ function record(
 }
 
 export function createEvalAddTool(tracker: EvalToolTracker) {
-  return defineTool("test_add", {
+  return defineEvalTool("test_add", {
     description: "Add two numbers together. ALWAYS use this when asked to add numbers.",
     parameters: {
       type: "object",
@@ -72,7 +84,7 @@ export function createEvalAddTool(tracker: EvalToolTracker) {
 }
 
 export function createEvalMultiplyTool(tracker: EvalToolTracker) {
-  return defineTool("test_multiply", {
+  return defineEvalTool("test_multiply", {
     description: "Multiply two numbers. ALWAYS use this when asked to multiply.",
     parameters: {
       type: "object",
@@ -91,7 +103,7 @@ export function createEvalMultiplyTool(tracker: EvalToolTracker) {
 }
 
 export function createEvalWeatherTool(tracker: EvalToolTracker) {
-  return defineTool("test_weather", {
+  return defineEvalTool("test_weather", {
     description: "Get the current weather for a city",
     parameters: {
       type: "object",

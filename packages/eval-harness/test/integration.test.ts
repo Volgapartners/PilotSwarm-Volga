@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,8 +16,8 @@ import {
   MultiTrialRunner,
 
   // V3
-  ScriptedDriver,
-  type ScriptedScenario,
+  DurabilityFixtureDriver,
+  type DurabilityFixtureScenario,
   type DurabilityObservation,
 
   // V4
@@ -195,9 +195,10 @@ describe("End-to-end integration (V1-V5)", () => {
 
     // 6. Detect regressions (V5b)
     const detector = new RegressionDetector(0.05);
-    const regressions = detector.detect(loaded, currentResult);
-    expect(regressions.length).toBe(6);
-    const regressed = regressions.find(
+    const detection = detector.detect(loaded, currentResult);
+    expect(detection.regressions.length).toBe(6);
+    expect(detection.missingBaselineSamples).toEqual([]);
+    const regressed = detection.regressions.find(
       (r) => r.sampleId === "selection.multiply-not-add",
     );
     expect(regressed).toBeDefined();
@@ -212,7 +213,7 @@ describe("End-to-end integration (V1-V5)", () => {
       maxRegressions: 0,
       maxCostUsd: 1,
     });
-    const gateResult = gate.evaluate(currentResult, regressions, 0.05);
+    const gateResult = gate.evaluate(currentResult, detection, 0.05);
 
     // 8. Verify gate result structure
     expect(gateResult.pass).toBe(false);
@@ -232,7 +233,7 @@ describe("End-to-end integration (V1-V5)", () => {
     const prPath = join(workDir, "pr.md");
     const reporter = new PRCommentReporter(prPath);
     reporter.onMultiTrialComplete(currentResult);
-    reporter.writeGateResult(gateResult, regressions);
+    reporter.writeGateResult(gateResult, detection.regressions);
   });
 
   it("trajectory pipeline: build → run → grade (per-turn + cross-turn + holistic)", async () => {
@@ -295,7 +296,16 @@ describe("End-to-end integration (V1-V5)", () => {
         { sampleId: "remember-color", trajectory },
       ]),
     });
-    const result = await runner.runTask(task);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let result;
+    try {
+      result = await runner.runTask(task);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("contextRetention matched only via lexical regex"),
+      );
+    } finally {
+      warn.mockRestore();
+    }
 
     expect(result.summary.total).toBe(1);
     expect(result.summary.passed).toBe(1);
@@ -392,6 +402,7 @@ describe("End-to-end integration (V1-V5)", () => {
       client,
       rubric,
       cache,
+      judgeId: "integration-judge",
       budgetUsd: 1,
     });
 
@@ -438,17 +449,21 @@ describe("End-to-end integration (V1-V5)", () => {
       budgetUsd: 0.01,
     });
     const tightResult = await tight.grade("Q?", "A.");
-    // First criterion runs and exhausts budget; second one short-circuits.
-    expect(tightClient.callCount).toBe(1);
+    // iter19 H4: hard-cap reconcile refunds + denies the first call (actual
+    // 5 > cap 0.01). The second call is then pre-checked or also denied.
+    // What matters: cumulative spend never exceeds cap, and at least one
+    // score surfaces a "Budget exceeded" infraError reason.
+    expect(tightClient.callCount).toBeGreaterThanOrEqual(1);
+    expect(tight.cumulativeCostUsd).toBeLessThanOrEqual(0.01);
     const budgetSkipped = tightResult.scores.find((s) =>
       s.reason.toLowerCase().includes("budget exceeded"),
     );
     expect(budgetSkipped).toBeDefined();
-    expect(budgetSkipped!.pass).toBe(false);
+    expect(budgetSkipped!.infraError).toBe(true);
   });
 
   it("durability pipeline: scripted crash → grade via runner → durability scores", async () => {
-    const scenarios: ScriptedScenario[] = [
+    const scenarios: DurabilityFixtureScenario[] = [
       {
         sampleId: "crash.recovers",
         steps: [
@@ -529,7 +544,7 @@ describe("End-to-end integration (V1-V5)", () => {
       ],
     };
 
-    const runner = new EvalRunner({ driver: new ScriptedDriver(scenarios) });
+    const runner = new EvalRunner({ driver: new DurabilityFixtureDriver(scenarios) });
     const runResult = await runner.runTask(task);
 
     expect(runResult.summary.total).toBe(1);

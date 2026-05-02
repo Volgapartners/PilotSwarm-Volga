@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { readFileSync, existsSync, rmSync, mkdtempSync } from "node:fs";
+import { readFileSync, existsSync, rmSync, mkdtempSync, writeFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ConsoleReporter } from "../src/reporters/console.js";
 import { JsonlReporter } from "../src/reporters/jsonl.js";
+import { PRCommentReporter } from "../src/reporters/pr-comment.js";
 import type { Reporter } from "../src/reporters/types.js";
-import type { EvalTask, CaseResult, RunResult } from "../src/types.js";
+import type { EvalTask, CaseResult, RunResult, CIGateResult, RegressionResult } from "../src/types.js";
 
 function makeTask(): EvalTask {
   return {
@@ -31,19 +32,13 @@ function makeCaseResult(overrides: Partial<CaseResult> = {}): CaseResult {
     caseId: "s1",
     pass: true,
     scores: [{ name: "tool-selection", value: 1, pass: true, reason: "ok" }],
-    observed: {
-      toolCalls: [],
-      finalResponse: "done",
-      sessionId: "sess",
-      latencyMs: 5,
-    },
+    observed: { toolCalls: [], finalResponse: "done", sessionId: "sess", latencyMs: 5 },
     durationMs: 42,
     ...overrides,
   };
 }
 
 function makeRunResult(overrides: Partial<RunResult> = {}): RunResult {
-  const caseResult = makeCaseResult();
   return {
     schemaVersion: 1,
     runId: "run-1",
@@ -52,7 +47,7 @@ function makeRunResult(overrides: Partial<RunResult> = {}): RunResult {
     startedAt: "2024-01-01T00:00:00.000Z",
     finishedAt: "2024-01-01T00:00:01.000Z",
     summary: { total: 1, passed: 1, failed: 0, errored: 0, passRate: 1 },
-    cases: [caseResult],
+    cases: [makeCaseResult()],
     ...overrides,
   };
 }
@@ -62,66 +57,65 @@ describe("ConsoleReporter", () => {
     vi.restoreAllMocks();
   });
 
-  it("implements the Reporter interface", () => {
+  function output(spy: ReturnType<typeof vi.spyOn>): string {
+    return spy.mock.calls.map((c) => c.join(" ")).join("\n");
+  }
+
+  it("implements the Reporter interface and prints task header on onRunStart", () => {
     const reporter: Reporter = new ConsoleReporter();
     expect(typeof reporter.onRunStart).toBe("function");
     expect(typeof reporter.onCaseResult).toBe("function");
     expect(typeof reporter.onRunComplete).toBe("function");
-  });
 
-  it("onRunStart prints task name and runId", () => {
     const spy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const reporter = new ConsoleReporter();
     reporter.onRunStart(makeTask(), "run-1");
-    const output = spy.mock.calls.map((c) => c.join(" ")).join("\n");
-    expect(output).toContain("Task One");
-    expect(output).toContain("1.0.0");
-    expect(output).toContain("run-1");
+    const out = output(spy);
+    expect(out).toContain("Task One");
+    expect(out).toContain("1.0.0");
+    expect(out).toContain("run-1");
   });
 
-  it("onCaseResult prints pass icon and caseId", () => {
-    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+  it("onCaseResult prints ✅/❌/⚠️ icons with reason or error message", () => {
     const reporter = new ConsoleReporter();
+
+    const sPass = vi.spyOn(console, "log").mockImplementation(() => {});
     reporter.onCaseResult(makeCaseResult({ pass: true }));
-    const output = spy.mock.calls.map((c) => c.join(" ")).join("\n");
-    expect(output).toContain("✅");
-    expect(output).toContain("s1");
-  });
+    expect(output(sPass)).toContain("✅");
+    expect(output(sPass)).toContain("s1");
+    sPass.mockRestore();
 
-  it("onCaseResult prints fail icon and failed score reasons", () => {
-    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const reporter = new ConsoleReporter();
+    const sFail = vi.spyOn(console, "log").mockImplementation(() => {});
     reporter.onCaseResult(
       makeCaseResult({
         pass: false,
-        scores: [
-          { name: "tool-selection", value: 0, pass: false, reason: "missing tool foo" },
-        ],
+        scores: [{ name: "tool-selection", value: 0, pass: false, reason: "missing tool foo" }],
       }),
     );
-    const output = spy.mock.calls.map((c) => c.join(" ")).join("\n");
-    expect(output).toContain("❌");
-    expect(output).toContain("missing tool foo");
+    const failOut = output(sFail);
+    expect(failOut).toContain("❌");
+    expect(failOut).toContain("missing tool foo");
+    sFail.mockRestore();
+
+    const sErr = vi.spyOn(console, "log").mockImplementation(() => {});
+    reporter.onCaseResult(makeCaseResult({ pass: false, scores: [], infraError: "driver crashed" }));
+    const errOut = output(sErr);
+    expect(errOut).toContain("⚠️");
+    expect(errOut).toContain("driver crashed");
   });
 
-  it("onCaseResult prints warning icon and error message for infraError", () => {
+  it("onRunComplete prints summary using quality denominator when infra errors are present", () => {
     const spy = vi.spyOn(console, "log").mockImplementation(() => {});
     const reporter = new ConsoleReporter();
-    reporter.onCaseResult(
-      makeCaseResult({ pass: false, scores: [], infraError: "driver crashed" }),
+    reporter.onRunComplete(
+      makeRunResult({
+        summary: { total: 10, passed: 5, failed: 0, errored: 5, passRate: 1 },
+        cases: [],
+      }),
     );
-    const output = spy.mock.calls.map((c) => c.join(" ")).join("\n");
-    expect(output).toContain("⚠️");
-    expect(output).toContain("driver crashed");
-  });
-
-  it("onRunComplete prints summary with counts and pass rate", () => {
-    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const reporter = new ConsoleReporter();
-    reporter.onRunComplete(makeRunResult());
-    const output = spy.mock.calls.map((c) => c.join(" ")).join("\n");
-    expect(output).toMatch(/1\s*\/\s*1/);
-    expect(output).toContain("100");
+    const out = output(spy);
+    expect(out).toContain("5/5 quality passed (100.0%)");
+    expect(out).toContain("5 infra errors");
+    expect(out).not.toContain("5/10 passed (100.0%)");
   });
 });
 
@@ -144,49 +138,10 @@ describe("JsonlReporter", () => {
     return dir;
   }
 
-  it("implements the Reporter interface", () => {
-    const reporter: Reporter = new JsonlReporter(tempDir());
-    expect(typeof reporter.onRunStart).toBe("function");
-    expect(typeof reporter.onCaseResult).toBe("function");
-    expect(typeof reporter.onRunComplete).toBe("function");
-  });
-
-  it("writes a JSONL file containing run, sample, and summary lines", () => {
+  it("writes JSONL with run/sample/summary lines, creates output dir, and emits failure artifact JSON for failed cases", () => {
     const dir = tempDir();
-    const reporter = new JsonlReporter(dir);
+    const reporter: Reporter = new JsonlReporter(join(dir, "nested", "deeper"));
     const task = makeTask();
-    const runResult = makeRunResult();
-    reporter.onRunStart(task, runResult.runId);
-    reporter.onCaseResult(runResult.cases[0]);
-    reporter.onRunComplete(runResult);
-
-    const filePath = join(dir, `${runResult.runId}.jsonl`);
-    expect(existsSync(filePath)).toBe(true);
-    const lines = readFileSync(filePath, "utf8").trim().split("\n");
-    expect(lines.length).toBeGreaterThanOrEqual(3);
-    const parsed = lines.map((l) => JSON.parse(l));
-    const types = parsed.map((p) => p.type);
-    expect(types).toContain("run");
-    expect(types).toContain("sample");
-    expect(types).toContain("summary");
-  });
-
-  it("creates the output directory if it does not exist", () => {
-    const base = tempDir();
-    const nested = join(base, "nested", "deeper");
-    const reporter = new JsonlReporter(nested);
-    const task = makeTask();
-    const runResult = makeRunResult();
-    reporter.onRunStart(task, runResult.runId);
-    reporter.onCaseResult(runResult.cases[0]);
-    reporter.onRunComplete(runResult);
-    expect(existsSync(nested)).toBe(true);
-    expect(existsSync(join(nested, `${runResult.runId}.jsonl`))).toBe(true);
-  });
-
-  it("writes failure artifact JSON for each failed case", () => {
-    const dir = tempDir();
-    const reporter = new JsonlReporter(dir);
     const failed = makeCaseResult({
       caseId: "bad-case",
       pass: false,
@@ -196,69 +151,62 @@ describe("JsonlReporter", () => {
       summary: { total: 1, passed: 0, failed: 1, errored: 0, passRate: 0 },
       cases: [failed],
     });
-    reporter.onRunStart(makeTask(), runResult.runId);
+    reporter.onRunStart(task, runResult.runId);
     reporter.onCaseResult(failed);
     reporter.onRunComplete(runResult);
 
-    const artifactPath = join(dir, runResult.runId, "bad-case.json");
+    const filePath = join(dir, "nested", "deeper", `${runResult.runId}.jsonl`);
+    expect(existsSync(filePath)).toBe(true);
+    const lines = readFileSync(filePath, "utf8").trim().split("\n");
+    const types = lines.map((l) => JSON.parse(l).type);
+    expect(types).toContain("run");
+    expect(types).toContain("sample");
+    expect(types).toContain("summary");
+
+    const artifactPath = join(dir, "nested", "deeper", runResult.runId, "bad-case.json");
     expect(existsSync(artifactPath)).toBe(true);
     const parsed = JSON.parse(readFileSync(artifactPath, "utf8"));
     expect(parsed.caseId).toBe("bad-case");
     expect(parsed.pass).toBe(false);
   });
 
-  it("writes header line on onRunStart (before onRunComplete) — survives crash", () => {
+  it("streams: writes header on onRunStart, appends a sample line per onCaseResult, writes failure artifact immediately", () => {
     const dir = tempDir();
     const reporter = new JsonlReporter(dir);
-    const task = makeTask();
-    reporter.onRunStart(task, "run-streaming");
-    const filePath = join(dir, "run-streaming.jsonl");
-    expect(existsSync(filePath)).toBe(true);
-    const lines = readFileSync(filePath, "utf8").trim().split("\n").filter(Boolean);
-    expect(lines.length).toBeGreaterThanOrEqual(1);
-    const parsed = JSON.parse(lines[0]);
-    expect(parsed.type).toBe("run");
-    expect(parsed.runId).toBe("run-streaming");
-  });
-
-  it("writes case line on each onCaseResult (file grows incrementally)", () => {
-    const dir = tempDir();
-    const reporter = new JsonlReporter(dir);
-    const task = makeTask();
-    reporter.onRunStart(task, "run-grow");
-    const filePath = join(dir, "run-grow.jsonl");
+    reporter.onRunStart(makeTask(), "run-stream");
+    const filePath = join(dir, "run-stream.jsonl");
     const sizeAfterStart = readFileSync(filePath, "utf8").length;
+    const headerLine = JSON.parse(readFileSync(filePath, "utf8").trim().split("\n")[0]);
+    expect(headerLine.type).toBe("run");
+    expect(headerLine.runId).toBe("run-stream");
 
     reporter.onCaseResult(makeCaseResult({ caseId: "c1" }));
     const sizeAfter1 = readFileSync(filePath, "utf8").length;
     expect(sizeAfter1).toBeGreaterThan(sizeAfterStart);
 
-    reporter.onCaseResult(makeCaseResult({ caseId: "c2" }));
-    const sizeAfter2 = readFileSync(filePath, "utf8").length;
-    expect(sizeAfter2).toBeGreaterThan(sizeAfter1);
-
-    const lines = readFileSync(filePath, "utf8").trim().split("\n").filter(Boolean);
-    const parsed = lines.map((l) => JSON.parse(l));
-    expect(parsed.filter((p) => p.type === "sample")).toHaveLength(2);
-  });
-
-  it("writes failure artifact immediately on failed onCaseResult (before onRunComplete)", () => {
-    const dir = tempDir();
-    const reporter = new JsonlReporter(dir);
-    reporter.onRunStart(makeTask(), "run-fail-immediate");
     const failed = makeCaseResult({
       caseId: "early-fail",
       pass: false,
       scores: [{ name: "x", value: 0, pass: false, reason: "boom" }],
     });
     reporter.onCaseResult(failed);
-    const artifactPath = join(dir, "run-fail-immediate", "early-fail.json");
-    expect(existsSync(artifactPath)).toBe(true);
+    expect(existsSync(join(dir, "run-stream", "early-fail.json"))).toBe(true);
+
+    const samples = readFileSync(filePath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l))
+      .filter((p) => p.type === "sample");
+    expect(samples).toHaveLength(2);
   });
 
-  it("sanitizes unsafe caseId in artifact path (no traversal)", () => {
+  it("sanitizes unsafe runId and caseId so writes cannot escape the run artifact dir", () => {
     const dir = tempDir();
     const reporter = new JsonlReporter(dir);
+    reporter.onRunStart(makeTask(), "../../evil-run");
+    expect(readdirSync(join(dir, "..")).some((e) => e === "evil-run.jsonl")).toBe(false);
+
     reporter.onRunStart(makeTask(), "run-traversal");
     const failed = makeCaseResult({
       caseId: "../../escape/evil",
@@ -266,26 +214,115 @@ describe("JsonlReporter", () => {
       scores: [{ name: "x", value: 0, pass: false, reason: "boom" }],
     });
     reporter.onCaseResult(failed);
-    // Must NOT have written outside the run artifact dir.
-    const escaped = join(dir, "..", "escape", "evil.json");
-    expect(existsSync(escaped)).toBe(false);
-    // The artifact must be present *inside* the run artifact dir under a sanitized name.
+    expect(existsSync(join(dir, "..", "escape", "evil.json"))).toBe(false);
     const artifactDir = join(dir, "run-traversal");
     expect(existsSync(artifactDir)).toBe(true);
-    const entries = require("node:fs").readdirSync(artifactDir);
+    const entries = readdirSync(artifactDir);
     expect(entries.length).toBe(1);
     expect(entries[0]).not.toContain("/");
     expect(entries[0]).not.toContain("..");
   });
+});
 
-  it("sanitizes unsafe runId in jsonl filename (no traversal)", () => {
+describe("PRCommentReporter", () => {
+  const created: string[] = [];
+
+  afterEach(() => {
+    for (const p of created.splice(0)) {
+      try {
+        rmSync(p, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+
+  function tempDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), "eval-pr-"));
+    created.push(dir);
+    return dir;
+  }
+
+  function makeGate(overrides: Partial<CIGateResult> = {}): CIGateResult {
+    return { pass: true, reasons: ["pass rate met"], passRate: 0.95, regressionCount: 0, ...overrides };
+  }
+
+  it("writeGateResult overwrites stale prior file on first call, then appends on subsequent calls", () => {
     const dir = tempDir();
-    const reporter = new JsonlReporter(dir);
-    // Pass a runId that would escape if used raw.
-    reporter.onRunStart(makeTask(), "../../evil-run");
-    // The reporter should not have created any file outside `dir`.
-    const escapedDirParent = join(dir, "..");
-    const before = require("node:fs").readdirSync(escapedDirParent);
-    expect(before.some((e: string) => e === "evil-run.jsonl")).toBe(false);
+    const path = join(dir, "pr.md");
+    writeFileSync(path, "## STALE PRIOR RUN\nshould-not-survive\n", "utf8");
+
+    const reporter = new PRCommentReporter(path);
+    reporter.writeGateResult(makeGate({ reasons: ["FIRST GATE"] }));
+    let out = readFileSync(path, "utf8");
+    expect(out).not.toContain("STALE PRIOR RUN");
+    expect(out).not.toContain("should-not-survive");
+    expect(out.startsWith("## CI Gate:")).toBe(true);
+    expect(out).toContain("FIRST GATE");
+
+    reporter.writeGateResult(makeGate({ reasons: ["SECOND GATE"] }));
+    out = readFileSync(path, "utf8");
+    expect(out).toContain("FIRST GATE");
+    expect(out).toContain("SECOND GATE");
+    expect(out.indexOf("FIRST GATE")).toBeLessThan(out.indexOf("SECOND GATE"));
+  });
+
+  it("writeGateResult shows adjustedPValue (with bh header) when correction is applied; raw pValue when correction='none'", () => {
+    const dir = tempDir();
+    const adjPath = join(dir, "adj.md");
+    const adjReporter = new PRCommentReporter(adjPath);
+    const adj: RegressionResult = {
+      sampleId: "s1",
+      baselinePassRate: 0.9,
+      currentPassRate: 0.6,
+      pValue: 0.0098,
+      adjustedPValue: 0.2,
+      correction: "bh",
+      significant: false,
+      direction: "regressed",
+    };
+    adjReporter.writeGateResult(makeGate({ pass: false, reasons: ["regression"] }), [adj]);
+    const adjOut = readFileSync(adjPath, "utf8");
+    const adjRow = adjOut.split("\n").find((l) => l.includes("| s1 |"))!;
+    expect(adjRow).toContain("0.2000");
+    expect(adjRow).not.toContain("0.0098");
+    expect(adjOut).toMatch(/p-value \(adjusted, bh\)/);
+
+    const rawPath = join(dir, "raw.md");
+    const rawReporter = new PRCommentReporter(rawPath);
+    const raw: RegressionResult = {
+      sampleId: "s2",
+      baselinePassRate: 0.9,
+      currentPassRate: 0.6,
+      pValue: 0.0098,
+      adjustedPValue: 0.0098,
+      correction: "none",
+      significant: true,
+      direction: "regressed",
+    };
+    rawReporter.writeGateResult(makeGate({ pass: false, reasons: ["regression"] }), [raw]);
+    const rawOut = readFileSync(rawPath, "utf8");
+    const rawRow = rawOut.split("\n").find((l) => l.includes("| s2 |"))!;
+    expect(rawRow).toContain("0.0098");
+    expect(rawOut).not.toMatch(/p-value \(adjusted/);
+  });
+
+  it("writeGateResult falls back to raw pValue when adjustedPValue is undefined", () => {
+    const dir = tempDir();
+    const path = join(dir, "pr.md");
+    const reporter = new PRCommentReporter(path);
+    const reg: RegressionResult = {
+      sampleId: "s3",
+      baselinePassRate: 0.9,
+      currentPassRate: 0.6,
+      pValue: 0.0123,
+      significant: true,
+      direction: "regressed",
+    };
+    reporter.writeGateResult(makeGate({ pass: false, reasons: ["regression"] }), [reg]);
+    const out = readFileSync(path, "utf8");
+    const sampleRow = out.split("\n").find((l) => l.includes("| s3 |"));
+    expect(sampleRow).toBeDefined();
+    expect(sampleRow!).toContain("0.0123");
   });
 });

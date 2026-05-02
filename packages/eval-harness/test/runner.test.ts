@@ -3,7 +3,7 @@ import { EvalRunner } from "../src/runner.js";
 import type { Reporter } from "../src/reporters/types.js";
 import { FakeDriver } from "../src/drivers/fake-driver.js";
 import type { Driver } from "../src/drivers/types.js";
-import type { EvalSample, EvalTask, ObservedResult } from "../src/types.js";
+import { EvalTaskSchema, type EvalSample, type EvalTask, type ObservedResult } from "../src/types.js";
 
 function sample(id: string, toolName = "add"): EvalSample {
   return {
@@ -105,6 +105,20 @@ describe("EvalRunner.runTask", () => {
     const runner = new EvalRunner({ driver });
     const result = await runner.runTask(task([sample("s1"), sample("s2")]));
     expect(result.summary.passRate).toBe(0.5);
+  });
+
+  it("excludes infra errors from passRate because they are not quality failures", async () => {
+    const driver: Driver = {
+      async run(s) {
+        if (s.id === "s1") return observed();
+        throw new Error("driver down");
+      },
+    };
+    const runner = new EvalRunner({ driver });
+    const result = await runner.runTask(task([sample("s1"), sample("s2")]));
+    expect(result.summary.passed).toBe(1);
+    expect(result.summary.errored).toBe(1);
+    expect(result.summary.passRate).toBe(1);
   });
 
   it("captures infraError when driver throws", async () => {
@@ -219,7 +233,27 @@ describe("EvalRunner: timeoutMs enforcement", () => {
 });
 
 describe("EvalRunner: zero-expectation samples", () => {
-  it("sample with no expectations passes", async () => {
+  it("sample with no expectations cannot pass silently", () => {
+    const noExpectSample: EvalSample = {
+      id: "noexp",
+      description: "no expectations",
+      input: { prompt: "anything" },
+      expected: { toolSequence: "unordered" },
+      timeoutMs: 120000,
+    };
+    expect(() =>
+      EvalTaskSchema.parse({
+        schemaVersion: 1,
+        id: "task-x",
+        name: "Task X",
+        description: "a task",
+        version: "1.0.0",
+        samples: [noExpectSample],
+      }),
+    ).toThrow(/no expected criteria/i);
+  });
+
+  it("programmatic hollow samples do not pass silently if they bypass loading", async () => {
     const noExpectSample: EvalSample = {
       id: "noexp",
       description: "no expectations",
@@ -228,11 +262,13 @@ describe("EvalRunner: zero-expectation samples", () => {
       timeoutMs: 120000,
     };
     const driver = FakeDriver.fromMap({
-      "noexp": observed({ toolCalls: [], finalResponse: "anything goes" }),
+      noexp: observed({ toolCalls: [], finalResponse: "anything goes" }),
     });
     const runner = new EvalRunner({ driver });
+
     const result = await runner.runTask(task([noExpectSample]));
-    expect(result.cases[0].pass).toBe(true);
+
+    expect(result.cases[0].pass).toBe(false);
     expect(result.cases[0].scores).toEqual([]);
   });
 });
@@ -303,6 +339,133 @@ describe("EvalRunner: runId per runTask", () => {
   });
 });
 
+function noToolCallSample(id: string): EvalSample {
+  return {
+    id,
+    description: `noToolCall sample ${id}`,
+    input: { prompt: "say hello, do not call any tools" },
+    expected: { noToolCall: true, toolSequence: "unordered" },
+    timeoutMs: 120000,
+  };
+}
+
+describe("EvalRunner: F7 hollow turn rejection (noToolCall:true + empty observed)", () => {
+  it("rejects hollow observed (toolCalls:[] + finalResponse:'') as infra when noToolCall:true is expected", async () => {
+    const driver = FakeDriver.fromMap({
+      h1: observed({ toolCalls: [], finalResponse: "" }),
+    });
+    const runner = new EvalRunner({ driver });
+    const result = await runner.runTask(task([noToolCallSample("h1")]));
+
+    expect(result.summary.errored).toBe(1);
+    expect(result.summary.passed).toBe(0);
+    expect(result.summary.failed).toBe(0);
+    expect(result.summary.passRate).toBeUndefined();
+    expect(result.summary.noQualitySignal).toBe(true);
+    expect(result.cases[0].pass).toBe(false);
+    expect(result.cases[0].scores).toEqual([]);
+    expect(result.cases[0].infraError).toMatch(/hollow/i);
+    expect(result.cases[0].infraError).toMatch(/runner/i);
+  });
+
+  it("rejects whitespace/newline/zero-width-only finalResponse as hollow when noToolCall:true is expected", async () => {
+    // Covers F7 (whitespace, newline) and F18 (zero-width / invisible chars).
+    // JS String.prototype.trim() does NOT strip U+200B-U+200D and U+FEFF, so
+    // a buggy/evasive driver could return one of those and bypass the F7 guard.
+    for (const [id, finalResponse] of [
+      ["h2", "   "],
+      ["h3", "\n"],
+      ["zw1", "\u200B"],
+      ["zw2", "\u200C"],
+      ["zw3", "\u200D"],
+      ["zw4", "\uFEFF"],
+      ["zw5", "  \u200B \u200D \uFEFF\n"],
+    ] as const) {
+      const driver = FakeDriver.fromMap({ [id]: observed({ toolCalls: [], finalResponse }) });
+      const runner = new EvalRunner({ driver });
+      const result = await runner.runTask(task([noToolCallSample(id)]));
+      expect(result.summary.errored, `id=${id}`).toBe(1);
+      expect(result.cases[0].infraError, `id=${id}`).toMatch(/hollow/i);
+    }
+  });
+
+  it("happy path: noToolCall:true + non-empty response → quality pass (behavior preserved)", async () => {
+    const driver = FakeDriver.fromMap({
+      h4: observed({ toolCalls: [], finalResponse: "Hello!" }),
+    });
+    const runner = new EvalRunner({ driver });
+    const result = await runner.runTask(task([noToolCallSample("h4")]));
+    expect(result.summary.passed).toBe(1);
+    expect(result.summary.errored).toBe(0);
+    expect(result.cases[0].pass).toBe(true);
+    expect(result.cases[0].infraError).toBeUndefined();
+  });
+
+  it("preserves no-criteria + empty observed → quality fail (not infra) for programmatic bypass", async () => {
+    const noExpectSample: EvalSample = {
+      id: "noexp",
+      description: "no expectations",
+      input: { prompt: "anything" },
+      expected: { toolSequence: "unordered" },
+      timeoutMs: 120000,
+    };
+    const driver = FakeDriver.fromMap({
+      noexp: observed({ toolCalls: [], finalResponse: "" }),
+    });
+    const runner = new EvalRunner({ driver });
+    const result = await runner.runTask(task([noExpectSample]));
+    expect(result.cases[0].pass).toBe(false);
+    expect(result.cases[0].infraError).toBeUndefined();
+    expect(result.cases[0].scores).toEqual([]);
+  });
+
+  it("preserves response.containsAll + whitespace observed → quality fail (not infra)", async () => {
+    const respSample: EvalSample = {
+      id: "rs",
+      description: "response containsAll",
+      input: { prompt: "say foo" },
+      expected: {
+        response: { containsAll: ["foo"] },
+        toolSequence: "unordered",
+      },
+      timeoutMs: 120000,
+    };
+    const driver = FakeDriver.fromMap({
+      rs: observed({ toolCalls: [], finalResponse: "   " }),
+    });
+    const runner = new EvalRunner({ driver });
+    const result = await runner.runTask(task([respSample]));
+    expect(result.cases[0].infraError).toBeUndefined();
+    expect(result.cases[0].pass).toBe(false);
+    expect(result.summary.failed).toBe(1);
+    expect(result.summary.errored).toBe(0);
+  });
+
+  it("allowHollowResults:true escape hatch lets hollow noToolCall pass quality grading", async () => {
+    const driver = FakeDriver.fromMap({
+      hh: observed({ toolCalls: [], finalResponse: "" }),
+    });
+    const runner = new EvalRunner({ driver, allowHollowResults: true });
+    const result = await runner.runTask(task([noToolCallSample("hh")]));
+    expect(result.summary.errored).toBe(0);
+    expect(result.summary.passed).toBe(1);
+    expect(result.cases[0].pass).toBe(true);
+  });
+
+  // F18: real text mixed with zero-width chars is NOT hollow.
+  it("F18: response containing real text mixed with zero-width chars is NOT hollow", async () => {
+    const driver = FakeDriver.fromMap({
+      zw6: observed({ toolCalls: [], finalResponse: "\u200BHello\u200B" }),
+    });
+    const runner = new EvalRunner({ driver });
+    const result = await runner.runTask(task([noToolCallSample("zw6")]));
+    expect(result.summary.errored).toBe(0);
+    expect(result.summary.passed).toBe(1);
+    expect(result.cases[0].pass).toBe(true);
+    expect(result.cases[0].infraError).toBeUndefined();
+  });
+});
+
 describe("EvalRunner: grader and reporter resilience", () => {
   it("does not abort run when a reporter throws — logs and continues", async () => {
     const flakyReporter: Reporter = {
@@ -337,6 +500,26 @@ describe("EvalRunner: grader and reporter resilience", () => {
     expect(result.cases[0].infraError).toMatch(/at /);
   });
 
+  it("classifies grader throws as grader infra errors, not quality failures", async () => {
+    const driver = FakeDriver.fromMap({
+      "s1": observed({ toolCalls: [{ name: "add", args: { broken: {} }, order: 0 }] }),
+    });
+    const badSample = sample("s1");
+    badSample.expected.toolCalls = [
+      {
+        name: "add",
+        args: { broken: {} },
+        match: "unsupported" as never,
+      },
+    ];
+    const runner = new EvalRunner({ driver });
+    const result = await runner.runTask(task([badSample]));
+    expect(result.summary.failed).toBe(0);
+    expect(result.summary.errored).toBe(1);
+    expect(result.cases[0].scores).toEqual([]);
+    expect(result.cases[0].infraError).toMatch(/^grader:/);
+  });
+
   it("awaits async reporter methods", async () => {
     const order: string[] = [];
     const asyncReporter: Reporter = {
@@ -357,5 +540,46 @@ describe("EvalRunner: grader and reporter resilience", () => {
     const runner = new EvalRunner({ driver, reporters: [asyncReporter] });
     await runner.runTask(task([sample("s1")]));
     expect(order).toEqual(["start", "case", "complete"]);
+  });
+
+  describe("failOnReporterError (iter18 WS-I)", () => {
+    it("default: swallows reporter errors and warns", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const throwingReporter: Reporter = {
+          onRunStart() {
+            throw new Error("reporter onRunStart boom");
+          },
+          onCaseResult() {},
+          onRunComplete() {},
+        };
+        const driver = FakeDriver.fromMap({ "s1": observed() });
+        const runner = new EvalRunner({ driver, reporters: [throwingReporter] });
+        const result = await runner.runTask(task([sample("s1")]));
+        expect(result.summary.passed).toBe(1);
+        expect(warnSpy).toHaveBeenCalled();
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("failOnReporterError:true rethrows reporter errors", async () => {
+      const throwingReporter: Reporter = {
+        onRunStart() {
+          throw new Error("reporter onRunStart boom");
+        },
+        onCaseResult() {},
+        onRunComplete() {},
+      };
+      const driver = FakeDriver.fromMap({ "s1": observed() });
+      const runner = new EvalRunner({
+        driver,
+        reporters: [throwingReporter],
+        failOnReporterError: true,
+      });
+      await expect(runner.runTask(task([sample("s1")]))).rejects.toThrow(
+        /reporter onRunStart boom/,
+      );
+    });
   });
 });

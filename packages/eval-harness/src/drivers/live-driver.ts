@@ -3,12 +3,6 @@ import type { Driver, DriverOptions } from "./types.js";
 import type { EvalSample, ObservedResult, ObservedToolCall } from "../types.js";
 import { createEvalToolTracker } from "../fixtures/eval-tools.js";
 import { extractObservedCalls } from "../observers/tool-tracker.js";
-import { PilotSwarmClient, PilotSwarmWorker } from "pilotswarm-sdk";
-// createTestEnv is a test helper from the sdk package that is not part of the
-// public API; import it by relative path from the sdk's test helpers. The sdk
-// helpers are plain .js with no types, so suppress the declaration lookup.
-// @ts-expect-error - no types for sdk test helper
-import { createTestEnv } from "../../../sdk/test/helpers/local-env.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyCtor = new (...args: any[]) => any;
@@ -18,8 +12,53 @@ export interface LiveDriverDeps {
   createEnv?: (suite: string) => any;
   WorkerCtor?: AnyCtor;
   ClientCtor?: AnyCtor;
+  /**
+   * Optional plugin directories threaded into the SDK Worker config as
+   * `pluginDirs`. Used by the prompt-testing module to inject mutated
+   * `.agent.md` variants without modifying the baseline plugin tree.
+   */
+  pluginDirs?: string[];
 }
 
+type CreateEnv = NonNullable<LiveDriverDeps["createEnv"]>;
+
+async function resolveSdkCtors(
+  deps: LiveDriverDeps,
+): Promise<{ WorkerCtor: AnyCtor; ClientCtor: AnyCtor }> {
+  if (deps.WorkerCtor && deps.ClientCtor) {
+    return { WorkerCtor: deps.WorkerCtor, ClientCtor: deps.ClientCtor };
+  }
+  const mod = await import("pilotswarm-sdk");
+  return {
+    WorkerCtor: (deps.WorkerCtor ?? mod.PilotSwarmWorker) as AnyCtor,
+    ClientCtor: (deps.ClientCtor ?? mod.PilotSwarmClient) as AnyCtor,
+  };
+}
+
+async function resolveCreateEnv(injected?: CreateEnv): Promise<CreateEnv> {
+  if (injected) return injected;
+  try {
+    // @ts-expect-error - SDK test helper is intentionally private and untyped.
+    const mod = await import("../../../sdk/test/helpers/local-env.js");
+    if (typeof mod.createTestEnv === "function") return mod.createTestEnv as CreateEnv;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `LiveDriver requires the PilotSwarm SDK test helper. Run from inside the monorepo, OR pass deps.createEnv to LiveDriver constructor to provide your own env factory. (${message})`,
+    );
+  }
+  throw new Error(
+    "LiveDriver requires the PilotSwarm SDK test helper. Run from inside the monorepo, OR pass deps.createEnv to LiveDriver constructor to provide your own env factory.",
+  );
+}
+
+/**
+ * Experimental monorepo-only live driver.
+ *
+ * This driver currently depends on the SDK package's private test environment
+ * helper via `createEnv`; standalone package consumers should provide their own
+ * dependency wiring or wait for a public SDK environment helper.
+ */
 export class LiveDriver implements Driver {
   private defaultOptions: DriverOptions;
   private deps: LiveDriverDeps;
@@ -56,27 +95,34 @@ export class LiveDriver implements Driver {
     const selectedToolNames = requested;
 
     // Track lifecycle ownership flags so cleanup runs in reverse order regardless of failure point.
+    // F20: track *construction* (not just successful start) so cleanup can call
+    // worker.stop() / client.stop() defensively if start() throws after partial
+    // resource allocation. stop() errors during cleanup are swallowed so the
+    // original start() error surfaces to the caller.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let env: any | undefined;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let worker: any | undefined;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let client: any | undefined;
-    let workerStarted = false;
-    let clientStarted = false;
+    let workerConstructed = false;
+    let clientConstructed = false;
     let abortHandler: (() => void) | undefined;
 
     const startedAt = Date.now();
     let sessionId = "";
     let finalResponse = "";
     let cmsState: string | undefined;
+    // F25: track whether the primary try-body succeeded. Cleanup errors must
+    // surface when primary succeeded, but must NOT mask a primary failure —
+    // they are logged to stderr instead.
+    let primaryError: unknown = null;
 
     try {
-      const envFactory = this.deps.createEnv ?? createTestEnv;
+      const envFactory = await resolveCreateEnv(this.deps.createEnv);
       env = envFactory(`eval_${sample.id}`);
 
-      const WorkerCtor = (this.deps.WorkerCtor ?? PilotSwarmWorker) as AnyCtor;
-      const ClientCtor = (this.deps.ClientCtor ?? PilotSwarmClient) as AnyCtor;
+      const { WorkerCtor, ClientCtor } = await resolveSdkCtors(this.deps);
 
       const workerNodeId = `eval-${randomBytes(4).toString("hex")}`;
 
@@ -90,10 +136,13 @@ export class LiveDriver implements Driver {
         workerNodeId,
         disableManagementAgents: true,
         logLevel: process.env.DUROXIDE_LOG_LEVEL || "error",
+        ...(this.deps.pluginDirs && this.deps.pluginDirs.length > 0
+          ? { pluginDirs: this.deps.pluginDirs }
+          : {}),
       });
+      workerConstructed = true;
       if (selectedTools.length > 0) worker.registerTools(selectedTools);
       await worker.start();
-      workerStarted = true;
 
       client = new ClientCtor({
         store: opts.store ?? env.store,
@@ -101,8 +150,8 @@ export class LiveDriver implements Driver {
         cmsSchema: env.cmsSchema,
         factsSchema: env.factsSchema,
       });
+      clientConstructed = true;
       await client.start();
-      clientStarted = true;
 
       const sessionConfig: {
         systemMessage?: string;
@@ -130,13 +179,35 @@ export class LiveDriver implements Driver {
           opts.signal!.addEventListener("abort", abortHandler, { once: true });
         });
       }
-      const response = abortPromise
-        ? await Promise.race([sendPromise, abortPromise])
-        : await sendPromise;
+      let response: unknown;
+      if (abortPromise) {
+        let abortedBySignal = false;
+        try {
+          response = await Promise.race([
+            sendPromise,
+            abortPromise.catch((err) => {
+              abortedBySignal = true;
+              throw err;
+            }),
+          ]);
+        } catch (err) {
+          if (abortedBySignal) {
+            // Promise.race aborts the harness wait and cleanup below stops local
+            // resources, but the SDK/provider call may not be cancellable yet.
+            // Suppress the losing send promise so it cannot become unhandled.
+            sendPromise.catch(() => {});
+          }
+          throw err;
+        }
+      } else {
+        response = await sendPromise;
+      }
       finalResponse = (response as string | undefined) ?? "";
 
       const info = await session.getInfo().catch(() => null);
       cmsState = info?.state ?? undefined;
+    } catch (err) {
+      primaryError = err;
     } finally {
       if (abortHandler && opts.signal) {
         try {
@@ -145,27 +216,64 @@ export class LiveDriver implements Driver {
           /* ignore */
         }
       }
-      if (clientStarted && client) {
+      if (clientConstructed && client) {
         try {
           await client.stop();
-        } catch {
-          /* ignore */
+        } catch (err) {
+          // F28 (iter17): mirror env.cleanup / worker.stop semantics. When the
+          // primary try-body already failed, do NOT mask the primary error
+          // with a stop() failure — log it to stderr instead. When the
+          // primary body succeeded, surface the stop() failure as the primary
+          // error so resource-leak / shutdown bugs don't get swallowed.
+          if (primaryError !== null) {
+            process.stderr.write(
+              `LiveDriver: client.stop() failed during cleanup: ${err instanceof Error ? err.message : String(err)}\n`,
+            );
+          } else {
+            primaryError = err;
+          }
         }
       }
-      if (workerStarted && worker) {
+      if (workerConstructed && worker) {
         try {
           await worker.stop();
-        } catch {
-          /* ignore */
+        } catch (err) {
+          // F28: mirror env.cleanup semantics. When the primary try-body
+          // already failed, do NOT mask the primary error with a stop()
+          // failure — log it to stderr instead. When the primary body
+          // succeeded, surface the stop() failure as the primary error so
+          // resource-leak / shutdown bugs don't get swallowed.
+          if (primaryError !== null) {
+            process.stderr.write(
+              `LiveDriver: worker.stop() failed during cleanup: ${err instanceof Error ? err.message : String(err)}\n`,
+            );
+          } else {
+            primaryError = err;
+          }
         }
       }
       if (env) {
         try {
           await env.cleanup();
-        } catch {
-          /* ignore */
+        } catch (err) {
+          // F25: when the primary try-body already errored, do NOT mask the
+          // primary error with a cleanup failure — log it to stderr instead.
+          // When the primary body succeeded, cleanup errors must surface;
+          // promote the cleanup error to primaryError so the throw below
+          // rethrows it.
+          if (primaryError !== null) {
+            console.error(
+              `LiveDriver: env.cleanup() failed during cleanup error path: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          } else {
+            primaryError = err;
+          }
         }
       }
+    }
+
+    if (primaryError !== null) {
+      throw primaryError;
     }
 
     const latencyMs = Date.now() - startedAt;

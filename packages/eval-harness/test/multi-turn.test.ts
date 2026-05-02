@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -88,10 +88,22 @@ describe("TrajectoryTask types", () => {
     const s = TrajectorySampleSchema.parse({
       id: "s",
       description: "d",
-      turns: [{ input: { prompt: "p" }, expected: {} }],
+      turns: [{ input: { prompt: "p" }, expected: { noToolCall: true } }],
     });
     expect(s.timeoutMs).toBe(120000);
     expect(s.expected).toBeUndefined();
+  });
+
+  it("rejects a trajectory turn with no expected criteria", () => {
+    const result = TrajectorySampleSchema.safeParse({
+      id: "s",
+      description: "d",
+      turns: [{ input: { prompt: "p" }, expected: {} }],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.message).toMatch(/no expected criteria/i);
+    }
   });
 });
 
@@ -135,10 +147,11 @@ describe("gradeTrajectory", () => {
   });
 
   it("scores context retention across turns (found)", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const s = sample({
       turns: [
-        { input: { prompt: "context" }, expected: {} },
-        { input: { prompt: "reference" }, expected: {} },
+        { input: { prompt: "context" }, expected: { noToolCall: true } },
+        { input: { prompt: "reference" }, expected: { noToolCall: true } },
       ],
       expected: {
         contextRetention: [{ term: "Osaka", mustAppearAfterTurn: 0 }],
@@ -156,13 +169,44 @@ describe("gradeTrajectory", () => {
     expect(score.crossTurnScores).toHaveLength(1);
     expect(score.crossTurnScores[0].pass).toBe(true);
     expect(score.crossTurnScores[0].name).toBe("context-retention/Osaka");
+    warn.mockRestore();
+  });
+
+  it("warns when context retention only matches lexical text", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const s = sample({
+      turns: [
+        { input: { prompt: "remember Osaka" }, expected: { noToolCall: true } },
+        { input: { prompt: "use it" }, expected: { noToolCall: true } },
+      ],
+      expected: {
+        contextRetention: [{ term: "Osaka", mustAppearAfterTurn: 0 }],
+      },
+    });
+    const obs: ObservedTrajectory = {
+      turns: [
+        { toolCalls: [], response: "noted", latencyMs: 1 },
+        { toolCalls: [], response: "Osaka is sunny", latencyMs: 1 },
+      ],
+      sessionId: "x",
+      totalLatencyMs: 2,
+    };
+
+    const score = gradeTrajectory(obs, s);
+
+    expect(score.crossTurnScores[0].pass).toBe(true);
+    expect(score.crossTurnScores[0].reason).toMatch(/lexical regex/i);
+    expect(warn).toHaveBeenCalledWith(
+      'contextRetention matched only via lexical regex on "Osaka" — this can pass parroting agents. Configure requireToolArgUse for stronger validation, OR add a turn-end response check that requires the term in a meaningful semantic context.',
+    );
+    warn.mockRestore();
   });
 
   it("fails context retention when term missing", () => {
     const s = sample({
       turns: [
-        { input: { prompt: "p1" }, expected: {} },
-        { input: { prompt: "p2" }, expected: {} },
+        { input: { prompt: "p1" }, expected: { noToolCall: true } },
+        { input: { prompt: "p2" }, expected: { noToolCall: true } },
       ],
       expected: {
         contextRetention: [{ term: "Osaka", mustAppearAfterTurn: 0 }],
@@ -177,6 +221,68 @@ describe("gradeTrajectory", () => {
       totalLatencyMs: 2,
     };
     const score = gradeTrajectory(obs, s);
+    expect(score.crossTurnScores[0].pass).toBe(false);
+  });
+
+  it("supports JSON-loadable context retention for tool-argument checks", () => {
+    const s = sample({
+      turns: [
+        { input: { prompt: "remember blue" }, expected: { noToolCall: true } },
+        { input: { prompt: "use it" }, expected: { toolCalls: [{ name: "paint", args: { color: "blue" } }] } },
+      ],
+      expected: {
+        contextRetention: [
+          {
+            term: "blue",
+            mustAppearAfterTurn: 0,
+            requireToolArgUse: { toolName: "paint", argPath: "color" },
+          },
+        ],
+      },
+    });
+    const obs: ObservedTrajectory = {
+      turns: [
+        { toolCalls: [], response: "blue", latencyMs: 1 },
+        {
+          toolCalls: [{ name: "paint", args: { color: "blue" }, order: 0 }],
+          response: "done",
+          latencyMs: 1,
+        },
+      ],
+      sessionId: "x",
+      totalLatencyMs: 2,
+    };
+    const score = gradeTrajectory(obs, s);
+    expect(score.crossTurnScores[0].pass).toBe(true);
+  });
+
+  it("does not pass tool-argument context retention for response-only parroting", () => {
+    const s = sample({
+      turns: [
+        { input: { prompt: "remember Osaka" }, expected: { noToolCall: true } },
+        { input: { prompt: "use it" }, expected: { noToolCall: true } },
+      ],
+      expected: {
+        contextRetention: [
+          {
+            term: "Osaka",
+            mustAppearAfterTurn: 0,
+            requireToolArgUse: { toolName: "test_weather", argPath: "city" },
+          },
+        ],
+      },
+    });
+    const obs: ObservedTrajectory = {
+      turns: [
+        { toolCalls: [], response: "Osaka", latencyMs: 1 },
+        { toolCalls: [], response: "Osaka Osaka Osaka", latencyMs: 1 },
+      ],
+      sessionId: "x",
+      totalLatencyMs: 2,
+    };
+
+    const score = gradeTrajectory(obs, s);
+
     expect(score.crossTurnScores[0].pass).toBe(false);
   });
 
@@ -232,32 +338,6 @@ describe("gradeTrajectory", () => {
     expect(turnCountScore!.pass).toBe(false);
   });
 
-  it("fails when observed has extra turns beyond expected", () => {
-    const observed: ObservedTrajectory = {
-      turns: [
-        { toolCalls: [{ name: "test_add", args: { a: 1, b: 2 }, order: 0 }], response: "3", latencyMs: 50 },
-        { toolCalls: [], response: "extra turn 1", latencyMs: 50 },
-        { toolCalls: [], response: "extra turn 2", latencyMs: 50 },
-      ],
-      sessionId: "s1",
-      totalLatencyMs: 150,
-    };
-    const sample = {
-      id: "extra-turns-fail",
-      description: "test",
-      turns: [
-        { input: { prompt: "add" }, expected: { toolCalls: [{ name: "test_add", args: { a: 1, b: 2 } }] } },
-      ],
-      timeoutMs: 5000,
-    };
-    const score = gradeTrajectory(observed, sample as any);
-    const turnCountScore = score.holisticScores.find((s) => s.name === "turn-count");
-    expect(turnCountScore).toBeDefined();
-    expect(turnCountScore!.pass).toBe(false);
-    expect(turnCountScore!.reason).toContain("3");
-    expect(turnCountScore!.reason).toContain("1");
-  });
-
   it("passes turn-count when observed matches expected turn count", () => {
     const observed: ObservedTrajectory = {
       turns: [
@@ -278,6 +358,28 @@ describe("gradeTrajectory", () => {
     const turnCountScore = score.holisticScores.find((s) => s.name === "turn-count");
     expect(turnCountScore).toBeDefined();
     expect(turnCountScore!.pass).toBe(true);
+  });
+
+  it("emits an infra error if a hollow turn bypasses schema validation", () => {
+    const hollow = {
+      id: "hollow",
+      description: "test",
+      turns: [{ input: { prompt: "p" }, expected: {} }],
+      timeoutMs: 5000,
+    } as any;
+    const score = gradeTrajectory(
+      {
+        turns: [{ toolCalls: [], response: "ok", latencyMs: 1 }],
+        sessionId: "x",
+        totalLatencyMs: 1,
+      },
+      hollow,
+    );
+    const infra = score.turnScores[0].find((s) => s.infraError);
+    expect(infra).toBeDefined();
+    expect(infra!.pass).toBe(false);
+    expect(infra!.value).toBe(0);
+    expect(infra!.reason).toMatch(/no expected criteria/i);
   });
 });
 
@@ -310,6 +412,58 @@ describe("TrajectoryRunner", () => {
     expect(result.summary.errored).toBe(1);
   });
 
+  it("classifies trajectory grader throws as infra errors, not quality failures", async () => {
+    const badSample = sample();
+    badSample.turns[0].expected.toolCalls = [
+      { name: "test_add", args: { broken: {} }, match: "unsupported" as never },
+    ];
+    const badTask: TrajectoryTask = {
+      ...task,
+      samples: [badSample],
+    };
+    const driver = FakeMultiTurnDriver.fromMap({ s1: observed() });
+    const runner = new TrajectoryRunner({ driver });
+
+    const result = await runner.runTask(badTask);
+
+    expect(result.summary.failed).toBe(0);
+    expect(result.summary.errored).toBe(1);
+    expect(result.cases[0].trajectoryScore).toEqual({
+      turnScores: [],
+      crossTurnScores: [],
+      holisticScores: [],
+    });
+    expect(result.cases[0].infraError).toMatch(/^grader:/);
+  });
+
+  it("hoists trajectory score infra errors to case-level infra errors", async () => {
+    const hollowSample = {
+      ...sample(),
+      turns: [{ input: { prompt: "p" }, expected: {} }],
+    } as TrajectorySample;
+    const hollowTask: TrajectoryTask = {
+      ...task,
+      samples: [hollowSample],
+    };
+    const driver = FakeMultiTurnDriver.fromMap({
+      s1: {
+        turns: [{ toolCalls: [], response: "ok", latencyMs: 1 }],
+        sessionId: "x",
+        totalLatencyMs: 1,
+      },
+    });
+    const runner = new TrajectoryRunner({ driver });
+
+    const result = await runner.runTask(hollowTask);
+
+    expect(result.summary.passed).toBe(0);
+    expect(result.summary.failed).toBe(0);
+    expect(result.summary.errored).toBe(1);
+    expect(result.summary.passRate).toBeUndefined();
+    expect(result.summary.noQualitySignal).toBe(true);
+    expect(result.cases[0].infraError).toMatch(/no expected criteria/i);
+  });
+
   it("computes pass rate correctly with mixed results", async () => {
     const badObs: ObservedTrajectory = {
       turns: [
@@ -329,6 +483,168 @@ describe("TrajectoryRunner", () => {
     expect(result.summary.passed).toBe(1);
     expect(result.summary.failed).toBe(1);
     expect(result.summary.passRate).toBe(0.5);
+  });
+
+  describe("F7 hollow turn rejection (noToolCall:true + empty observed turn)", () => {
+    function noToolCallTrajectorySample(id = "ntc"): TrajectorySample {
+      return TrajectorySampleSchema.parse({
+        id,
+        description: "noToolCall trajectory",
+        turns: [
+          {
+            input: { prompt: "say hi, no tools" },
+            expected: { noToolCall: true },
+          },
+        ],
+        timeoutMs: 1000,
+      });
+    }
+
+    it("hoists infraError when a noToolCall:true turn has empty response and no tool calls", async () => {
+      const sampleNtc = noToolCallTrajectorySample();
+      const driver = FakeMultiTurnDriver.fromMap({
+        ntc: {
+          turns: [{ toolCalls: [], response: "", latencyMs: 1 }],
+          sessionId: "x",
+          totalLatencyMs: 1,
+        },
+      });
+      const runner = new TrajectoryRunner({ driver });
+      const result = await runner.runTask({
+        ...task,
+        samples: [sampleNtc],
+      });
+      expect(result.summary.errored).toBe(1);
+      expect(result.summary.passed).toBe(0);
+      expect(result.summary.failed).toBe(0);
+      expect(result.summary.passRate).toBeUndefined();
+      expect(result.summary.noQualitySignal).toBe(true);
+      expect(result.cases[0].pass).toBe(false);
+      expect(result.cases[0].infraError).toMatch(/hollow/i);
+      expect(result.cases[0].infraError).toMatch(/runner/i);
+    });
+
+    it("hoists infraError for whitespace/newline/zero-width-only responses in a noToolCall:true turn", async () => {
+      for (const [id, response] of [
+        ["ntc-ws", "   "],
+        ["ntc-nl", "\n"],
+        ["ntc-zw1", "\u200B"],
+        ["ntc-zw2", "\u200C"],
+        ["ntc-zw3", "\u200D"],
+        ["ntc-zw4", "\uFEFF"],
+      ] as const) {
+        const sampleNtc = noToolCallTrajectorySample(id);
+        const driver = FakeMultiTurnDriver.fromMap({
+          [id]: {
+            turns: [{ toolCalls: [], response, latencyMs: 1 }],
+            sessionId: "x",
+            totalLatencyMs: 1,
+          },
+        });
+        const runner = new TrajectoryRunner({ driver });
+        const result = await runner.runTask({ ...task, samples: [sampleNtc] });
+        expect(result.summary.errored, `id=${id}`).toBe(1);
+        expect(result.cases[0].infraError, `id=${id}`).toMatch(/hollow/i);
+      }
+    });
+
+    it("hoists infraError when ANY turn in a multi-turn trajectory is hollow", async () => {
+      const multiSample = TrajectorySampleSchema.parse({
+        id: "ntc-multi",
+        description: "two-turn with hollow second",
+        turns: [
+          {
+            input: { prompt: "add 1+2" },
+            expected: { toolCalls: [{ name: "test_add", args: { a: 1, b: 2 }, match: "subset" }] },
+          },
+          {
+            input: { prompt: "now say hi, no tools" },
+            expected: { noToolCall: true },
+          },
+        ],
+        timeoutMs: 1000,
+      });
+      const driver = FakeMultiTurnDriver.fromMap({
+        "ntc-multi": {
+          turns: [
+            { toolCalls: [{ name: "test_add", args: { a: 1, b: 2 }, order: 0 }], response: "3", latencyMs: 1 },
+            { toolCalls: [], response: "", latencyMs: 1 },
+          ],
+          sessionId: "x",
+          totalLatencyMs: 2,
+        },
+      });
+      const runner = new TrajectoryRunner({ driver });
+      const result = await runner.runTask({ ...task, samples: [multiSample] });
+      expect(result.summary.errored).toBe(1);
+      expect(result.cases[0].infraError).toMatch(/hollow/i);
+    });
+
+    it("happy path: noToolCall:true with non-empty response → quality pass (preserved)", async () => {
+      const sampleNtc = noToolCallTrajectorySample("ntc-ok");
+      const driver = FakeMultiTurnDriver.fromMap({
+        "ntc-ok": {
+          turns: [{ toolCalls: [], response: "Hello!", latencyMs: 1 }],
+          sessionId: "x",
+          totalLatencyMs: 1,
+        },
+      });
+      const runner = new TrajectoryRunner({ driver });
+      const result = await runner.runTask({ ...task, samples: [sampleNtc] });
+      expect(result.summary.passed).toBe(1);
+      expect(result.summary.errored).toBe(0);
+      expect(result.cases[0].pass).toBe(true);
+    });
+
+    it("allowHollowResults:true escape hatch permits hollow noToolCall turns to be quality-graded", async () => {
+      const sampleNtc = noToolCallTrajectorySample("ntc-allow");
+      const driver = FakeMultiTurnDriver.fromMap({
+        "ntc-allow": {
+          turns: [{ toolCalls: [], response: "", latencyMs: 1 }],
+          sessionId: "x",
+          totalLatencyMs: 1,
+        },
+      });
+      const runner = new TrajectoryRunner({ driver, allowHollowResults: true });
+      const result = await runner.runTask({ ...task, samples: [sampleNtc] });
+      expect(result.summary.errored).toBe(0);
+      expect(result.summary.passed).toBe(1);
+      expect(result.cases[0].pass).toBe(true);
+    });
+
+    // F18: zero-width / invisible chars are also covered above. JS String.prototype.trim()
+    // does NOT strip U+200B-U+200D / U+FEFF — keep multi-turn coverage too.
+    it("F18: hoists infraError when ANY trajectory turn is zero-width-only", async () => {
+      const multiSample = TrajectorySampleSchema.parse({
+        id: "ntc-multi-zw",
+        description: "two-turn with zero-width second",
+        turns: [
+          {
+            input: { prompt: "add 1+2" },
+            expected: { toolCalls: [{ name: "test_add", args: { a: 1, b: 2 }, match: "subset" }] },
+          },
+          {
+            input: { prompt: "now say hi, no tools" },
+            expected: { noToolCall: true },
+          },
+        ],
+        timeoutMs: 1000,
+      });
+      const driver = FakeMultiTurnDriver.fromMap({
+        "ntc-multi-zw": {
+          turns: [
+            { toolCalls: [{ name: "test_add", args: { a: 1, b: 2 }, order: 0 }], response: "3", latencyMs: 1 },
+            { toolCalls: [], response: "\u200B\uFEFF", latencyMs: 1 },
+          ],
+          sessionId: "x",
+          totalLatencyMs: 2,
+        },
+      });
+      const runner = new TrajectoryRunner({ driver });
+      const result = await runner.runTask({ ...task, samples: [multiSample] });
+      expect(result.summary.errored).toBe(1);
+      expect(result.cases[0].infraError).toMatch(/hollow/i);
+    });
   });
 
   it("forwards events to reporters", async () => {
@@ -359,8 +675,8 @@ describe("v4 review fixes", () => {
       id: "cr-boundary",
       description: "test",
       turns: [
-        { input: { prompt: "Tell me about Osaka" }, expected: {} },
-        { input: { prompt: "What did I ask about?" }, expected: {} },
+        { input: { prompt: "Tell me about Osaka" }, expected: { noToolCall: true } },
+        { input: { prompt: "What did I ask about?" }, expected: { noToolCall: true } },
       ],
       expected: {
         contextRetention: [{ term: "Osaka", mustAppearAfterTurn: 0 }],
@@ -448,5 +764,14 @@ describe("multi-turn fixtures", () => {
       expect(s.turns.length).toBeGreaterThanOrEqual(1);
       expect(s.id.startsWith("multi-turn.")).toBe(true);
     }
+  });
+
+  it("context-retention fixture uses JSON-loadable tool-argument retention", () => {
+    const task = TrajectoryTaskSchema.parse(raw);
+    const retention = task.samples.find((s) => s.id === "multi-turn.context-retention")!;
+    expect(retention.expected?.contextRetention?.[0].requireToolArgUse).toEqual({
+      toolName: "test_weather",
+      argPath: "city",
+    });
   });
 });

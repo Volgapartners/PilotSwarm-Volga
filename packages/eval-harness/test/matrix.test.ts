@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { MatrixRunner } from "../src/matrix.js";
 import { FakeDriver } from "../src/drivers/fake-driver.js";
+import { CIGate } from "../src/ci-gate.js";
 import type { Driver, DriverOptions } from "../src/drivers/types.js";
 import type {
   EvalSample,
@@ -326,5 +327,123 @@ describe("MatrixRunner", () => {
     expect(result.configs).toEqual(CONFIGS);
     expect(typeof result.startedAt).toBe("string");
     expect(typeof result.finishedAt).toBe("string");
+  });
+
+  it("throws at run time before driver creation when planned sample cells exceed maxCells", async () => {
+    let created = 0;
+    const runner = new MatrixRunner({
+      driverFactory: () => {
+        created++;
+        return passingDriver();
+      },
+      models: ["m1", "m2"],
+      configs: CONFIGS,
+      trials: 1,
+      maxCells: 3,
+    });
+    await expect(runner.runTask(makeTask(["s1"]))).rejects.toThrow(/maxCells/i);
+    expect(created).toBe(0);
+  });
+
+  it("dryRun returns the matrix plan without running drivers", async () => {
+    let created = 0;
+    const runner = new MatrixRunner({
+      driverFactory: () => {
+        created++;
+        return passingDriver();
+      },
+      models: ["m1", "m2"],
+      configs: CONFIGS,
+      trials: 3,
+      dryRun: true,
+    });
+    const result = await runner.runTask(makeTask(["s1", "s2"]));
+    expect(created).toBe(0);
+    expect(result.dryRun).toBe(true);
+    expect(result.cells).toHaveLength(4);
+    expect(result.cells[0].result.rawRuns).toEqual([]);
+    expect(result.cells[0].result.dryRun).toBe(true);
+    expect(result.cells[0].result.summary.meanPassRate).toBeUndefined();
+    expect(result.cells[0].result.samples.every((sample) => sample.noQualitySignal)).toBe(true);
+  });
+
+  it("dryRun cells fail CI gate with an explicit dry-run reason", async () => {
+    const runner = new MatrixRunner({
+      driverFactory: () => passingDriver(),
+      models: ["m1"],
+      configs: [{ id: "cfg-a", label: "A", overrides: {} }],
+      trials: 1,
+      dryRun: true,
+    });
+    const matrix = await runner.runTask(makeTask(["s1"]));
+
+    const verdict = new CIGate({ passRateFloor: 0.8 }).evaluate(matrix.cells[0].result);
+
+    expect(verdict.pass).toBe(false);
+    expect(verdict.reasons).toContain(
+      "CIGate received a dry-run MultiTrialResult — re-run without dryRun to gate on real quality signal",
+    );
+  });
+
+  it("non-dry-run cells evaluate normally in CI gate", async () => {
+    const runner = new MatrixRunner({
+      driverFactory: () => passingDriver(),
+      models: ["m1"],
+      configs: [{ id: "cfg-a", label: "A", overrides: {} }],
+      trials: 1,
+    });
+    const matrix = await runner.runTask(makeTask(["s1"]));
+
+    const verdict = new CIGate({ passRateFloor: 0.8, failOnNewSamples: false, allowMissingBaselineSamples: true }).evaluate(matrix.cells[0].result);
+
+    expect(verdict.pass).toBe(true);
+    expect(verdict.reasons).toContain("All gates passed");
+  });
+
+  it("dryRun also enforces maxCells cap (F9)", async () => {
+    let created = 0;
+    const runner = new MatrixRunner({
+      driverFactory: () => {
+        created++;
+        return passingDriver();
+      },
+      models: ["m1", "m2", "m3", "m4"],
+      configs: [
+        { id: "c1", label: "C1", overrides: {} },
+        { id: "c2", label: "C2", overrides: {} },
+        { id: "c3", label: "C3", overrides: {} },
+        { id: "c4", label: "C4", overrides: {} },
+        { id: "c5", label: "C5", overrides: {} },
+      ],
+      trials: 5,
+      maxCells: 1,
+      dryRun: true,
+    });
+
+    await expect(runner.runTask(makeTask(["s1"]))).rejects.toThrow(/maxCells/i);
+    expect(created).toBe(0);
+  });
+
+  it("dryRun within maxCells budget previews cells without creating drivers", async () => {
+    let created = 0;
+    const runner = new MatrixRunner({
+      driverFactory: () => {
+        created++;
+        return passingDriver();
+      },
+      models: ["m1", "m2"],
+      configs: [
+        { id: "c1", label: "C1", overrides: {} },
+        { id: "c2", label: "C2", overrides: {} },
+      ],
+      trials: 1,
+      maxCells: 100,
+      dryRun: true,
+    });
+
+    const result = await runner.runTask(makeTask(["s1"]));
+    expect(created).toBe(0);
+    expect(result.dryRun).toBe(true);
+    expect(result.cells).toHaveLength(4);
   });
 });

@@ -4,6 +4,7 @@
   "name": "Multi-Turn Scenarios",
   "description": "Core multi-turn trajectories — sequential calculations, context retention, tool switching, goal completion, and call budgets.",
   "version": "1.0.0",
+  "runnable": false,
   "passRateFloor": 0.8,
   "samples": [
     {
@@ -12,12 +13,24 @@
       "turns": [
         {
           "input": {
-            "prompt": "What is 3 plus 4? Use test_add.",
-            "systemMessage": "Use the provided tools for math. Be brief."
+            "prompt": "What is 3 plus 4? Use test_add."
           },
           "expected": {
-            "toolCalls": [{ "name": "test_add", "args": { "a": 3, "b": 4 }, "match": "subset" }],
-            "response": { "containsAny": ["7"] }
+            "toolCalls": [
+              {
+                "name": "test_add",
+                "args": {
+                  "a": 3,
+                  "b": 4
+                },
+                "match": "subset"
+              }
+            ],
+            "response": {
+              "containsAny": [
+                "7"
+              ]
+            }
           }
         },
         {
@@ -25,13 +38,32 @@
             "prompt": "Now multiply that result by 2 using test_multiply."
           },
           "expected": {
-            "toolCalls": [{ "name": "test_multiply", "args": { "a": 7, "b": 2 }, "match": "subset" }],
-            "response": { "containsAny": ["14"] }
+            "toolCalls": [
+              {
+                "name": "test_multiply",
+                "args": {
+                  "a": 7,
+                  "b": 2
+                },
+                "match": "subset"
+              }
+            ],
+            "response": {
+              "containsAny": [
+                "14"
+              ]
+            }
           }
         }
       ],
-      "tools": ["test_add", "test_multiply"],
-      "tags": ["multi-turn", "arithmetic"],
+      "tools": [
+        "test_add",
+        "test_multiply"
+      ],
+      "tags": [
+        "multi-turn",
+        "arithmetic"
+      ],
       "expected": {
         "goalCompleted": true,
         "maxTotalToolCalls": 2
@@ -47,7 +79,11 @@
           },
           "expected": {
             "noToolCall": true,
-            "response": { "containsAny": ["Osaka"] }
+            "response": {
+              "containsAny": [
+                "Osaka"
+              ]
+            }
           }
         },
         {
@@ -55,15 +91,37 @@
             "prompt": "What's the weather in my favorite city? Use test_weather."
           },
           "expected": {
-            "toolCalls": [{ "name": "test_weather", "args": { "city": "Osaka" }, "match": "subset" }]
+            "toolCalls": [
+              {
+                "name": "test_weather",
+                "args": {
+                  "city": "Osaka"
+                },
+                "match": "subset"
+              }
+            ]
           }
         }
       ],
-      "tools": ["test_weather"],
-      "tags": ["multi-turn", "context-retention"],
+      "tools": [
+        "test_weather"
+      ],
+      "tags": [
+        "multi-turn",
+        "context-retention"
+      ],
       "expected": {
         "goalCompleted": true,
-        "contextRetention": [{ "term": "Osaka", "mustAppearAfterTurn": 0 }]
+        "contextRetention": [
+          {
+            "term": "Osaka",
+            "mustAppearAfterTurn": 0,
+            "requireToolArgUse": {
+              "toolName": "test_weather",
+              "argPath": "city"
+            }
+          }
+        ]
       }
     },
     {
@@ -72,12 +130,22 @@
       "turns": [
         {
           "input": {
-            "prompt": "What is 10 plus 5? Use test_add.",
-            "systemMessage": "Use the right tool for each request. Be brief."
+            "prompt": "What is 10 plus 5? Use test_add."
           },
           "expected": {
-            "toolCalls": [{ "name": "test_add", "args": { "a": 10, "b": 5 }, "match": "subset" }],
-            "forbiddenTools": ["test_weather"]
+            "toolCalls": [
+              {
+                "name": "test_add",
+                "args": {
+                  "a": 10,
+                  "b": 5
+                },
+                "match": "subset"
+              }
+            ],
+            "forbiddenTools": [
+              "test_weather"
+            ]
           }
         },
         {
@@ -85,13 +153,29 @@
             "prompt": "Now check the weather in Paris using test_weather."
           },
           "expected": {
-            "toolCalls": [{ "name": "test_weather", "args": { "city": "Paris" }, "match": "subset" }],
-            "forbiddenTools": ["test_add"]
+            "toolCalls": [
+              {
+                "name": "test_weather",
+                "args": {
+                  "city": "Paris"
+                },
+                "match": "subset"
+              }
+            ],
+            "forbiddenTools": [
+              "test_add"
+            ]
           }
         }
       ],
-      "tools": ["test_add", "test_weather"],
-      "tags": ["multi-turn", "tool-switch"],
+      "tools": [
+        "test_add",
+        "test_weather"
+      ],
+      "tags": [
+        "multi-turn",
+        "tool-switch"
+      ],
       "expected": {
         "goalCompleted": true
       }
@@ -102,12 +186,16 @@
       "turns": [
         {
           "input": {
-            "prompt": "Say hello without using any tools.",
-            "systemMessage": "Only use tools when asked to. Be brief."
+            "prompt": "Say hello without using any tools."
           },
           "expected": {
             "noToolCall": true,
-            "response": { "containsAny": ["hello", "hi"] }
+            "response": {
+              "containsAny": [
+                "hello",
+                "hi"
+              ]
+            }
           }
         },
         {
@@ -115,12 +203,26 @@
             "prompt": "Now add 1 and 2 using test_add."
           },
           "expected": {
-            "toolCalls": [{ "name": "test_add", "args": { "a": 1, "b": 2 }, "match": "subset" }]
+            "toolCalls": [
+              {
+                "name": "test_add",
+                "args": {
+                  "a": 1,
+                  "b": 2
+                },
+                "match": "subset"
+              }
+            ]
           }
         }
       ],
-      "tools": ["test_add"],
-      "tags": ["multi-turn", "mixed"],
+      "tools": [
+        "test_add"
+      ],
+      "tags": [
+        "multi-turn",
+        "mixed"
+      ],
       "expected": {
         "goalCompleted": true
       }
@@ -134,7 +236,16 @@
             "prompt": "Add 1 and 2 using test_add."
           },
           "expected": {
-            "toolCalls": [{ "name": "test_add", "args": { "a": 1, "b": 2 }, "match": "subset" }]
+            "toolCalls": [
+              {
+                "name": "test_add",
+                "args": {
+                  "a": 1,
+                  "b": 2
+                },
+                "match": "subset"
+              }
+            ]
           }
         },
         {
@@ -142,7 +253,16 @@
             "prompt": "Multiply 3 and 4 using test_multiply."
           },
           "expected": {
-            "toolCalls": [{ "name": "test_multiply", "args": { "a": 3, "b": 4 }, "match": "subset" }]
+            "toolCalls": [
+              {
+                "name": "test_multiply",
+                "args": {
+                  "a": 3,
+                  "b": 4
+                },
+                "match": "subset"
+              }
+            ]
           }
         },
         {
@@ -150,12 +270,27 @@
             "prompt": "Add 5 and 6 using test_add."
           },
           "expected": {
-            "toolCalls": [{ "name": "test_add", "args": { "a": 5, "b": 6 }, "match": "subset" }]
+            "toolCalls": [
+              {
+                "name": "test_add",
+                "args": {
+                  "a": 5,
+                  "b": 6
+                },
+                "match": "subset"
+              }
+            ]
           }
         }
       ],
-      "tools": ["test_add", "test_multiply"],
-      "tags": ["multi-turn", "budget"],
+      "tools": [
+        "test_add",
+        "test_multiply"
+      ],
+      "tags": [
+        "multi-turn",
+        "budget"
+      ],
       "expected": {
         "maxTotalToolCalls": 4
       }
@@ -166,11 +301,18 @@
       "turns": [
         {
           "input": {
-            "prompt": "Please check the weather in Berlin using test_weather.",
-            "systemMessage": "Follow the user's plan step by step. Be brief."
+            "prompt": "Please check the weather in Berlin using test_weather."
           },
           "expected": {
-            "toolCalls": [{ "name": "test_weather", "args": { "city": "Berlin" }, "match": "subset" }]
+            "toolCalls": [
+              {
+                "name": "test_weather",
+                "args": {
+                  "city": "Berlin"
+                },
+                "match": "subset"
+              }
+            ]
           }
         },
         {
@@ -179,12 +321,22 @@
           },
           "expected": {
             "noToolCall": true,
-            "response": { "containsAny": ["Berlin", "weather"] }
+            "response": {
+              "containsAny": [
+                "Berlin",
+                "weather"
+              ]
+            }
           }
         }
       ],
-      "tools": ["test_weather"],
-      "tags": ["multi-turn", "goal"],
+      "tools": [
+        "test_weather"
+      ],
+      "tags": [
+        "multi-turn",
+        "goal"
+      ],
       "expected": {
         "goalCompleted": true
       }

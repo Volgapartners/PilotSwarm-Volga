@@ -64,18 +64,18 @@ export class JsonlReporter implements Reporter {
   }
 
   onRunComplete(result: RunResult): void {
-    const summary =
-      JSON.stringify({
-        type: "summary",
-        runId: this.runId,
-        total: result.summary.total,
-        passed: result.summary.passed,
-        failed: result.summary.failed,
-        errored: result.summary.errored,
-        passRate: result.summary.passRate,
-        startedAt: result.startedAt,
-        finishedAt: result.finishedAt,
-      }) + "\n";
+    const summaryLine: Record<string, unknown> = {
+      type: "summary",
+      runId: this.runId,
+      taskId: result.taskId,
+      taskVersion: result.taskVersion,
+      ...result.summary,
+      startedAt: result.startedAt,
+      finishedAt: result.finishedAt,
+    };
+    if (result.gitSha !== undefined) summaryLine.gitSha = result.gitSha;
+    if (result.model !== undefined) summaryLine.model = result.model;
+    const summary = JSON.stringify(summaryLine) + "\n";
     appendFileSync(this.filePath, summary, "utf8");
   }
 }

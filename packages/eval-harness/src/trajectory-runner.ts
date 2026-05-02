@@ -9,6 +9,7 @@ import type {
   ObservedTrajectory,
 } from "./types.js";
 import { gradeTrajectory } from "./graders/trajectory.js";
+import { isVisuallyEmpty } from "./runner.js";
 
 export interface TrajectoryReporter {
   onRunStart?(task: TrajectoryTask, runId: string): void | Promise<void>;
@@ -22,6 +23,14 @@ export interface TrajectoryRunnerOptions {
   runId?: string;
   gitSha?: string;
   model?: string;
+  /**
+   * When false (default), the trajectory runner rejects observed turns that
+   * have no tool calls AND an empty/whitespace-only response when the
+   * corresponding sample turn expects `noToolCall: true`. Mirrors the F7
+   * hollow-turn guard in `EvalRunner`. Set to `true` only for evals that
+   * legitimately verify a "say nothing and call no tools" turn (rare).
+   */
+  allowHollowResults?: boolean;
 }
 
 const SAFE_ID_RE = /^[a-zA-Z0-9_-]+$/;
@@ -40,6 +49,16 @@ function allScoresPass(score: TrajectoryScore): boolean {
   return turnOk && crossOk && holisticOk;
 }
 
+function infraScoreMessages(score: TrajectoryScore): string[] {
+  return [
+    ...score.turnScores.flat(),
+    ...score.crossTurnScores,
+    ...score.holisticScores,
+  ]
+    .filter((s) => s.infraError)
+    .map((s) => `${s.name}: ${s.reason}`);
+}
+
 export class TrajectoryRunner {
   private driver: MultiTurnDriver;
   private reporters: TrajectoryReporter[];
@@ -47,6 +66,7 @@ export class TrajectoryRunner {
   private runId: string;
   private gitSha?: string;
   private model?: string;
+  private allowHollowResults: boolean;
 
   constructor(options: TrajectoryRunnerOptions) {
     this.driver = options.driver;
@@ -55,6 +75,7 @@ export class TrajectoryRunner {
     this.runId = this.fixedRunId ?? sanitizeId(randomUUID());
     this.gitSha = options.gitSha;
     this.model = options.model;
+    this.allowHollowResults = options.allowHollowResults ?? false;
   }
 
   private async safeReporter<K extends keyof TrajectoryReporter>(
@@ -93,6 +114,8 @@ export class TrajectoryRunner {
     const passed = cases.filter((c) => c.pass).length;
     const errored = cases.filter((c) => !!c.infraError).length;
     const failed = cases.filter((c) => !c.pass && !c.infraError).length;
+    const qualityDenominator = cases.length - errored;
+    const passRate = qualityDenominator > 0 ? passed / qualityDenominator : undefined;
 
     const result: TrajectoryRunResult = {
       schemaVersion: 1,
@@ -108,7 +131,9 @@ export class TrajectoryRunner {
         passed,
         failed,
         errored,
-        passRate: cases.length > 0 ? passed / cases.length : 0,
+        ...(passRate === undefined ? {} : { passRate }),
+        ...(passRate === undefined ? { noQualitySignal: true } : {}),
+        infraErrorRate: cases.length > 0 ? errored / cases.length : 0,
       },
       cases,
     };
@@ -145,24 +170,58 @@ export class TrajectoryRunner {
         if (timeoutHandle) clearTimeout(timeoutHandle);
       }
 
+      // F7 hollow-turn guard: if any observed turn paired with a
+      // `noToolCall: true` expected turn has no tool calls AND no
+      // non-whitespace response, hoist to case-level infraError. A silent
+      // turn yields zero evidence of model behavior and would falsely score
+      // a quality pass against the `noToolCall` expectation.
+      if (!this.allowHollowResults) {
+        const limit = Math.min(observed.turns.length, sample.turns.length);
+        for (let i = 0; i < limit; i++) {
+          const expectedTurn = sample.turns[i].expected;
+          const observedTurn = observed.turns[i];
+          if (
+            expectedTurn.noToolCall === true &&
+            observedTurn.toolCalls.length === 0 &&
+            isVisuallyEmpty(observedTurn.response)
+          ) {
+            return {
+              caseId: sample.id,
+              pass: false,
+              trajectoryScore: { turnScores: [], crossTurnScores: [], holisticScores: [] },
+              observed,
+              infraError: `runner: hollow observed turn ${i} (no tool calls and empty/whitespace-only response) cannot validate a noToolCall:true expectation`,
+              durationMs: Date.now() - start,
+            };
+          }
+        }
+      }
+
       let trajectoryScore: TrajectoryScore;
       try {
         trajectoryScore = gradeTrajectory(observed, sample);
       } catch (graderErr) {
         const msg = graderErr instanceof Error ? graderErr.message : String(graderErr);
-        trajectoryScore = {
-          turnScores: [
-            [
-              {
-                name: "grader-error",
-                value: 0,
-                pass: false,
-                reason: `grader threw: ${msg}`,
-              },
-            ],
-          ],
-          crossTurnScores: [],
-          holisticScores: [],
+        const stack = graderErr instanceof Error && graderErr.stack ? "\n" + graderErr.stack : "";
+        return {
+          caseId: sample.id,
+          pass: false,
+          trajectoryScore: { turnScores: [], crossTurnScores: [], holisticScores: [] },
+          observed,
+          infraError: `grader: ${msg}${stack}`,
+          durationMs: Date.now() - start,
+        };
+      }
+
+      const infraScores = infraScoreMessages(trajectoryScore);
+      if (infraScores.length > 0) {
+        return {
+          caseId: sample.id,
+          pass: false,
+          trajectoryScore,
+          observed,
+          infraError: infraScores.join("; "),
+          durationMs: Date.now() - start,
         };
       }
 
@@ -193,6 +252,6 @@ export class TrajectoryRunner {
   }
 
   checkPassRateFloor(result: TrajectoryRunResult, floor: number): boolean {
-    return result.summary.passRate >= floor;
+    return result.summary.passRate !== undefined && result.summary.passRate >= floor;
   }
 }

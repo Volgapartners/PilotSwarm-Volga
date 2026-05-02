@@ -2,6 +2,7 @@
   "name": "pilotswarm-eval-harness",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -11,8 +12,17 @@
       "types": "./dist/index.d.ts"
     }
   },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "datasets",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
+    "prepack": "npm run build",
+    "pretest": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest"
   },

@@ -12,6 +12,12 @@ export { gradeOrdering } from "./ordering.js";
 export { gradeResponse } from "./response.js";
 export { gradeCmsState } from "./cms-state.js";
 export { gradeDurability } from "./durability.js";
+export {
+  gradeNoSecretLeak,
+  findSecretLeaks,
+  SecretLeakPatterns,
+} from "./secret-leak.js";
+export type { SecretLeakOptions, SecretLeakHit } from "./secret-leak.js";
 
 export function gradeEvalCase(observed: ObservedResult, expected: EvalExpected): Score[] {
   const scores: Score[] = [];
@@ -53,7 +59,11 @@ export function gradeEvalCase(observed: ObservedResult, expected: EvalExpected):
       let bestCall = candidates[0].o;
       let bestIdx = candidates[0].idx;
       for (const { o, idx } of candidates) {
-        const r = matchArgs(o.args, exp.args, exp.match ?? "subset");
+        const r = matchArgs(o.args, exp.args, exp.match ?? "subset", {
+          subsetCaseInsensitive: exp.subsetCaseInsensitive,
+          numericTolerance: exp.numericTolerance,
+          fuzzyStringMaxRelativeDistance: exp.fuzzyStringMaxRelativeDistance,
+        });
         if (r.score > best.score || (r.pass && !best.pass)) {
           best = r;
           bestCall = o;

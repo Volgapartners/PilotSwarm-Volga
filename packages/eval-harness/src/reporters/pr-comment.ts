@@ -3,131 +3,17 @@ import { dirname } from "node:path";
 
 import type {
   CIGateResult,
-  MatrixCell,
   MatrixResult,
   MultiTrialResult,
   RegressionResult,
-  SampleTrialResult,
 } from "../types.js";
 import type { AggregateReporter } from "./aggregate-types.js";
-
-function pct(rate: number): string {
-  if (!Number.isFinite(rate)) return "—";
-  return (rate * 100).toFixed(1);
-}
-
-function collectKs(samples: SampleTrialResult[]): number[] {
-  const set = new Set<number>();
-  for (const s of samples) {
-    for (const k of Object.keys(s.passAtK)) set.add(Number(k));
-  }
-  return [...set].filter((k) => Number.isFinite(k)).sort((a, b) => a - b);
-}
-
-function formatPassAtKCell(s: SampleTrialResult, k: number): string {
-  if (k > s.trials) return "—";
-  const v = s.passAtK[k];
-  if (v === undefined) return "—";
-  return v.toFixed(2);
-}
-
-function findCell(
-  cells: MatrixCell[],
-  model: string,
-  configId: string,
-): MatrixCell | undefined {
-  return cells.find((c) => c.model === model && c.configId === configId);
-}
-
-function multiTrialMarkdown(result: MultiTrialResult): string {
-  const lines: string[] = [];
-  const { taskId, trials, summary, samples, model } = result;
-  lines.push(`## Eval Results: ${taskId}`);
-  lines.push("");
-  lines.push(`**Task Version:** ${result.taskVersion}  `);
-  if (model) lines.push(`**Model:** ${model}  `);
-  lines.push(`**Trials:** ${trials}  `);
-  lines.push(
-    `**Mean Pass Rate:** ${pct(summary.meanPassRate)}% (CI: ${pct(summary.passRateCI.lower)}-${pct(summary.passRateCI.upper)}%)  `,
-  );
-  lines.push("");
-
-  const ks = collectKs(samples);
-  const header = ["Sample", "Pass Rate", ...ks.map((k) => `pass@${k}`)];
-  lines.push(`| ${header.join(" | ")} |`);
-  lines.push(`|${header.map(() => "---").join("|")}|`);
-  for (const s of samples) {
-    const rateCell = `${pct(s.passRate)}% (${s.passCount}/${s.trials})`;
-    const kCells = ks.map((k) => formatPassAtKCell(s, k));
-    lines.push(`| ${s.sampleId} | ${rateCell} | ${kCells.join(" | ")} |`);
-  }
-  lines.push("");
-  return lines.join("\n");
-}
-
-function matrixMarkdown(result: MatrixResult): string {
-  const lines: string[] = [];
-  const { taskId, taskVersion, gitSha, models, configs, cells, summary } =
-    result;
-  const trials = cells[0]?.result.trials ?? 0;
-
-  lines.push(`## Eval Matrix: ${taskId}`);
-  lines.push("");
-  lines.push(`**Task:** ${taskId} v${taskVersion}  `);
-  lines.push(`**Trials per cell:** ${trials}  `);
-  if (gitSha) lines.push(`**Git SHA:** ${gitSha}  `);
-  lines.push("");
-
-  lines.push(`### Pass Rates`);
-  lines.push("");
-  const header = ["Model", ...configs.map((c) => c.label)];
-  lines.push(`| ${header.join(" | ")} |`);
-  lines.push(`|${header.map(() => "---").join("|")}|`);
-  for (const m of models) {
-    const row: string[] = [m];
-    for (const cfg of configs) {
-      const cell = findCell(cells, m, cfg.id);
-      if (!cell) {
-        row.push("—");
-        continue;
-      }
-      const r = cell.result.summary.meanPassRate;
-      const ci = cell.result.summary.passRateCI;
-      row.push(`${pct(r)}% (CI: ${pct(ci.lower)}-${pct(ci.upper)}%)`);
-    }
-    lines.push(`| ${row.join(" | ")} |`);
-  }
-  lines.push("");
-
-  lines.push(`### Best / Worst`);
-  lines.push("");
-  const best = findCell(
-    cells,
-    summary.bestPassRate.model,
-    summary.bestPassRate.configId,
-  );
-  const worst = findCell(
-    cells,
-    summary.worstPassRate.model,
-    summary.worstPassRate.configId,
-  );
-  if (best) {
-    lines.push(
-      `- **Best:** ${best.model} × ${best.configLabel} — ${pct(summary.bestPassRate.passRate)}%`,
-    );
-  }
-  if (worst) {
-    lines.push(
-      `- **Worst:** ${worst.model} × ${worst.configLabel} — ${pct(summary.worstPassRate.passRate)}%`,
-    );
-  }
-  lines.push("");
-  return lines.join("\n");
-}
+import { escapeMarkdownCell, formatPValue, matrixMarkdown, multiTrialMarkdown, pct } from "./util.js";
 
 function gateResultMarkdown(
   gate: CIGateResult,
   regressions?: RegressionResult[],
+  extras?: { noQualityCurrentSamples?: string[] },
 ): string {
   const lines: string[] = [];
   const badge = gate.pass ? "✅ **PASS**" : "❌ **FAIL**";
@@ -148,15 +34,26 @@ function gateResultMarkdown(
   lines.push(`### Reasons`);
   lines.push("");
   for (const r of gate.reasons) {
-    lines.push(`- ${r}`);
+    lines.push(`- ${escapeMarkdownCell(r)}`);
   }
   lines.push("");
 
   if (regressions && regressions.length > 0) {
+    // F21: column header reflects whether the displayed p-value is raw or
+    // multiple-testing-corrected. RegressionDetector applies the same
+    // correction across all regressions in a detection result, so derive the
+    // label from the first non-"none" correction encountered.
+    const correctionInUse = regressions
+      .map((r) => r.correction)
+      .find((c) => c && c !== "none");
+    const pValueHeader = correctionInUse
+      ? `p-value (adjusted, ${correctionInUse})`
+      : `p-value`;
+
     lines.push(`### Sample Comparison vs Baseline`);
     lines.push("");
     lines.push(
-      `| Sample | Baseline | Current | Δ | p-value | Direction |`,
+      `| Sample | Baseline | Current | Δ | ${pValueHeader} | Direction |`,
     );
     lines.push(`|---|---|---|---|---|---|`);
     for (const r of regressions) {
@@ -165,9 +62,33 @@ function gateResultMarkdown(
       const dirLabel = r.significant
         ? r.direction
         : `${r.direction} (n.s.)`;
+      // F21: display the adjusted p-value when present so the rendered cell
+      // matches the significance label (which is decided on adjustedPValue).
+      // Fall back to raw pValue when adjustedPValue is missing.
+      // F13: route through formatPValue so non-finite values (NaN, ±Infinity)
+      // render as em-dash instead of leaking "NaN"/"Infinity" tokens.
+      const displayedP = r.adjustedPValue ?? r.pValue;
       lines.push(
-        `| ${r.sampleId} | ${pct(r.baselinePassRate)}% | ${pct(r.currentPassRate)}% | ${sign}${delta.toFixed(1)}pp | ${r.pValue.toFixed(4)} | ${dirLabel} |`,
+        `| ${escapeMarkdownCell(r.sampleId)} | ${pct(r.baselinePassRate)}% | ${pct(r.currentPassRate)}% | ${sign}${delta.toFixed(1)}pp | ${formatPValue(displayedP)} | ${escapeMarkdownCell(dirLabel)} |`,
       );
+    }
+    lines.push("");
+  }
+
+  // F1: render samples with no quality signal in their own section so they
+  // are not confused with regressions. These are infra outages on the current
+  // run side, not statistical regressions, so they have no baseline / current
+  // / delta / p-value cells — only the sample IDs matter for triage.
+  const noQualityIds = extras?.noQualityCurrentSamples ?? [];
+  if (noQualityIds.length > 0) {
+    lines.push(`### No Quality Signal`);
+    lines.push("");
+    lines.push(
+      `The following sample(s) ran in the current job but produced no quality signal (treated as infra outages, not regressions):`,
+    );
+    lines.push("");
+    for (const id of noQualityIds) {
+      lines.push(`- ${escapeMarkdownCell(id)}`);
     }
     lines.push("");
   }
@@ -198,7 +119,13 @@ export class PRCommentReporter implements AggregateReporter {
   }
 
   onMultiTrialComplete(result: MultiTrialResult): void {
-    this.writeOrAppend(multiTrialMarkdown(result));
+    this.writeOrAppend(
+      multiTrialMarkdown(result, {
+        title: "Eval Results",
+        includeTaskVersion: true,
+        includeModel: true,
+      }),
+    );
   }
 
   onMatrixComplete(result: MatrixResult): void {
@@ -208,10 +135,15 @@ export class PRCommentReporter implements AggregateReporter {
   writeGateResult(
     gate: CIGateResult,
     regressions?: RegressionResult[],
+    extras?: { noQualityCurrentSamples?: string[] },
   ): void {
     this.ensureDir();
-    const content = gateResultMarkdown(gate, regressions);
-    if (!existsSync(this.outputPath)) {
+    const content = gateResultMarkdown(gate, regressions, extras);
+    // F19: mirror writeOrAppend semantics — on a fresh reporter instance the
+    // existing file may be stale (left over from a prior run). Only append
+    // when this reporter has already written its own main section in this
+    // process; otherwise overwrite to avoid emitting prior-run content.
+    if (!existsSync(this.outputPath) || !this.wroteMainSection) {
       writeFileSync(this.outputPath, content, "utf8");
     } else {
       appendFileSync(this.outputPath, `\n${content}`, "utf8");

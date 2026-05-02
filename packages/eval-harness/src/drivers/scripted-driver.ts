@@ -7,7 +7,7 @@ import type {
   ObservedResult,
 } from "../types.js";
 
-export interface ScriptedStep {
+export interface DurabilityFixtureStep {
   type: "respond" | "crash" | "recover";
   /** For "respond": the ObservedResult to return if this is the last step. */
   response?: ObservedResult;
@@ -20,21 +20,29 @@ export interface ScriptedStep {
   durability?: Partial<DurabilityObservation>;
 }
 
-export interface ScriptedScenario {
+export interface DurabilityFixtureScenario {
   sampleId: string;
-  steps: ScriptedStep[];
+  steps: DurabilityFixtureStep[];
 }
 
+/** @deprecated Use DurabilityFixtureStep. */
+export type ScriptedStep = DurabilityFixtureStep;
+/** @deprecated Use DurabilityFixtureScenario. */
+export type ScriptedScenario = DurabilityFixtureScenario;
+
 /**
- * Driver that replays a scripted sequence of steps (respond / crash / recover)
- * into a single composed ObservedResult. Used to exercise durability graders
- * without running a real worker.
+ * Fixture-based illustrative durability driver.
+ *
+ * This driver does not crash a real worker, replay orchestration history, or
+ * verify hydration/handoff. Durability observations are derived from the
+ * fixture script supplied by the test author, then passed to durability graders.
+ * Use it for grader examples only, not as proof of production crash recovery.
  */
-export class ScriptedDriver implements Driver {
-  private scenarios: Map<string, ScriptedScenario>;
+export class DurabilityFixtureDriver implements Driver {
+  private scenarios: Map<string, DurabilityFixtureScenario>;
   private crashOnly: Map<string, { faultPoint: DurabilityFaultPoint; faultMode: DurabilityFaultMode }>;
 
-  constructor(scenarios: ScriptedScenario[]) {
+  constructor(scenarios: DurabilityFixtureScenario[]) {
     this.scenarios = new Map();
     this.crashOnly = new Map();
     for (const s of scenarios) {
@@ -45,26 +53,26 @@ export class ScriptedDriver implements Driver {
   async run(sample: EvalSample, options?: DriverOptions): Promise<ObservedResult> {
     const scenario = this.scenarios.get(sample.id);
     if (!scenario) {
-      throw new Error(`ScriptedDriver: unknown sampleId "${sample.id}"`);
+      throw new Error(`DurabilityFixtureDriver: unknown sampleId "${sample.id}"`);
     }
     await new Promise((resolve) => setTimeout(resolve, 1));
     if (options?.signal?.aborted) {
-      throw new Error(`ScriptedDriver: aborted while serving sample "${sample.id}"`);
+      throw new Error(`DurabilityFixtureDriver: aborted while serving sample "${sample.id}"`);
     }
 
     const composed = this.buildResult(scenario);
     if (composed === null) {
       throw new Error(
-        `ScriptedDriver: scenario "${sample.id}" crashed without recovery (infra error)`,
+        `DurabilityFixtureDriver: scenario "${sample.id}" crashed without recovery (infra error)`,
       );
     }
     return structuredClone(composed);
   }
 
-  private buildResult(scenario: ScriptedScenario): ObservedResult | null {
+  private buildResult(scenario: DurabilityFixtureScenario): ObservedResult | null {
     const steps = scenario.steps;
     if (steps.length === 0) {
-      throw new Error(`ScriptedDriver: scenario "${scenario.sampleId}" has no steps`);
+      throw new Error(`DurabilityFixtureDriver: scenario "${scenario.sampleId}" has no steps`);
     }
 
     // Locate the last crash step (if any) and the last respond/recover steps.
@@ -91,7 +99,7 @@ export class ScriptedDriver implements Driver {
     const finalIdx = Math.max(lastRecoverIdx, lastRespondIdx);
     if (finalIdx === -1) {
       throw new Error(
-        `ScriptedDriver: scenario "${scenario.sampleId}" has no respond/recover step`,
+        `DurabilityFixtureDriver: scenario "${scenario.sampleId}" has no respond/recover step`,
       );
     }
     const finalStep = steps[finalIdx];
@@ -99,7 +107,7 @@ export class ScriptedDriver implements Driver {
       finalStep.type === "recover" ? finalStep.recoveryResponse : finalStep.response;
     if (!base) {
       throw new Error(
-        `ScriptedDriver: scenario "${scenario.sampleId}" step ${finalIdx} missing payload`,
+        `DurabilityFixtureDriver: scenario "${scenario.sampleId}" step ${finalIdx} missing payload`,
       );
     }
     const result: ObservedResult = structuredClone(base);
@@ -151,7 +159,10 @@ export class ScriptedDriver implements Driver {
     return result;
   }
 
-  static fromScenarios(scenarios: ScriptedScenario[]): ScriptedDriver {
-    return new ScriptedDriver(scenarios);
+  static fromScenarios(scenarios: DurabilityFixtureScenario[]): DurabilityFixtureDriver {
+    return new DurabilityFixtureDriver(scenarios);
   }
 }
+
+/** @deprecated Use DurabilityFixtureDriver. */
+export const ScriptedDriver = DurabilityFixtureDriver;

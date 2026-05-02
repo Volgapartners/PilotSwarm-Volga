@@ -1,136 +1,42 @@
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
-import type {
-  MultiTrialResult,
-  MatrixResult,
-  MatrixCell,
-  SampleTrialResult,
-} from "../types.js";
+import { fileURLToPath } from "node:url";
+import type { MultiTrialResult, MatrixResult } from "../types.js";
 import type { AggregateReporter } from "./aggregate-types.js";
+import { escapeMarkdownCell, matrixMarkdown, multiTrialMarkdown } from "./util.js";
 
-function pct(rate: number): string {
-  if (!Number.isFinite(rate)) return "—";
-  return (rate * 100).toFixed(1);
-}
-
-function collectKs(samples: SampleTrialResult[]): number[] {
-  const set = new Set<number>();
-  for (const s of samples) {
-    for (const k of Object.keys(s.passAtK)) set.add(Number(k));
+// F27: read the harness version once at module load so every report carries
+// reliable provenance even when run from a built dist tree.
+function readHarnessVersion(): string {
+  try {
+    const url = new URL("../../package.json", import.meta.url);
+    const raw = readFileSync(fileURLToPath(url), "utf8");
+    const pkg = JSON.parse(raw) as { version?: string };
+    return pkg.version ?? "unknown";
+  } catch {
+    return "unknown";
   }
-  return [...set].filter((k) => Number.isFinite(k)).sort((a, b) => a - b);
 }
 
-function formatPassAtKCell(s: SampleTrialResult, k: number): string {
-  if (k > s.trials) return "—";
-  const v = s.passAtK[k];
-  if (v === undefined) return "—";
-  return v.toFixed(2);
-}
+const HARNESS_VERSION = readHarnessVersion();
 
-function multiTrialMarkdown(result: MultiTrialResult): string {
+function provenanceMarkdown(result: MultiTrialResult | MatrixResult): string {
   const lines: string[] = [];
-  const { taskId, trials, summary, samples } = result;
-  lines.push(`## Multi-Trial: ${taskId}`);
+  lines.push("### Provenance");
   lines.push("");
-  lines.push(`**Trials:** ${trials}  `);
-  lines.push(
-    `**Mean Pass Rate:** ${pct(summary.meanPassRate)}% (CI: ${pct(summary.passRateCI.lower)}-${pct(summary.passRateCI.upper)}%)  `,
-  );
-  lines.push("");
-
-  const ks = collectKs(samples);
-  const header = ["Sample", "Pass Rate", ...ks.map((k) => `pass@${k}`)];
-  lines.push(`| ${header.join(" | ")} |`);
-  lines.push(`|${header.map(() => "---").join("|")}|`);
-
-  for (const s of samples) {
-    const rateCell = `${pct(s.passRate)}% (${s.passCount}/${s.trials})`;
-    const kCells = ks.map((k) => formatPassAtKCell(s, k));
-    lines.push(`| ${s.sampleId} | ${rateCell} | ${kCells.join(" | ")} |`);
+  lines.push(`- **Run ID:** ${escapeMarkdownCell(result.runId)}`);
+  if (result.gitSha) {
+    lines.push(`- **Git SHA:** ${escapeMarkdownCell(result.gitSha)}`);
   }
+  const model = (result as MultiTrialResult).model;
+  if (model) {
+    lines.push(`- **Model:** ${escapeMarkdownCell(model)}`);
+  }
+  lines.push(`- **Started:** ${escapeMarkdownCell(result.startedAt)}`);
+  lines.push(`- **Finished:** ${escapeMarkdownCell(result.finishedAt)}`);
+  lines.push(`- **Harness Version:** ${escapeMarkdownCell(HARNESS_VERSION)}`);
   lines.push("");
   return lines.join("\n");
-}
-
-function matrixMarkdown(result: MatrixResult): string {
-  const lines: string[] = [];
-  const { taskId, taskVersion, gitSha, models, configs, cells, summary } = result;
-  const trials = cells[0]?.result.trials ?? 0;
-
-  lines.push(`## Eval Matrix: ${taskId}`);
-  lines.push("");
-  lines.push(`**Task:** ${taskId} v${taskVersion}  `);
-  lines.push(`**Trials per cell:** ${trials}  `);
-  if (gitSha) lines.push(`**Git SHA:** ${gitSha}  `);
-  lines.push("");
-
-  lines.push(`### Pass Rates`);
-  lines.push("");
-  const header = ["Model", ...configs.map((c) => c.label)];
-  lines.push(`| ${header.join(" | ")} |`);
-  lines.push(`|${header.map(() => "---").join("|")}|`);
-  for (const m of models) {
-    const row: string[] = [m];
-    for (const cfg of configs) {
-      const cell = cells.find((c) => c.model === m && c.configId === cfg.id);
-      if (!cell) {
-        row.push("—");
-        continue;
-      }
-      const r = cell.result.summary.meanPassRate;
-      const ci = cell.result.summary.passRateCI;
-      row.push(`${pct(r)}% (CI: ${pct(ci.lower)}-${pct(ci.upper)}%)`);
-    }
-    lines.push(`| ${row.join(" | ")} |`);
-  }
-  lines.push("");
-
-  lines.push(`### Best / Worst`);
-  lines.push("");
-  const best = findCell(cells, summary.bestPassRate.model, summary.bestPassRate.configId);
-  const worst = findCell(cells, summary.worstPassRate.model, summary.worstPassRate.configId);
-  if (best) {
-    lines.push(
-      `- **Best:** ${best.model} × ${best.configLabel} — ${pct(summary.bestPassRate.passRate)}%`,
-    );
-  }
-  if (worst) {
-    lines.push(
-      `- **Worst:** ${worst.model} × ${worst.configLabel} — ${pct(summary.worstPassRate.passRate)}%`,
-    );
-  }
-  lines.push("");
-
-  lines.push(`### Per-Sample Breakdown`);
-  lines.push("");
-  for (const cell of cells) {
-    const cellRate = pct(cell.result.summary.meanPassRate);
-    lines.push("<details>");
-    lines.push(`<summary>${cell.model} × ${cell.configLabel} (${cellRate}%)</summary>`);
-    lines.push("");
-    const ks = collectKs(cell.result.samples);
-    const subHeader = ["Sample", "Pass Rate", ...ks.map((k) => `pass@${k}`)];
-    lines.push(`| ${subHeader.join(" | ")} |`);
-    lines.push(`|${subHeader.map(() => "---").join("|")}|`);
-    if (cell.result.samples.length === 0) {
-      lines.push(`| — | — |`);
-    }
-    for (const s of cell.result.samples) {
-      const rateCell = `${pct(s.passRate)}% (${s.passCount}/${s.trials})`;
-      const kCells = ks.map((k) => formatPassAtKCell(s, k));
-      lines.push(`| ${s.sampleId} | ${rateCell} | ${kCells.join(" | ")} |`);
-    }
-    lines.push("");
-    lines.push("</details>");
-    lines.push("");
-  }
-
-  return lines.join("\n");
-}
-
-function findCell(cells: MatrixCell[], model: string, configId: string): MatrixCell | undefined {
-  return cells.find((c) => c.model === model && c.configId === configId);
 }
 
 export class MarkdownReporter implements AggregateReporter {
@@ -138,11 +44,13 @@ export class MarkdownReporter implements AggregateReporter {
 
   onMultiTrialComplete(result: MultiTrialResult): void {
     mkdirSync(dirname(this.outputPath), { recursive: true });
-    writeFileSync(this.outputPath, multiTrialMarkdown(result), "utf8");
+    const body = `${multiTrialMarkdown(result)}\n${provenanceMarkdown(result)}`;
+    writeFileSync(this.outputPath, body, "utf8");
   }
 
   onMatrixComplete(result: MatrixResult): void {
     mkdirSync(dirname(this.outputPath), { recursive: true });
-    writeFileSync(this.outputPath, matrixMarkdown(result), "utf8");
+    const body = `${matrixMarkdown(result, { includePerSampleBreakdown: true })}\n${provenanceMarkdown(result)}`;
+    writeFileSync(this.outputPath, body, "utf8");
   }
 }

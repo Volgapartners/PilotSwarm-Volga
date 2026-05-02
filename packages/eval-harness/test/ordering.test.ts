@@ -6,80 +6,39 @@ function obs(name: string, order: number): ObservedToolCall {
   return { name, args: {}, order };
 }
 
-describe("gradeOrdering: strict", () => {
-  it("correct order passes", () => {
-    const observed = [obs("a", 0), obs("b", 1), obs("c", 2)];
-    const expected: EvalToolCall[] = [
-      { name: "a", match: "subset" },
-      { name: "b", match: "subset" },
-      { name: "c", match: "subset" },
-    ];
-    const s = gradeOrdering(observed, expected, "strict");
-    expect(s.pass).toBe(true);
-    expect(s.value).toBe(1);
-  });
+const abcExpected: EvalToolCall[] = [
+  { name: "a", match: "subset" },
+  { name: "b", match: "subset" },
+  { name: "c", match: "subset" },
+];
 
-  it("wrong order fails", () => {
-    const observed = [obs("c", 0), obs("b", 1), obs("a", 2)];
-    const expected: EvalToolCall[] = [
-      { name: "a", match: "subset" },
-      { name: "b", match: "subset" },
-      { name: "c", match: "subset" },
-    ];
-    const s = gradeOrdering(observed, expected, "strict");
-    expect(s.pass).toBe(false);
-  });
-
-  it("subsequence match (extra calls between) passes", () => {
+describe("gradeOrdering", () => {
+  it("strict: subsequence with extras passes; missing call fails", () => {
     const observed = [obs("a", 0), obs("x", 1), obs("b", 2), obs("y", 3), obs("c", 4)];
-    const expected: EvalToolCall[] = [
-      { name: "a", match: "subset" },
-      { name: "b", match: "subset" },
-      { name: "c", match: "subset" },
-    ];
-    const s = gradeOrdering(observed, expected, "strict");
-    expect(s.pass).toBe(true);
+    expect(gradeOrdering(observed, abcExpected, "strict").pass).toBe(true);
+    expect(gradeOrdering([obs("a", 0), obs("c", 1)], abcExpected, "strict").pass).toBe(false);
   });
 
-  it("missing expected call fails", () => {
-    const observed = [obs("a", 0), obs("c", 1)];
-    const expected: EvalToolCall[] = [
-      { name: "a", match: "subset" },
-      { name: "b", match: "subset" },
-      { name: "c", match: "subset" },
-    ];
-    const s = gradeOrdering(observed, expected, "strict");
-    expect(s.pass).toBe(false);
-  });
-});
-
-describe("gradeOrdering: unordered", () => {
-  it("all present any order passes", () => {
-    const observed = [obs("c", 0), obs("a", 1), obs("b", 2)];
-    const expected: EvalToolCall[] = [
-      { name: "a", match: "subset" },
-      { name: "b", match: "subset" },
-      { name: "c", match: "subset" },
-    ];
-    const s = gradeOrdering(observed, expected, "unordered");
-    expect(s.pass).toBe(true);
-    expect(s.value).toBe(1);
+  it("strict: wrong order fails", () => {
+    expect(gradeOrdering([obs("c", 0), obs("b", 1), obs("a", 2)], abcExpected, "strict").pass).toBe(false);
   });
 
-  it("missing call fails", () => {
-    const observed = [obs("a", 0), obs("c", 1)];
-    const expected: EvalToolCall[] = [
+  it("exactSequence rejects interleaved calls; subsequence accepts them", () => {
+    const observed = [obs("a", 0), obs("delete_db", 1), obs("b", 2)];
+    const exp: EvalToolCall[] = [
       { name: "a", match: "subset" },
       { name: "b", match: "subset" },
-      { name: "c", match: "subset" },
     ];
-    const s = gradeOrdering(observed, expected, "unordered");
-    expect(s.pass).toBe(false);
+    expect(gradeOrdering(observed, exp, "exactSequence").pass).toBe(false);
+    expect(gradeOrdering(observed, exp, "subsequence").pass).toBe(true);
   });
-});
 
-describe("gradeOrdering: edge cases", () => {
-  it("empty expected → passes trivially", () => {
+  it("unordered: all present any order passes; missing fails", () => {
+    expect(gradeOrdering([obs("c", 0), obs("a", 1), obs("b", 2)], abcExpected, "unordered").pass).toBe(true);
+    expect(gradeOrdering([obs("a", 0), obs("c", 1)], abcExpected, "unordered").pass).toBe(false);
+  });
+
+  it("empty expected passes trivially with value=1", () => {
     const s = gradeOrdering([obs("a", 0)], [], "strict");
     expect(s.pass).toBe(true);
     expect(s.value).toBe(1);
@@ -91,31 +50,19 @@ describe("gradeOrdering: edge cases", () => {
       { name: "b", match: "subset", order: 0 },
       { name: "a", match: "subset", order: 1 },
     ];
-    const s = gradeOrdering(observed, expected, "strict");
-    expect(s.pass).toBe(false);
+    expect(gradeOrdering(observed, expected, "strict").pass).toBe(false);
   });
-});
 
-describe("gradeOrdering: multiset semantics", () => {
-  it("unordered: fails when expected has 2 calls to same tool but observed has only 1", () => {
-    const observed = [obs("test_weather", 0)];
+  it("unordered enforces multiset semantics: 2 expected vs 1 observed of same tool fails with partial value", () => {
     const expected: EvalToolCall[] = [
       { name: "test_weather", match: "subset" },
       { name: "test_weather", match: "subset" },
     ];
-    const s = gradeOrdering(observed, expected, "unordered");
-    expect(s.pass).toBe(false);
-    expect(s.value).toBeCloseTo(0.5, 5);
-  });
-
-  it("unordered: passes when expected has 2 calls to same tool and observed has 2", () => {
-    const observed = [obs("test_weather", 0), obs("test_weather", 1)];
-    const expected: EvalToolCall[] = [
-      { name: "test_weather", match: "subset" },
-      { name: "test_weather", match: "subset" },
-    ];
-    const s = gradeOrdering(observed, expected, "unordered");
-    expect(s.pass).toBe(true);
-    expect(s.value).toBe(1);
+    const partial = gradeOrdering([obs("test_weather", 0)], expected, "unordered");
+    expect(partial.pass).toBe(false);
+    expect(partial.value).toBeCloseTo(0.5, 5);
+    const full = gradeOrdering([obs("test_weather", 0), obs("test_weather", 1)], expected, "unordered");
+    expect(full.pass).toBe(true);
+    expect(full.value).toBe(1);
   });
 });

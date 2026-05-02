@@ -6,6 +6,19 @@ export interface MatchResult {
   diff: string[];
 }
 
+export interface MatchOptions {
+  /**
+   * Legacy subset semantics: trim, collapse whitespace, and lowercase strings
+   * before comparing. Default subset mode is exact for string values because
+   * paths, URLs, IDs, regexes, and branch names are often case-sensitive.
+   */
+  subsetCaseInsensitive?: boolean;
+  /** Absolute numeric tolerance for fuzzy numeric comparison. Defaults to 0. */
+  numericTolerance?: number;
+  /** Max Levenshtein distance divided by expected length in fuzzy mode. Defaults to 0.2. */
+  fuzzyStringMaxRelativeDistance?: number;
+}
+
 export function sortKeys(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map(sortKeys);
@@ -71,9 +84,55 @@ function deepEqual(a: unknown, b: unknown): boolean {
   return false;
 }
 
-function subsetValueMatch(actual: unknown, expected: unknown): boolean {
+/**
+ * F20: Strict structural equality for exact-mode argument matching.
+ *
+ * Differs from {@link deepEqual} in three ways that matter for argument
+ * comparisons:
+ *   - Treats own-key presence as significant: `{a: undefined}` !== `{}`.
+ *   - Uses `Object.is` semantics on leaves so that `NaN === NaN` is true,
+ *     `+0 !== -0`, and `Infinity !== -Infinity`.
+ *   - Recurses through arrays and plain objects index-by-index / key-by-key
+ *     including keys whose value is `undefined`.
+ *
+ * Non-exact modes (subset / fuzzy / setEquals) are intentionally left on the
+ * looser `deepEqual` semantics.
+ */
+function deepEqualStrict(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b)) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!deepEqualStrict(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  if (
+    a !== null &&
+    b !== null &&
+    typeof a === "object" &&
+    typeof b === "object"
+  ) {
+    const ao = a as Record<string, unknown>;
+    const bo = b as Record<string, unknown>;
+    const ak = Object.keys(ao);
+    const bk = Object.keys(bo);
+    if (ak.length !== bk.length) return false;
+    // Both directions of key presence must match.
+    for (const k of ak) {
+      if (!Object.prototype.hasOwnProperty.call(bo, k)) return false;
+      if (!deepEqualStrict(ao[k], bo[k])) return false;
+    }
+    return true;
+  }
+  return Object.is(a, b);
+}
+
+function subsetValueMatch(actual: unknown, expected: unknown, options: MatchOptions): boolean {
   if (typeof expected === "string" && typeof actual === "string") {
-    return actual.trim().toLowerCase() === expected.trim().toLowerCase();
+    return options.subsetCaseInsensitive
+      ? normalizeString(actual) === normalizeString(expected)
+      : actual === expected;
   }
   if (expected !== null && typeof expected === "object" && !Array.isArray(expected)) {
     if (actual === null || typeof actual !== "object" || Array.isArray(actual)) return false;
@@ -81,14 +140,14 @@ function subsetValueMatch(actual: unknown, expected: unknown): boolean {
     const act = actual as Record<string, unknown>;
     for (const k of Object.keys(exp)) {
       if (!(k in act)) return false;
-      if (!subsetValueMatch(act[k], exp[k])) return false;
+      if (!subsetValueMatch(act[k], exp[k], options)) return false;
     }
     return true;
   }
   return deepEqual(actual, expected);
 }
 
-function fuzzyValueMatch(actual: unknown, expected: unknown): boolean {
+function fuzzyValueMatch(actual: unknown, expected: unknown, options: MatchOptions): boolean {
   if (typeof expected === "string") {
     const a = typeof actual === "string" ? actual : typeof actual === "number" ? String(actual) : null;
     if (a === null) return false;
@@ -96,7 +155,8 @@ function fuzzyValueMatch(actual: unknown, expected: unknown): boolean {
     const ne = normalizeString(expected);
     if (na === ne) return true;
     const dist = levenshtein(na, ne);
-    const tolerance = Math.max(1, Math.ceil(ne.length * 0.2));
+    const ratio = options.fuzzyStringMaxRelativeDistance ?? 0.2;
+    const tolerance = Math.ceil(ne.length * ratio);
     return dist <= tolerance;
   }
   if (typeof expected === "number") {
@@ -107,7 +167,7 @@ function fuzzyValueMatch(actual: unknown, expected: unknown): boolean {
           ? Number(actual)
           : null;
     if (a === null) return false;
-    return Math.abs(a - expected) <= 0.01;
+    return Math.abs(a - expected) <= (options.numericTolerance ?? 0);
   }
   if (Array.isArray(expected)) {
     if (!Array.isArray(actual)) return false;
@@ -117,7 +177,7 @@ function fuzzyValueMatch(actual: unknown, expected: unknown): boolean {
       let found = -1;
       for (let i = 0; i < actual.length; i++) {
         if (used.has(i)) continue;
-        if (fuzzyValueMatch(actual[i], ev)) {
+        if (fuzzyValueMatch(actual[i], ev, options)) {
           found = i;
           break;
         }
@@ -133,7 +193,7 @@ function fuzzyValueMatch(actual: unknown, expected: unknown): boolean {
     const act = actual as Record<string, unknown>;
     for (const k of Object.keys(exp)) {
       if (!(k in act)) return false;
-      if (!fuzzyValueMatch(act[k], exp[k])) return false;
+      if (!fuzzyValueMatch(act[k], exp[k], options)) return false;
     }
     return true;
   }
@@ -144,13 +204,17 @@ export function matchArgs(
   actual: Record<string, unknown> | undefined,
   expected: Record<string, unknown> | undefined,
   mode: MatchMode = "subset",
+  options: MatchOptions = {},
 ): MatchResult {
   const a = actual ?? {};
   const e = expected ?? {};
   const diff: string[] = [];
+  if (!["exact", "subset", "fuzzy", "setEquals"].includes(mode)) {
+    throw new Error(`unknown match mode: ${String(mode)}`);
+  }
 
   if (mode === "exact") {
-    const ok = JSON.stringify(sortKeys(a)) === JSON.stringify(sortKeys(e));
+    const ok = deepEqualStrict(a, e);
     if (!ok) diff.push(`exact mismatch: expected=${JSON.stringify(sortKeys(e))} actual=${JSON.stringify(sortKeys(a))}`);
     return { pass: ok, score: ok ? 1 : 0, diff };
   }
@@ -182,7 +246,7 @@ export function matchArgs(
       diff.push(`missing key "${k}"`);
       continue;
     }
-    const ok = mode === "fuzzy" ? fuzzyValueMatch(a[k], e[k]) : subsetValueMatch(a[k], e[k]);
+    const ok = mode === "fuzzy" ? fuzzyValueMatch(a[k], e[k], options) : subsetValueMatch(a[k], e[k], options);
     if (ok) {
       matched++;
     } else {

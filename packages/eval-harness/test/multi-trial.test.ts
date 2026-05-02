@@ -2,7 +2,14 @@ import { describe, it, expect } from "vitest";
 import { MultiTrialRunner } from "../src/multi-trial.js";
 import { FakeDriver } from "../src/drivers/fake-driver.js";
 import type { Driver, DriverOptions } from "../src/drivers/types.js";
-import type { EvalSample, EvalTask, ObservedResult } from "../src/types.js";
+import {
+  SampleTrialResultSchema,
+  type EvalSample,
+  type EvalTask,
+  type ObservedResult,
+  type RunResult,
+  type SampleTrialResult,
+} from "../src/types.js";
 import type { Reporter } from "../src/reporters/types.js";
 
 function makeTask(sampleIds: string[]): EvalTask {
@@ -147,7 +154,11 @@ describe("MultiTrialRunner", () => {
     const s1 = result.samples[0]!;
     expect(s1.errorCount).toBe(4);
     expect(s1.passCount).toBe(0);
-    expect(s1.passRate).toBe(0);
+    expect(s1.passRate).toBeUndefined();
+    expect((s1 as { noQualitySignal?: boolean }).noQualitySignal).toBe(true);
+    expect(result.summary.meanPassRate).toBeUndefined();
+    expect((result.summary as { noQualitySignal?: boolean }).noQualitySignal).toBe(true);
+    expect((result.summary as { infraErrorRate?: number }).infraErrorRate).toBe(1);
   });
 
   it("preserves rawRuns", async () => {
@@ -296,5 +307,131 @@ describe("MultiTrialRunner", () => {
     expect(result.rawRuns.length).toBe(6);
     expect(maxActive).toBeGreaterThan(1);
     expect(maxActive).toBeLessThanOrEqual(3);
+  });
+});
+
+// F14: aggregateSample silently dropped trials whose RunResult had no case for
+// the sample, producing passCount + failCount + errorCount < trials and failing
+// SampleTrialResultSchema on round-trip. Treat missing case as an infra error.
+describe("MultiTrialRunner.aggregateSample — F14 missing per-sample case", () => {
+  function makeCaseResult(caseId: string, pass: boolean) {
+    return {
+      caseId,
+      pass,
+      scores: [],
+      observed: {
+        toolCalls: [],
+        finalResponse: pass ? "ok" : "no",
+        sessionId: "sess",
+        latencyMs: 10,
+      },
+      durationMs: 10,
+    };
+  }
+
+  function makeRunResult(cases: ReturnType<typeof makeCaseResult>[]): RunResult {
+    return {
+      schemaVersion: 1,
+      runId: `r-${Math.random().toString(36).slice(2)}`,
+      taskId: "test-task",
+      taskVersion: "1.0",
+      startedAt: "2025-01-01T00:00:00Z",
+      finishedAt: "2025-01-01T00:00:01Z",
+      summary: {
+        total: cases.length,
+        passed: cases.filter((c) => c.pass).length,
+        failed: cases.filter((c) => !c.pass).length,
+        errored: 0,
+      },
+      cases,
+    } as RunResult;
+  }
+
+  function aggregate(runner: MultiTrialRunner, sampleId: string, rawRuns: RunResult[]): SampleTrialResult {
+    return (
+      runner as unknown as {
+        aggregateSample(id: string, runs: RunResult[]): SampleTrialResult;
+      }
+    ).aggregateSample(sampleId, rawRuns);
+  }
+
+  it("counts a trial with no case for the sample as an infra error", () => {
+    const runner = new MultiTrialRunner({
+      driverFactory: () => new FakeDriver([]),
+      trials: 3,
+    });
+    const rawRuns: RunResult[] = [
+      makeRunResult([makeCaseResult("s1", true)]),
+      makeRunResult([]), // missing s1 — partial run / driver bug
+      makeRunResult([makeCaseResult("s1", true)]),
+    ];
+
+    const sample = aggregate(runner, "s1", rawRuns);
+
+    expect(sample.trials).toBe(3);
+    expect(sample.passCount).toBe(2);
+    expect(sample.failCount).toBe(0);
+    expect(sample.errorCount).toBe(1);
+    expect(sample.passCount + sample.failCount + sample.errorCount).toBe(sample.trials);
+    expect(sample.passRate).toBeCloseTo(1, 10);
+
+    // Round-trip through the schema (would reject if the arithmetic invariant
+    // were violated by silent drops).
+    expect(() => SampleTrialResultSchema.parse(sample)).not.toThrow();
+  });
+
+  it("counts every trial as an infra error when no trial has a case for the sample", () => {
+    const runner = new MultiTrialRunner({
+      driverFactory: () => new FakeDriver([]),
+      trials: 4,
+    });
+    const rawRuns: RunResult[] = [
+      makeRunResult([makeCaseResult("other", true)]),
+      makeRunResult([]),
+      makeRunResult([makeCaseResult("other", false)]),
+      makeRunResult([]),
+    ];
+
+    const sample = aggregate(runner, "missing", rawRuns);
+
+    expect(sample.trials).toBe(4);
+    expect(sample.passCount).toBe(0);
+    expect(sample.failCount).toBe(0);
+    expect(sample.errorCount).toBe(4);
+    expect(sample.passRate).toBeUndefined();
+    expect((sample as { noQualitySignal?: boolean }).noQualitySignal).toBe(true);
+
+    expect(() => SampleTrialResultSchema.parse(sample)).not.toThrow();
+  });
+
+  it("mixes missing cases, infra errors, and real pass/fail correctly", () => {
+    const runner = new MultiTrialRunner({
+      driverFactory: () => new FakeDriver([]),
+      trials: 5,
+    });
+    const failingCase = makeCaseResult("s1", false);
+    const infraErrorCase = {
+      ...makeCaseResult("s1", false),
+      infraError: "boom",
+    };
+    const rawRuns: RunResult[] = [
+      makeRunResult([makeCaseResult("s1", true)]),
+      makeRunResult([failingCase]),
+      makeRunResult([infraErrorCase]),
+      makeRunResult([]), // missing — count as infra error
+      makeRunResult([makeCaseResult("s1", true)]),
+    ];
+
+    const sample = aggregate(runner, "s1", rawRuns);
+
+    expect(sample.trials).toBe(5);
+    expect(sample.passCount).toBe(2);
+    expect(sample.failCount).toBe(1);
+    expect(sample.errorCount).toBe(2); // 1 explicit infraError + 1 missing
+    expect(sample.passCount + sample.failCount + sample.errorCount).toBe(sample.trials);
+    // passRate = passCount / (trials - errorCount) = 2 / 3
+    expect(sample.passRate).toBeCloseTo(2 / 3, 10);
+
+    expect(() => SampleTrialResultSchema.parse(sample)).not.toThrow();
   });
 });

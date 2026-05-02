@@ -173,4 +173,130 @@ describe("LiveDriver: lifecycle / cleanup", () => {
     expect(workerConfigs[0].workerNodeId).not.toBe(workerConfigs[1].workerNodeId);
     expect(String(workerConfigs[0].workerNodeId)).toMatch(/^eval-/);
   });
+
+  // F20: even when worker.start() throws, the worker object has been
+  // constructed and may have allocated resources. Cleanup must call
+  // worker.stop() exactly once to avoid leaks.
+  it("F20: calls worker.stop() exactly once when worker.start() throws after construction", async () => {
+    const env = fakeEnv();
+    const workerStop = vi.fn().mockResolvedValue(undefined);
+    class FailingWorker {
+      registerTools() {}
+      setSessionConfig() {}
+      async start() {
+        throw new Error("worker boom after partial alloc");
+      }
+      stop = workerStop;
+    }
+    class NoopClient {
+      async start() {}
+      async stop() {}
+      async createSession() {
+        return { sessionId: "x", sendAndWait: async () => "", getInfo: async () => null };
+      }
+    }
+    const driver = new LiveDriver(undefined, {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createEnv: () => env as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      WorkerCtor: FailingWorker as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ClientCtor: NoopClient as any,
+    });
+    await expect(driver.run(makeSample())).rejects.toThrow(/worker boom/);
+    expect(workerStop).toHaveBeenCalledTimes(1);
+    expect(env.cleanup).toHaveBeenCalled();
+  });
+
+  it("F20: swallows errors from worker.stop() during cleanup so original start error surfaces", async () => {
+    const env = fakeEnv();
+    const workerStop = vi.fn().mockRejectedValue(new Error("stop also boom"));
+    class FailingWorker {
+      registerTools() {}
+      setSessionConfig() {}
+      async start() {
+        throw new Error("primary start boom");
+      }
+      stop = workerStop;
+    }
+    class NoopClient {
+      async start() {}
+      async stop() {}
+      async createSession() {
+        return { sessionId: "x", sendAndWait: async () => "", getInfo: async () => null };
+      }
+    }
+    const driver = new LiveDriver(undefined, {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createEnv: () => env as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      WorkerCtor: FailingWorker as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ClientCtor: NoopClient as any,
+    });
+    await expect(driver.run(makeSample())).rejects.toThrow(/primary start boom/);
+    expect(workerStop).toHaveBeenCalledTimes(1);
+    expect(env.cleanup).toHaveBeenCalled();
+  });
+
+  it("F20: calls client.stop() exactly once when client.start() throws after construction", async () => {
+    const env = fakeEnv();
+    const workerStop = vi.fn().mockResolvedValue(undefined);
+    const clientStop = vi.fn().mockResolvedValue(undefined);
+    class OkWorker {
+      registerTools() {}
+      setSessionConfig() {}
+      async start() {}
+      stop = workerStop;
+    }
+    class FailingClient {
+      async start() {
+        throw new Error("client boom after partial alloc");
+      }
+      stop = clientStop;
+      async createSession() {
+        return { sessionId: "x", sendAndWait: async () => "", getInfo: async () => null };
+      }
+    }
+    const driver = new LiveDriver(undefined, {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createEnv: () => env as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      WorkerCtor: OkWorker as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ClientCtor: FailingClient as any,
+    });
+    await expect(driver.run(makeSample())).rejects.toThrow(/client boom/);
+    expect(clientStop).toHaveBeenCalledTimes(1);
+    expect(workerStop).toHaveBeenCalledTimes(1);
+    expect(env.cleanup).toHaveBeenCalled();
+  });
+
+  it("F20: does NOT call worker.stop() when worker was never constructed (env factory throws)", async () => {
+    const workerStop = vi.fn().mockResolvedValue(undefined);
+    class CountingWorker {
+      registerTools() {}
+      setSessionConfig() {}
+      async start() {}
+      stop = workerStop;
+    }
+    class NoopClient {
+      async start() {}
+      async stop() {}
+      async createSession() {
+        return { sessionId: "x", sendAndWait: async () => "", getInfo: async () => null };
+      }
+    }
+    const driver = new LiveDriver(undefined, {
+      createEnv: () => {
+        throw new Error("env factory boom");
+      },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      WorkerCtor: CountingWorker as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ClientCtor: NoopClient as any,
+    });
+    await expect(driver.run(makeSample())).rejects.toThrow(/env factory boom/);
+    expect(workerStop).not.toHaveBeenCalled();
+  });
 });

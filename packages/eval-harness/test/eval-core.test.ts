@@ -79,6 +79,11 @@ describe("eval:tool-call-correctness", () => {
     expect(task.schemaVersion).toBe(1);
   });
 
+  it("does not use deprecated strict toolSequence in the canonical fixture", () => {
+    const modes = task.samples.map((s) => s.expected.toolSequence);
+    expect(modes).not.toContain("strict");
+  });
+
   it("all fake scenarios pass harness grading", async () => {
     const result = await runner.runTask(task);
     expect(result.summary.passed).toBe(6);

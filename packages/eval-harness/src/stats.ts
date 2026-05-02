@@ -110,10 +110,41 @@ export function wilsonInterval(
   total: number,
   z: number = 1.959964,
 ): { lower: number; upper: number; point: number; z: number } {
+  if (!Number.isFinite(z) || z <= 0) {
+    throw new Error(
+      `wilsonInterval: z must be a finite positive number, got ${z}`,
+    );
+  }
+  // H1 (iter19): bound z to a sane upper limit. Any reasonable confidence
+  // level corresponds to z ≤ ~10 (z=10 ≈ ~1 in 10^23 tail probability). Huge
+  // z values (e.g. 1e308) cause `z*z` to overflow to Infinity inside the
+  // wilson formula and produce NaN bounds, which then propagate into Wilson
+  // CIs throughout the harness. Reject early with a clear error.
+  if (z > 100) {
+    throw new Error(
+      `wilsonInterval: z must be <= 100 (got ${z}); huge z values overflow to NaN bounds`,
+    );
+  }
+  // iter18 F9: NaN/Infinity guards. `passes < 0` returns false for NaN, so
+  // without an explicit `Number.isFinite` check `wilsonInterval(NaN, 10)`
+  // would silently compute NaN bounds and propagate them into Wilson CIs
+  // throughout the harness. Reject non-finite numerator/denominator loudly.
+  if (!Number.isFinite(passes)) {
+    throw new Error(`wilsonInterval: passes must be a finite number, got ${passes}`);
+  }
+  if (!Number.isFinite(total)) {
+    throw new Error(`wilsonInterval: total must be a finite number, got ${total}`);
+  }
+  if (!Number.isInteger(passes)) {
+    throw new Error(`wilsonInterval: passes must be an integer, got ${passes}`);
+  }
+  if (!Number.isInteger(total)) {
+    throw new Error(`wilsonInterval: total must be an integer, got ${total}`);
+  }
   if (passes < 0) throw new Error("wilsonInterval: passes < 0");
   if (total < 0) throw new Error("wilsonInterval: total < 0");
   if (passes > total) throw new Error("wilsonInterval: passes > total");
-  if (total === 0) return { lower: 0, upper: 1, point: NaN, z };
+  if (total === 0) return { lower: 0, upper: 1, point: 0, z };
   const p = passes / total;
   const z2 = z * z;
   const denom = 1 + z2 / total;
@@ -122,6 +153,14 @@ export function wilsonInterval(
     (z * Math.sqrt((p * (1 - p)) / total + z2 / (4 * total * total))) / denom;
   const lower = passes === 0 ? 0 : Math.max(0, Math.min(1, center - margin));
   const upper = passes === total ? 1 : Math.max(0, Math.min(1, center + margin));
+  // H1 (iter19): defense in depth — even with the z bound above, post-validate
+  // that bounds are finite numbers in [0,1] before returning. Any non-finite
+  // value here indicates a numeric edge case the bound did not catch.
+  if (!Number.isFinite(lower) || !Number.isFinite(upper) || !Number.isFinite(p)) {
+    throw new Error(
+      `wilsonInterval: produced non-finite output (lower=${lower}, upper=${upper}, point=${p}) for inputs passes=${passes}, total=${total}, z=${z}`,
+    );
+  }
   return { lower, upper, point: p, z };
 }
 
@@ -161,7 +200,13 @@ export function bootstrapCI(
   for (let r = 0; r < reps; r++) {
     let s = 0;
     for (let i = 0; i < n; i++) {
-      const idx = Math.floor(rng() * n);
+      const u = rng();
+      if (!Number.isFinite(u) || u < 0 || u >= 1) {
+        throw new Error(
+          `bootstrapCI: rng must return a finite number in [0, 1), got ${u}`,
+        );
+      }
+      const idx = Math.floor(u * n);
       s += values[idx === n ? n - 1 : idx]!;
     }
     means[r] = s / n;
@@ -212,7 +257,7 @@ export function mcNemarTest(
     const p = Math.min(1, 2 * binomialCdf(m, n, 0.5));
     return { pValue: p, statistic: m, b, c, method: "exact" };
   }
-  const diff = Math.abs(b - c) - 1;
+  const diff = Math.max(0, Math.abs(b - c) - 1);
   const chi2 = (diff * diff) / n;
   const pValue = 1 - chiSquaredCdfDf1(chi2);
   return { pValue, statistic: chi2, b, c, method: "chi2-yates" };
@@ -301,43 +346,27 @@ export function mannWhitneyU(
   return { u, u1, u2, z, pValue: Math.min(1, Math.max(0, pValue)), n1, n2 };
 }
 
-// Exact Mann-Whitney U distribution via DP.
-// f(u, n1, n2) = f(u, n1-1, n2) + f(u-n2, n1, n2-1)
-// Computed iteratively: we build the frequency array over U1 values
-// by adding items one at a time. Using generating-function recurrence:
-// starting from all items in group B (U1=0), each time we move an item
-// from B to A, we convolve with (1 + x + x^2 + ... + x^{n2}) — but the
-// clean approach is direct DP on (n1, n2).
 function exactUFrequencies(n1: number, n2: number): number[] {
-  // dp[a][b][u] — but we can collapse. Use map from (a,b) -> freq[u].
-  // Simpler: 3D table indexed by a in [0..n1], b in [0..n2].
   const maxU = n1 * n2;
-  // table[a][b] is Float64Array of length maxU+1
-  const table: Float64Array[][] = [];
-  for (let a = 0; a <= n1; a++) {
-    table.push([]);
-    for (let b = 0; b <= n2; b++) {
-      table[a]!.push(new Float64Array(maxU + 1));
+  const out = new Array<number>(maxU + 1).fill(0);
+  const totalRanks = n1 + n2;
+  const rankSumOffset = (n1 * (n1 + 1)) / 2;
+
+  function chooseRanks(nextRank: number, chosen: number, rankSum: number): void {
+    if (chosen === n1) {
+      const u = rankSum - rankSumOffset;
+      out[u] = (out[u] ?? 0) + 1;
+      return;
+    }
+
+    const remainingToChoose = n1 - chosen;
+    const maxStart = totalRanks - remainingToChoose + 1;
+    for (let rank = nextRank; rank <= maxStart; rank++) {
+      chooseRanks(rank + 1, chosen + 1, rankSum + rank);
     }
   }
-  // Base: f(0, 0, b) = 1 for all b (no group-A items, no U contribution)
-  for (let b = 0; b <= n2; b++) table[0]![b]![0] = 1;
-  // Also f(0, a, 0) = 1 (no group-B items means U1=0 with a items in A)
-  for (let a = 0; a <= n1; a++) table[a]![0]![0] = 1;
-  for (let a = 1; a <= n1; a++) {
-    for (let b = 1; b <= n2; b++) {
-      const cur = table[a]![b]!;
-      const fromA = table[a - 1]![b]!; // f(u, a-1, b)
-      const fromB = table[a]![b - 1]!; // f(u-b, a, b-1) — shift by b
-      for (let u = 0; u <= maxU; u++) {
-        const va = fromA[u] ?? 0;
-        const vb = u - b >= 0 ? (fromB[u - b] ?? 0) : 0;
-        cur[u] = va + vb;
-      }
-    }
-  }
-  const out = new Array<number>(maxU + 1);
-  for (let u = 0; u <= maxU; u++) out[u] = table[n1]![n2]![u]!;
+
+  chooseRanks(1, 0, 0);
   return out;
 }
 

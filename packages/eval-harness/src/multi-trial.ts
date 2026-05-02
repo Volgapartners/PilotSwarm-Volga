@@ -5,7 +5,6 @@ import type { Reporter } from "./reporters/types.js";
 import type {
   EvalTask,
   RunResult,
-  CaseResult,
   MultiTrialResult,
   SampleTrialResult,
 } from "./types.js";
@@ -29,8 +28,6 @@ export interface MultiTrialRunnerOptions {
 
 const DEFAULT_PASS_AT_K = [1, 5, 10];
 
-let concurrencyReporterWarningLogged = false;
-
 export class MultiTrialRunner {
   private driverFactory: () => Driver;
   private reporters: Reporter[];
@@ -40,18 +37,46 @@ export class MultiTrialRunner {
   private passAtKValues: number[];
   private gitSha?: string;
   private model?: string;
+  private concurrencyReporterWarningLogged = false;
 
   constructor(options: MultiTrialRunnerOptions) {
+    if (typeof options !== "object" || options === null) {
+      throw new Error("MultiTrialRunner: options must be a non-null object");
+    }
+    if (typeof options.driverFactory !== "function") {
+      throw new Error("MultiTrialRunner: driverFactory must be a function");
+    }
     if (!Number.isInteger(options.trials) || options.trials < 1) {
       throw new Error(
         `MultiTrialRunner: trials must be an integer >= 1 (got ${options.trials})`,
       );
+    }
+    if (options.trials > Number.MAX_SAFE_INTEGER) {
+      throw new Error("MultiTrialRunner: trials exceeds MAX_SAFE_INTEGER");
     }
     const concurrency = options.concurrency ?? 1;
     if (!Number.isInteger(concurrency) || concurrency < 1) {
       throw new Error(
         `MultiTrialRunner: concurrency must be an integer >= 1 (got ${concurrency})`,
       );
+    }
+    if (options.passAtKValues !== undefined) {
+      if (!Array.isArray(options.passAtKValues)) {
+        throw new Error("MultiTrialRunner: passAtKValues must be an array");
+      }
+      for (const k of options.passAtKValues) {
+        if (!Number.isInteger(k) || k < 1) {
+          throw new Error(
+            `MultiTrialRunner: passAtKValues entries must be integers >= 1 (got ${k})`,
+          );
+        }
+      }
+    }
+    if (options.gitSha !== undefined && typeof options.gitSha !== "string") {
+      throw new Error("MultiTrialRunner: gitSha must be a string when provided");
+    }
+    if (options.model !== undefined && typeof options.model !== "string") {
+      throw new Error("MultiTrialRunner: model must be a string when provided");
     }
     this.driverFactory = options.driverFactory;
     this.reporters = options.reporters ?? [];
@@ -96,7 +121,9 @@ export class MultiTrialRunner {
     );
 
     // Task-level summary
-    const passRates = samples.map((s) => s.passRate);
+    const passRates = samples
+      .map((s) => s.passRate)
+      .filter((rate): rate is number => rate !== undefined);
     const meanStats =
       passRates.length > 0 ? meanStddev(passRates) : { mean: 0, stddev: 0, n: 0 };
     const totalPasses = samples.reduce((acc, s) => acc + s.passCount, 0);
@@ -104,12 +131,10 @@ export class MultiTrialRunner {
       (acc, s) => acc + (this.trials - s.errorCount),
       0,
     );
-    // Wilson interval on all-error runs degenerates to point=NaN; substitute
-    // an uninformative-but-valid interval so result passes schema validation.
-    const passRateCI =
-      totalNonError === 0
-        ? { lower: 0, upper: 1, point: 0, z: 1.959964 }
-        : wilsonInterval(totalPasses, totalNonError);
+    const pooledPassRateCI = wilsonInterval(totalPasses, totalNonError);
+    const totalInfraErrors = samples.reduce((acc, s) => acc + s.errorCount, 0);
+    const plannedTrials = samples.length * this.trials;
+    const meanPassRate = passRates.length > 0 ? meanStats.mean : undefined;
 
     const finishedAt = new Date().toISOString();
     const result: MultiTrialResult = {
@@ -125,9 +150,12 @@ export class MultiTrialRunner {
       summary: {
         total: samples.length,
         trials: this.trials,
-        meanPassRate: Number.isFinite(meanStats.mean) ? meanStats.mean : 0,
+        ...(meanPassRate === undefined ? {} : { meanPassRate }),
+        ...(meanPassRate === undefined ? { noQualitySignal: true } : {}),
+        infraErrorRate: plannedTrials > 0 ? totalInfraErrors / plannedTrials : 0,
         stddevPassRate: Number.isFinite(meanStats.stddev) ? meanStats.stddev : 0,
-        passRateCI,
+        passRateCI: pooledPassRateCI,
+        pooledPassRateCI,
       },
       samples,
       rawRuns,
@@ -149,8 +177,8 @@ export class MultiTrialRunner {
     } else if (this.reporterFactory) {
       trialReporters = this.reporterFactory();
     } else {
-      if (this.reporters.length > 0 && !concurrencyReporterWarningLogged) {
-        concurrencyReporterWarningLogged = true;
+      if (this.reporters.length > 0 && !this.concurrencyReporterWarningLogged) {
+        this.concurrencyReporterWarningLogged = true;
         console.warn(
           "MultiTrialRunner: reporters are shared across concurrent trials, which can corrupt stateful reporters (e.g. JsonlReporter). Provide `reporterFactory` to create per-trial reporter instances. Per-trial reporters dropped for concurrency > 1.",
         );
@@ -180,12 +208,6 @@ export class MultiTrialRunner {
     sampleId: string,
     rawRuns: RunResult[],
   ): SampleTrialResult {
-    const cases: CaseResult[] = [];
-    for (const run of rawRuns) {
-      const c = run.cases.find((x) => x.caseId === sampleId);
-      if (c) cases.push(c);
-    }
-
     const trials = this.trials;
     let passCount = 0;
     let failCount = 0;
@@ -193,8 +215,19 @@ export class MultiTrialRunner {
     // passResults includes only trials that actually ran (pass or fail).
     // Infra errors are excluded so passAtK uses the same denominator as passRate.
     const passResults: boolean[] = [];
+    // Score aggregation: group by name across non-infra-error cases that emitted the score.
+    const valuesByName = new Map<string, number[]>();
 
-    for (const c of cases) {
+    for (const run of rawRuns) {
+      const c = run.cases.find((x) => x.caseId === sampleId);
+      if (!c) {
+        // F14: a trial with no case result for this sample is treated as an
+        // infrastructure error (lost trial). Without this, passCount + failCount
+        // + errorCount could be < trials and the result would fail
+        // SampleTrialResultSchema on round-trip.
+        errorCount++;
+        continue;
+      }
       if (c.infraError) {
         errorCount++;
         continue;
@@ -206,10 +239,18 @@ export class MultiTrialRunner {
         failCount++;
         passResults.push(false);
       }
+      for (const s of c.scores) {
+        let arr = valuesByName.get(s.name);
+        if (!arr) {
+          arr = [];
+          valuesByName.set(s.name, arr);
+        }
+        arr.push(s.value);
+      }
     }
 
     const nonError = trials - errorCount;
-    const passRate = nonError > 0 ? passCount / nonError : 0;
+    const passRate = nonError > 0 ? passCount / nonError : undefined;
 
     // passAtK per k (skip k > trials)
     const passAtKMap: Record<number, number> = {};
@@ -221,19 +262,6 @@ export class MultiTrialRunner {
       }
     }
 
-    // Score aggregation: group by name across non-infra-error cases that emitted the score
-    const valuesByName = new Map<string, number[]>();
-    for (const c of cases) {
-      if (c.infraError) continue;
-      for (const s of c.scores) {
-        let arr = valuesByName.get(s.name);
-        if (!arr) {
-          arr = [];
-          valuesByName.set(s.name, arr);
-        }
-        arr.push(s.value);
-      }
-    }
     const scores: Record<
       string,
       { mean: number; stddev: number; n: number; values: number[] }
@@ -248,10 +276,7 @@ export class MultiTrialRunner {
       };
     }
 
-    const wilsonCI =
-      nonError === 0
-        ? { lower: 0, upper: 1, point: 0, z: 1.959964 }
-        : wilsonInterval(passCount, nonError);
+    const wilsonCI = wilsonInterval(passCount, nonError);
 
     return {
       sampleId,
@@ -259,7 +284,8 @@ export class MultiTrialRunner {
       passCount,
       failCount,
       errorCount,
-      passRate,
+      ...(passRate === undefined ? {} : { passRate }),
+      ...(passRate === undefined ? { noQualitySignal: true } : {}),
       passAtK: passAtKMap,
       scores,
       wilsonCI,

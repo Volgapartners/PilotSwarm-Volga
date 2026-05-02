@@ -1,5 +1,6 @@
 import type { EvalTask, CaseResult, RunResult } from "../types.js";
 import type { Reporter } from "./types.js";
+import { formatRate } from "./format.js";
 
 export class ConsoleReporter implements Reporter {
   onRunStart(task: EvalTask, runId: string): void {
@@ -25,9 +26,16 @@ export class ConsoleReporter implements Reporter {
   }
 
   onRunComplete(result: RunResult): void {
-    const { total, passed, passRate } = result.summary;
-    const pct = (passRate * 100).toFixed(1);
-    console.log(`━━━ Results: ${passed}/${total} passed (${pct}%) ━━━`);
+    const { total, passed, errored, passRate } = result.summary;
+    const formatted = passRate === undefined ? "n/a" : formatRate(passRate, 1);
+    const pct = formatted === "n/a" ? "n/a" : formatted.slice(0, -1);
+    if (errored > 0) {
+      const nonError = total - errored;
+      console.log(`━━━ Results: ${passed}/${nonError} quality passed (${pct}%) ━━━`);
+      console.log(`${errored} infra errors`);
+    } else {
+      console.log(`━━━ Results: ${passed}/${total} passed (${pct}%) ━━━`);
+    }
     const startMs = Date.parse(result.startedAt);
     const endMs = Date.parse(result.finishedAt);
     if (!Number.isNaN(startMs) && !Number.isNaN(endMs)) {

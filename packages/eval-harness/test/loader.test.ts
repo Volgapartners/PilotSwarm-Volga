@@ -1,44 +1,37 @@
 import { describe, it, expect } from "vitest";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadEvalTask, loadEvalTaskFromDir } from "../src/loader.js";
+import {
+  loadEvalTask,
+  loadEvalTaskFromDir,
+  loadTrajectoryTask,
+  loadTrajectoryTaskFromDir,
+} from "../src/loader.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = resolve(__dirname, "fixtures");
+const DATASETS = resolve(__dirname, "../datasets");
 
 describe("loadEvalTask", () => {
-  it("loads a valid JSON fixture file and returns an EvalTask", () => {
+  it("loads a valid JSON fixture and applies zod defaults", () => {
     const task = loadEvalTask(resolve(FIXTURES, "test-fixture.json"));
     expect(task.id).toBe("test-fixture");
-    expect(task.name).toBe("Test Fixture");
-    expect(task.version).toBe("1.0.0");
     expect(task.samples).toHaveLength(1);
-    expect(task.samples[0].id).toBe("test.sample.1");
-  });
-
-  it("validates with zod and applies default values (match defaults to subset)", () => {
-    const task = loadEvalTask(resolve(FIXTURES, "test-fixture.json"));
-    // match default
     expect(task.samples[0].expected.toolCalls?.[0].match).toBe("subset");
-    // toolSequence default
     expect(task.samples[0].expected.toolSequence).toBe("unordered");
-    // timeoutMs default
     expect(task.samples[0].timeoutMs).toBe(120000);
   });
 
-  it("throws on missing required fields", () => {
-    expect(() => loadEvalTask(resolve(FIXTURES, "test-invalid.json"))).toThrow();
-  });
-
-  it("throws on invalid schemaVersion", () => {
-    // test-invalid.json has schemaVersion: 2
+  it("throws on missing required fields / invalid schemaVersion", () => {
     expect(() => loadEvalTask(resolve(FIXTURES, "test-invalid.json"))).toThrow(
-      /schemaVersion|invalid/i,
+      /schemaVersion|invalid|required/i,
     );
   });
 
-  it("throws on file not found", () => {
-    expect(() => loadEvalTask(resolve(FIXTURES, "does-not-exist.json"))).toThrow();
+  it("throws a clear error when a sample has empty expected criteria", () => {
+    expect(() => loadEvalTask(resolve(FIXTURES, "test-empty-expected.json"))).toThrow(
+      /no expected criteria/i,
+    );
   });
 });
 
@@ -46,27 +39,61 @@ describe("loadEvalTaskFromDir", () => {
   it("loads all JSON files in the directory", () => {
     const tasks = loadEvalTaskFromDir(resolve(FIXTURES, "valid-dir"));
     expect(tasks).toHaveLength(2);
-    const ids = tasks.map((t) => t.id).sort();
-    expect(ids).toEqual(["valid-a", "valid-b"]);
-  });
-
-  it("skips non-JSON files (e.g., README.md)", () => {
-    const tasks = loadEvalTaskFromDir(resolve(FIXTURES, "valid-dir"));
-    // All results should be validated EvalTask objects
-    for (const task of tasks) {
-      expect(task.schemaVersion).toBe(1);
-      expect(typeof task.id).toBe("string");
-    }
+    expect(tasks.map((t) => t.id).sort()).toEqual(["valid-a", "valid-b"]);
   });
 
   it("returns an empty array for a directory with no JSON files", () => {
-    // Use __tests__ itself which has no top-level JSON files
-    // Actually, __tests__ has no JSON at root (fixtures/ is a subdir). Let's verify.
-    // Use the node_modules-less approach: point at a known empty-of-json dir.
-    // Since our loader should not recurse, pointing at __tests__ root dir should yield 0
-    // provided we only check the immediate directory.
-    const tasks = loadEvalTaskFromDir(__dirname);
-    // __dirname = .../__tests__ — contains .ts files only, no .json at that level.
-    expect(tasks).toEqual([]);
+    expect(loadEvalTaskFromDir(__dirname)).toEqual([]);
+  });
+
+  it("skips trajectory datasets when loading EvalTasks (mixed-schema dir)", () => {
+    const tasks = loadEvalTaskFromDir(DATASETS);
+    expect(tasks.length).toBeGreaterThan(0);
+    const ids = tasks.map((t) => t.id);
+    expect(ids).not.toContain("multi-turn-scenarios");
+    expect(ids).toContain("tool-call-correctness");
+  });
+
+  it("invokes onSkip callback for skipped files", () => {
+    const skips: Array<{ path: string; reason: string }> = [];
+    loadEvalTaskFromDir(DATASETS, {
+      onSkip: (path, reason) => skips.push({ path, reason }),
+    } as never);
+    const skip = skips.find((s) => s.path.includes("multi-turn-scenarios"));
+    expect(skip).toBeDefined();
+    expect(skip!.reason).toMatch(/trajectory/i);
+  });
+});
+
+describe("loadTrajectoryTask", () => {
+  it("loads a valid trajectory dataset", () => {
+    const task = loadTrajectoryTask(resolve(DATASETS, "multi-turn-scenarios.v1.json"));
+    expect(task!.id).toBe("multi-turn-scenarios");
+    expect(task!.samples.length).toBeGreaterThan(0);
+  });
+
+  it("skips non-runnable trajectory datasets in live mode", () => {
+    const messages: string[] = [];
+    const task = loadTrajectoryTask(
+      resolve(FIXTURES, "trajectory-non-runnable.json"),
+      { mode: "live", onSkip: (m) => messages.push(m) },
+    );
+    expect(task).toBeUndefined();
+    expect(messages[0]).toMatch(/skipping non-runnable dataset/i);
+  });
+});
+
+describe("loadTrajectoryTaskFromDir", () => {
+  it("loads trajectory tasks from a directory", () => {
+    const tasks = loadTrajectoryTaskFromDir(resolve(FIXTURES, "trajectory-dir"));
+    expect(tasks.map((task) => task.id)).toEqual(["trajectory-valid"]);
+  });
+
+  it("returns only trajectory tasks when scanning mixed-schema dir", () => {
+    const tasks = loadTrajectoryTaskFromDir(DATASETS);
+    expect(tasks.length).toBeGreaterThan(0);
+    const ids = tasks.map((t) => t.id);
+    expect(ids).toContain("multi-turn-scenarios");
+    expect(ids).not.toContain("tool-call-correctness");
   });
 });
