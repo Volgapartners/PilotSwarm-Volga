@@ -7,9 +7,9 @@ The harness is organized into six capability suites — see [`docs/SUITES.md`](.
 | Suite        | File                              | LIVE tests | Gating                                  |
 |--------------|-----------------------------------|-----------:|-----------------------------------------|
 | FUNCTIONAL   | `test/live-driver-live.test.ts`   | 9          | `LIVE=1`                                |
-| DURABILITY   | `test/durability-live.test.ts`    | 7          | `LIVE=1`                                |
+| DURABILITY   | `test/durability-live.test.ts`    | 7          | `LIVE=1` (incl. real worker-handoff)    |
 | ABLATIONS    | `test/ablations-live.test.ts`     | 5          | `LIVE=1`                                |
-| LLM-JUDGE    | `test/llm-judge-live.test.ts`     | 5          | `LIVE=1 LIVE_JUDGE=1` + `OPENAI_API_KEY`|
+| LLM-JUDGE    | `test/llm-judge-live.test.ts`     | 5          | `LIVE=1 LIVE_JUDGE=1` + `OPENAI_API_KEY` **OR** `GITHUB_TOKEN`+`PS_MODEL_PROVIDERS_PATH` |
 | PERFORMANCE  | `test/performance-live.test.ts`   | 4          | `LIVE=1`                                |
 | SAFETY       | `test/safety-live.test.ts`        | 14         | `LIVE=1` (+ `LIVE_JUDGE=1`)             |
 
@@ -46,7 +46,7 @@ The harness has four runner paths:
 - `MatrixRunner` for model/config sweeps across multi-trial cells.
 - `TrajectoryRunner` for V4 multi-turn fixtures (🧪 experimental measurement).
 
-Graders include deterministic tool selection, argument matching, ordering, response, CMS state, and durability-fixture checks, plus `LLMJudgeGrader` with `FakeJudgeClient` and `OpenAIJudgeClient` (🧪 calibration not shipped). Output surfaces include `ConsoleReporter`, `JsonlReporter`, `ConsoleAggregateReporter`, `MarkdownReporter`, `PRCommentReporter`, `CIGate`, and `RegressionDetector`.
+Graders include deterministic tool selection, argument matching, ordering, response, CMS state, durability-fixture checks, plus `LLMJudgeGrader` with three pluggable judge clients: `FakeJudgeClient` (deterministic tests), `OpenAIJudgeClient` (direct OpenAI / OpenAI-compatible API), and `PilotSwarmJudgeClient` (routes through PilotSwarm's `ModelProviderRegistry` so the judge inherits every provider PilotSwarm itself supports — GitHub Copilot, OpenAI, Anthropic, Azure OpenAI). See [`docs/JUDGE-CLIENTS.md`](./docs/JUDGE-CLIENTS.md) for selection precedence and cost-rate contract. Output surfaces include `ConsoleReporter`, `JsonlReporter`, `ConsoleAggregateReporter`, `MarkdownReporter`, `PRCommentReporter`, `CIGate`, and `RegressionDetector`. `EvalRunner` auto-appends a `JsonlReporter` when `EVAL_REPORTS_DIR` env var or `reportsDir` constructor option is set, so `.eval-results/` artifacts are written without per-test wiring.
 
 ## Package Structure
 
@@ -281,6 +281,54 @@ cd packages/eval-harness && npx vitest run
 
 If your scenario needs a new tool, add it to `src/fixtures/eval-tools.ts` and register in `createEvalToolTracker()`.
 
+## CMS event capture (system-tool evidence)
+
+`LiveDriver` captures the full persisted CMS event log via the SDK's
+`session.getMessages()` API after each turn and attaches it as
+`observed.cmsEvents: CmsObservedEvent[]`. This is the canonical evidence
+surface for graders / durability tests:
+
+- Each event carries `{ seq, eventType, data?, createdAt, workerNodeId? }`.
+- Graders can assert "did `spawn_agent` actually fire and persist?"
+  rather than trusting only the LLM's self-reported tool-calls list.
+- Distinct `workerNodeId` values across the session's CMS event log
+  is the canonical signal of cross-worker handoff
+  (see DURABILITY suite's real worker-handoff test).
+- Capture is best-effort: failures log to stderr and never abort the run.
+- Capped at 1000 events per run to bound report size.
+
+Output flows into the `JsonlReporter` (auto-wired when `EVAL_REPORTS_DIR`
+or `reportsDir` is set) so `.eval-results/<runId>.jsonl` carries the
+event log alongside scores and observed tool calls.
+
+## Saving eval reports to disk
+
+`EvalRunner` auto-appends a `JsonlReporter` when either the
+`EVAL_REPORTS_DIR` env var or the `reportsDir` constructor option is set.
+Caller-supplied reporters always win; the auto-reporter is appended only
+when no `JsonlReporter` is already present.
+
+```bash
+EVAL_REPORTS_DIR="$PWD/.eval-results" \
+  LIVE=1 PS_MODEL_PROVIDERS_PATH="$PWD/../sdk/test/fixtures/model-providers.test.json" \
+  npx vitest run test/live-driver-live.test.ts
+```
+
+```typescript
+new EvalRunner({ driver, reportsDir: "./.eval-results" });
+```
+
+Layout per run:
+- `<dir>/<runId>.jsonl` — header + one JSON line per case (pass/fail,
+  scores, observed including `cmsEvents`).
+- `<dir>/<runId>/<caseId>.json` — full failure detail (only on fail).
+
+`.eval-results/` is already gitignored via `packages/eval-harness/.gitignore`,
+so reports won't leak into commits.
+
+Precedence: explicit `reportsDir` option > `EVAL_REPORTS_DIR` env var
+> no auto-wiring. Empty-string env var is treated as unset.
+
 ## Running Against a Real Model
 
 The experimental `LiveDriver` executes samples against a real LLM using `PilotSwarmClient`/`PilotSwarmWorker`, but it currently depends on a monorepo-only SDK test helper for environment setup. It is not portable as a standalone package consumer. Use only inside the PilotSwarm monorepo until the SDK exposes a public env helper, or inject equivalent dependencies yourself.
@@ -463,11 +511,28 @@ console.log(mc.pValue, mc.method); // p-value, "exact" or "chi2-yates"
 const mw = mannWhitneyU([0.8, 0.9, 0.85], [0.6, 0.7, 0.65]);
 ```
 
-## V3: Crash Recovery & Durability Fixtures (experimental)
+## V3: Crash Recovery & Durability (real + fixture)
 
-> ⚠️ **V3 fixture-only — does NOT test real worker crashes.** To validate real durability, you must implement a `ChaosDriver` that calls `worker.kill()` mid-`runTurn`. PilotSwarm does not ship one yet.
+V3 ships durability grader plumbing, fixture-based scenario testing for grader logic, AND a real worker-handoff LIVE test that validates actual session migration via CMS evidence.
 
-V3 currently ships durability **grader plumbing and fixture-based examples**, not a chaos driver. `DurabilityFixtureDriver` derives observations from a test-authored script; it does not crash a real worker, replay orchestration history, or prove hydration/worker handoff. Use it to test grader behavior only.
+**Real worker-handoff LIVE test** (`test/durability-live.test.ts`,
+`DURABILITY: REAL worker handoff — second turn handled by surviving
+worker (CMS evidence)`):
+1. Starts worker A only, runs turn 1 — A handles it (only worker active).
+2. Stops worker A, starts worker B.
+3. Runs turn 2 on the same session — B must handle it (A is dead).
+4. Reads persisted CMS event log via `session.getMessages()` and asserts
+   distinct `workerNodeId` values include BOTH `eval-handoff-a` AND
+   `eval-handoff-b`.
+5. Asserts ≥2 `session.turn_completed` events.
+
+This is real product evidence — not a synthetic tag. Gated by `LIVE=1`.
+The previous synthetic `afterRunHook` test was removed; its tag was
+overwritten by `ChaosDriver` overlay anyway and proved nothing.
+
+**Fixture-based grader scaffolding** (`DurabilityFixtureDriver`) remains
+for testing the durability grader's internal logic on scripted
+scenarios:
 
 ```typescript
 import {
@@ -558,7 +623,15 @@ V5 has two halves.
 
 ### V5a — LLM-as-Judge (experimental)
 
-For subjective dimensions (helpfulness, accuracy, safety, …) `LLMJudgeGrader` runs a `Rubric` of criteria against a prompt+response pair using a pluggable `JudgeClient`. The package includes `FakeJudgeClient` for deterministic tests and an OpenAI-compatible `OpenAIJudgeClient` adapter, but judge calibration against human ratings is not yet shipped. Cost capping requires `OpenAIJudgeClient` `costRates` configuration; without rates, the OpenAI adapter reports unknown cost and the grader emits a judge `infraError` instead of pretending the call cost $0. An optional `JudgeCache` deduplicates by judge ID, rubric ID + version, criterion ID, prompt, response, and a hashed `systemMessage` value (`undefined` is distinct from an empty string or any explicit value). `LLMJudgeGraderOptions.systemMessage` lets callers pass judge-specific instructions through to the `JudgeClient` and participates in that cache identity.
+For subjective dimensions (helpfulness, accuracy, safety, …) `LLMJudgeGrader` runs a `Rubric` of criteria against a prompt+response pair using a pluggable `JudgeClient`. The package includes three pluggable clients (two production-ready live clients plus a deterministic test fake):
+
+- `FakeJudgeClient` — deterministic for unit tests; not for live use.
+- `OpenAIJudgeClient` — direct OpenAI / OpenAI-compatible API. Requires `OPENAI_API_KEY`.
+- `PilotSwarmJudgeClient` — routes via PilotSwarm's `ModelProviderRegistry`, so the judge inherits every provider PilotSwarm itself supports (GitHub Copilot, OpenAI, Anthropic, Azure OpenAI). The default PilotSwarm dev environment (only `GITHUB_TOKEN` + `PS_MODEL_PROVIDERS_PATH`) can run live judge tests without exporting `OPENAI_API_KEY`.
+
+See [`docs/JUDGE-CLIENTS.md`](./docs/JUDGE-CLIENTS.md) for the full selection matrix, cost-rate contract, and `makeLiveJudgeClient()` helper precedence rules.
+
+Cost capping requires `costRates` configuration; without rates, the client returns unknown cost and the grader emits a judge `infraError` instead of pretending the call cost $0. An optional `JudgeCache` deduplicates by judge ID (`cacheIdentity()`), rubric ID + version, criterion ID, prompt, response, and a hashed `systemMessage` value (`undefined` is distinct from an empty string or any explicit value). `LLMJudgeGraderOptions.systemMessage` lets callers pass judge-specific instructions through to the `JudgeClient` and participates in that cache identity.
 
 ```typescript
 import {

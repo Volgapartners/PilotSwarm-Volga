@@ -6,16 +6,18 @@ Each suite documents its intent, gating, and (where relevant) cost.
 > Suite gating is uniform: every `*-live.test.ts` file uses
 > `process.env.LIVE === "1" ? it : it.skip` so default `npx vitest run` skips
 > live tests cleanly. LLM-judge subjective tests additionally require
-> `LIVE_JUDGE=1` + `OPENAI_API_KEY`.
+> `LIVE_JUDGE=1` AND either `OPENAI_API_KEY` OR
+> `GITHUB_TOKEN`+`PS_MODEL_PROVIDERS_PATH` (the latter routes through
+> PilotSwarm's `ModelProviderRegistry` via `PilotSwarmJudgeClient`).
 
 ## Quick Reference
 
 | Suite        | File                              | Gating                                  | LIVE tests |
 |--------------|-----------------------------------|-----------------------------------------|-----------:|
 | FUNCTIONAL   | `live-driver-live.test.ts`        | `LIVE=1`                                | 9          |
-| DURABILITY   | `durability-live.test.ts`         | `LIVE=1`                                | 7          |
+| DURABILITY   | `durability-live.test.ts`         | `LIVE=1` (incl. real worker-handoff w/ CMS evidence) | 7          |
 | ABLATIONS    | `ablations-live.test.ts`          | `LIVE=1` (+ optional models env)        | 5          |
-| LLM-JUDGE    | `llm-judge-live.test.ts`          | `LIVE=1 LIVE_JUDGE=1` + `OPENAI_API_KEY`| 5          |
+| LLM-JUDGE    | `llm-judge-live.test.ts`          | `LIVE=1 LIVE_JUDGE=1` + `OPENAI_API_KEY` **OR** `GITHUB_TOKEN`+`PS_MODEL_PROVIDERS_PATH` | 5          |
 | PERFORMANCE  | `performance-live.test.ts`        | `LIVE=1`                                | 4          |
 | SAFETY       | `safety-live.test.ts`             | `LIVE=1` (+ `LIVE_JUDGE=1` for subjective) | 14      |
 | (regression) | `regression-live.test.ts`         | `LIVE=1`                                | 2          |
@@ -24,15 +26,23 @@ Total LIVE-gated tests: **46** (was 9 before eval-platform expansion).
 
 Optional environment variables used across suites:
 
-| Var                           | Purpose                                                    |
-|-------------------------------|------------------------------------------------------------|
-| `LIVE`                        | Master gate — set to `1` to enable LIVE tests              |
-| `LIVE_JUDGE`                  | Enables LLM-as-judge subjective tests                       |
-| `LIVE_JUDGE_MODEL`            | Single judge model id (default `gpt-4o-mini`)              |
-| `LIVE_JUDGE_MODEL_A` / `_B`   | Cross-judge agreement model ids                             |
-| `LIVE_MATRIX_MODELS`          | Comma-separated PilotSwarm model ids for matrix sweep       |
-| `LIVE_ABLATION_MODELS`        | Override matrix models for ablation suite only              |
-| `OPENAI_API_KEY`              | Judge transport credential                                  |
+| Var                                | Purpose                                                    |
+|------------------------------------|------------------------------------------------------------|
+| `LIVE`                             | Master gate — set to `1` to enable LIVE tests              |
+| `LIVE_JUDGE`                       | Enables LLM-as-judge subjective tests                      |
+| `LIVE_JUDGE_MODEL`                 | Single judge model id (default `gpt-4o-mini` for OpenAI; `github-copilot:gpt-4.1` for PilotSwarm-routed) |
+| `LIVE_JUDGE_MODEL_A` / `_B`        | Cross-judge agreement model ids                            |
+| `LIVE_JUDGE_INPUT_USD_PER_M`       | Input rate override for `PilotSwarmJudgeClient` cost math (per 1M tokens) |
+| `LIVE_JUDGE_OUTPUT_USD_PER_M`      | Output rate override (per 1M tokens). Both required if either set |
+| `LIVE_JUDGE_CACHED_INPUT_USD_PER_M`| Optional cached-input rate override (per 1M tokens)        |
+| `LIVE_MATRIX_MODELS`               | Comma-separated PilotSwarm model ids for matrix sweep      |
+| `LIVE_ABLATION_MODELS`             | Override matrix models for ablation suite only             |
+| `OPENAI_API_KEY`                   | OpenAI judge transport credential                          |
+| `OPENAI_BASE_URL`                  | OpenAI-compatible base URL override (default `https://api.openai.com/v1`) |
+| `GITHUB_TOKEN`                     | GitHub Copilot judge transport credential (for `PilotSwarmJudgeClient`) |
+| `PS_MODEL_PROVIDERS_PATH`          | Path to model providers config — required for `PilotSwarmJudgeClient` |
+| `EVAL_REPORTS_DIR`                 | When set, `EvalRunner` auto-appends a `JsonlReporter` writing to `<dir>/<runId>.jsonl` (and `<dir>/<runId>/<caseId>.json` for failures). Default `.eval-results/` is gitignored. |
+| `KEEP_DURABILITY_ENV`              | Set to `1` to retain DURABILITY test env state for forensics |
 
 ## FUNCTIONAL
 
@@ -57,12 +67,16 @@ Coverage:
 ## DURABILITY
 
 **File:** `test/durability-live.test.ts`
-**Gating:** `LIVE=1`.
-**Helpers:** `ChaosDriver` from `src/drivers/chaos-driver.ts`.
+**Gating:** `LIVE=1`. Optional `KEEP_DURABILITY_ENV=1` to retain test
+env state for forensics on the real worker-handoff scenario.
+**Helpers:** `ChaosDriver` from `src/drivers/chaos-driver.ts` for
+fault-injection scenarios; SDK `PilotSwarmWorker` / `PilotSwarmClient`
+plus `createTestEnv` for the real handoff test (sequential worker
+construction — `withTwoWorkers` is intentionally NOT used because both
+workers would race to dispatch turn 1, defeating the handoff scenario).
 
-Tests crash recovery, dehydration, and worker handoff via the real
-`ChaosDriver` wrapping `LiveDriver`. Every `ObservedResult` is tagged with
-a `DurabilityObservation` describing fault point/mode and recovery state.
+Tests crash recovery, dehydration, and **real cross-worker session
+handoff** verified via persisted CMS events with `workerNodeId` evidence.
 
 Coverage:
 
@@ -70,7 +84,12 @@ Coverage:
 - Dehydrate / hydrate session round-trip (`after_dehydrate`)
 - In-flight tool fault — re-throws by default; observable when `swallowOnFault`
 - Long-running session survives multiple chaos cycles (smoke)
-- Worker handoff scenario via `afterRunHook`
+- **REAL worker handoff (CMS evidence)** — starts worker A only for
+  turn 1, stops A and starts B, runs turn 2 on the same session,
+  asserts the persisted CMS event log contains BOTH `eval-handoff-a`
+  AND `eval-handoff-b` `workerNodeId` values plus ≥2
+  `session.turn_completed` events. No synthetic tags, no
+  `ChaosDriver` overlay — pure product evidence.
 
 Plus 9 fixture-driven `ChaosDriver` unit tests in `test/durability.test.ts`
 that run by default (no LIVE gating) and validate fault-injection semantics
@@ -98,15 +117,23 @@ Coverage:
 ## LLM-JUDGE
 
 **File:** `test/llm-judge-live.test.ts`
-**Gating:** `LIVE=1 LIVE_JUDGE=1` + `OPENAI_API_KEY`.
+**Gating:** `LIVE=1 LIVE_JUDGE=1` AND either `OPENAI_API_KEY` OR
+`GITHUB_TOKEN`+`PS_MODEL_PROVIDERS_PATH` (the helper
+`makeLiveJudgeClient()` selects between `OpenAIJudgeClient` and
+`PilotSwarmJudgeClient` based on which credentials are available).
 
-Subjective rubric grading + judge-vs-judge cross-validation. Uses
-`OpenAIJudgeClient` + `LLMJudgeGrader`. Each grader instance carries a
-`budgetUsd` cap; cost is asserted within budget.
+Subjective rubric grading + judge-vs-judge cross-validation. Each
+grader instance carries a `budgetUsd` cap; cost is asserted within
+budget. The `PilotSwarmJudgeClient` path lets the judge run on every
+provider PilotSwarm itself supports (GitHub Copilot / OpenAI /
+Anthropic / Azure OpenAI), so the default PilotSwarm dev environment
+(only `GITHUB_TOKEN` set) can run live judge tests without exporting
+`OPENAI_API_KEY`. See [`JUDGE-CLIENTS.md`](./JUDGE-CLIENTS.md) for the
+full selection precedence and cost-rate contract.
 
 Coverage:
 
-- Single-criterion calibrated rubric grade against real PilotSwarm response
+- Single-criterion rubric grade against real PilotSwarm response
 - Multi-criterion rubric (helpfulness/accuracy/safety) returns finite scores
 - Cost accounting accumulates within `budgetUsd`
 - Cross-judge agreement — two judge models score the same response
