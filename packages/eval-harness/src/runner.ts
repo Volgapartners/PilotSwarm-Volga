@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Driver } from "./drivers/types.js";
 import type { EvalTask, EvalSample, CaseResult, RunResult, Score } from "./types.js";
 import type { Reporter } from "./reporters/types.js";
+import { JsonlReporter } from "./reporters/jsonl.js";
 import { gradeEvalCase } from "./graders/index.js";
 import { normalizeObservedResult } from "./validation/normalize-result.js";
 
@@ -29,6 +30,14 @@ export interface RunnerOptions {
    * blow up an entire run.
    */
   failOnReporterError?: boolean;
+  /**
+   * G8: explicit per-runner reports directory. When provided, the runner
+   * appends a `JsonlReporter(reportsDir)` to the reporter list (unless the
+   * caller already supplied one). This is the programmatic equivalent of
+   * the `EVAL_REPORTS_DIR` env var; the explicit option wins over the env
+   * var when both are present.
+   */
+  reportsDir?: string;
 }
 
 const SAFE_ID_RE = /^[a-zA-Z0-9_-]+$/;
@@ -102,7 +111,26 @@ export class EvalRunner {
 
   constructor(options: RunnerOptions) {
     this.driver = options.driver;
-    this.reporters = options.reporters ?? [];
+    // G8: optional auto-wiring of `JsonlReporter` from a per-runner option
+    // (`reportsDir`) or the `EVAL_REPORTS_DIR` env var. Caller-supplied
+    // reporters are always kept; the auto-reporter is appended ONLY if no
+    // `JsonlReporter` is already present (so a caller can override with
+    // a custom output dir or suppress auto-wiring by passing their own
+    // instance). Explicit option wins over env var when both are set.
+    const callerReporters = options.reporters ?? [];
+    const explicitDir = options.reportsDir;
+    const envDir =
+      explicitDir === undefined
+        ? process.env.EVAL_REPORTS_DIR && process.env.EVAL_REPORTS_DIR.length > 0
+          ? process.env.EVAL_REPORTS_DIR
+          : undefined
+        : undefined;
+    const autoDir = explicitDir ?? envDir;
+    const hasJsonl = callerReporters.some((r) => r instanceof JsonlReporter);
+    this.reporters =
+      autoDir && !hasJsonl
+        ? [...callerReporters, new JsonlReporter(autoDir)]
+        : callerReporters;
     this.fixedRunId = options.runId !== undefined ? sanitizeId(options.runId) : undefined;
     this.runId = this.fixedRunId ?? sanitizeId(randomUUID());
     this.gitSha = options.gitSha;

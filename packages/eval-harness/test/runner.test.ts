@@ -583,3 +583,152 @@ describe("EvalRunner: grader and reporter resilience", () => {
     });
   });
 });
+
+
+// G8: EVAL_REPORTS_DIR / reportsDir auto-wiring of JsonlReporter
+describe("EvalRunner: reports auto-wiring (G8)", () => {
+  function buildPassingTask(): EvalTask {
+    return EvalTaskSchema.parse({
+      schemaVersion: 1,
+      id: "g8-task",
+      name: "G8 Test Task",
+      description: "G8 reports auto-wiring test task",
+      version: "1.0.0",
+      samples: [
+        {
+          id: "s1",
+          description: "minimal passing sample",
+          input: { prompt: "hi" },
+          expected: { noToolCall: true },
+          timeoutMs: 120000,
+        },
+      ],
+    });
+  }
+
+  function passingDriver(): Driver {
+    return {
+      async run(_sample: EvalSample): Promise<ObservedResult> {
+        return {
+          sessionId: "sid",
+          toolCalls: [],
+          finalResponse: "ok response",
+          cmsState: "idle",
+          latencyMs: 10,
+        };
+      },
+    } as unknown as Driver;
+  }
+
+  it("appends a JsonlReporter when reportsDir is provided", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "eval-reports-g8-"));
+    try {
+      const runner = new EvalRunner({
+        driver: passingDriver(),
+        runId: "g8-explicit",
+        reportsDir: dir,
+      });
+      await runner.runTask(buildPassingTask());
+      const file = path.join(dir, "g8-explicit.jsonl");
+      expect(fs.existsSync(file)).toBe(true);
+      const lines = fs.readFileSync(file, "utf8").trim().split("\n");
+      expect(lines.length).toBeGreaterThanOrEqual(2);
+      const header = JSON.parse(lines[0]!);
+      expect(header.type).toBe("run");
+      expect(header.runId).toBe("g8-explicit");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("appends a JsonlReporter when EVAL_REPORTS_DIR env var is set", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "eval-reports-g8-env-"));
+    const prev = process.env.EVAL_REPORTS_DIR;
+    process.env.EVAL_REPORTS_DIR = dir;
+    try {
+      const runner = new EvalRunner({
+        driver: passingDriver(),
+        runId: "g8-env",
+      });
+      await runner.runTask(buildPassingTask());
+      const file = path.join(dir, "g8-env.jsonl");
+      expect(fs.existsSync(file)).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.EVAL_REPORTS_DIR;
+      else process.env.EVAL_REPORTS_DIR = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("explicit reportsDir option wins over EVAL_REPORTS_DIR env var", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const envDir = fs.mkdtempSync(path.join(os.tmpdir(), "eval-reports-g8-env2-"));
+    const optDir = fs.mkdtempSync(path.join(os.tmpdir(), "eval-reports-g8-opt-"));
+    const prev = process.env.EVAL_REPORTS_DIR;
+    process.env.EVAL_REPORTS_DIR = envDir;
+    try {
+      const runner = new EvalRunner({
+        driver: passingDriver(),
+        runId: "g8-opt-wins",
+        reportsDir: optDir,
+      });
+      await runner.runTask(buildPassingTask());
+      // Option wins → file in optDir, NOT envDir.
+      expect(fs.existsSync(path.join(optDir, "g8-opt-wins.jsonl"))).toBe(true);
+      expect(fs.existsSync(path.join(envDir, "g8-opt-wins.jsonl"))).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.EVAL_REPORTS_DIR;
+      else process.env.EVAL_REPORTS_DIR = prev;
+      fs.rmSync(envDir, { recursive: true, force: true });
+      fs.rmSync(optDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT auto-add a JsonlReporter when caller already supplied one", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const callerDir = fs.mkdtempSync(path.join(os.tmpdir(), "eval-reports-g8-caller-"));
+    const autoDir = fs.mkdtempSync(path.join(os.tmpdir(), "eval-reports-g8-auto-"));
+    const { JsonlReporter } = await import("../src/reporters/jsonl.js");
+    try {
+      const runner = new EvalRunner({
+        driver: passingDriver(),
+        runId: "g8-caller",
+        reporters: [new JsonlReporter(callerDir)],
+        reportsDir: autoDir, // would normally add another, but should be skipped
+      });
+      await runner.runTask(buildPassingTask());
+      expect(fs.existsSync(path.join(callerDir, "g8-caller.jsonl"))).toBe(true);
+      expect(fs.existsSync(path.join(autoDir, "g8-caller.jsonl"))).toBe(false);
+    } finally {
+      fs.rmSync(callerDir, { recursive: true, force: true });
+      fs.rmSync(autoDir, { recursive: true, force: true });
+    }
+  });
+
+  it("no auto-wiring when neither reportsDir nor EVAL_REPORTS_DIR is set", async () => {
+    const prev = process.env.EVAL_REPORTS_DIR;
+    delete process.env.EVAL_REPORTS_DIR;
+    try {
+      const runner = new EvalRunner({
+        driver: passingDriver(),
+        runId: "g8-none",
+      });
+      const result = await runner.runTask(buildPassingTask());
+      expect(result.runId).toBe("g8-none");
+      // No directory was created — the ((runner as any).reporters) is empty.
+      expect(((runner as unknown as { reporters: unknown[] }).reporters).length).toBe(0);
+    } finally {
+      if (prev !== undefined) process.env.EVAL_REPORTS_DIR = prev;
+    }
+  });
+});
