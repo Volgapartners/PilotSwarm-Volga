@@ -1393,8 +1393,16 @@ export function registerActivities(
         const trace = activityTrace(activityCtx, "dehydrateSession");
         trace(`session=${input.sessionId} start reason=${reason}`);
 
+        let outcomeKind: "dehydrated" | "preserved-snapshot" | "ghost" = "dehydrated";
+        let outcomeLossy = false;
         try {
-            await sessionManager.dehydrate(input.sessionId, reason, { trace });
+            const outcome = await sessionManager.dehydrate(input.sessionId, reason, { trace });
+            outcomeKind = outcome.kind;
+            outcomeLossy = outcome.kind === "dehydrated" && outcome.lossy === true;
+            // Surface the outcome kind in the trace so operators can distinguish
+            // a real archive from a no-op (ghost) or preserved-snapshot path.
+            trace(`session=${input.sessionId} dehydrate outcome=${outcomeKind} reason=${reason}` +
+                (outcomeLossy ? " lossy=true" : ""));
         } catch (err: any) {
             const message = err?.message || String(err);
             if (isMissingDehydrateSnapshotErrorMessage(message)) {
@@ -1450,21 +1458,30 @@ export function registerActivities(
             throw err;
         }
 
-        trace(`session=${input.sessionId} complete reason=${reason}`);
+        trace(`session=${input.sessionId} complete reason=${reason} outcome=${outcomeKind}`);
 
         if (catalog) {
-            const snapshotSizeBytes = await tryReadSnapshotSizeBytes(_sessionStore, input.sessionId);
-            await catalog.upsertSessionMetricSummary(input.sessionId, {
-                ...(snapshotSizeBytes != null ? { snapshotSizeBytes } : {}),
-                dehydrationCountIncrement: 1,
-                lastDehydratedAt: true,
-            }).catch((err: any) => {
-                activityCtx.traceInfo(`[dehydrateSession] CMS summary update failed: ${err}`);
-            });
+            // Persist the outcome kind in the CMS event + metric summary so
+            // observability can distinguish real archives from ghost/preserved
+            // no-ops. Only the "dehydrated" outcome increments the dehydration
+            // counter and updates lastDehydratedAt — ghost/preserved outcomes
+            // did not actually archive anything new.
+            if (outcomeKind === "dehydrated") {
+                const snapshotSizeBytes = await tryReadSnapshotSizeBytes(_sessionStore, input.sessionId);
+                await catalog.upsertSessionMetricSummary(input.sessionId, {
+                    ...(snapshotSizeBytes != null ? { snapshotSizeBytes } : {}),
+                    dehydrationCountIncrement: 1,
+                    lastDehydratedAt: true,
+                }).catch((err: any) => {
+                    activityCtx.traceInfo(`[dehydrateSession] CMS summary update failed: ${err}`);
+                });
+            }
             await catalog.recordEvents(input.sessionId, [{
                 eventType: "session.dehydrated",
                 data: {
                     reason,
+                    outcome: outcomeKind,
+                    ...(outcomeLossy ? { lossy: true } : {}),
                     ...(eventData ?? {}),
                 },
             }], workerNodeId).catch((err: any) => {

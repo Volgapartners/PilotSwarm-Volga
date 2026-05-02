@@ -48,6 +48,21 @@ function isMissingDehydrateSnapshotError(error: unknown): boolean {
     return /Session state directory not ready during dehydrate/i.test(message);
 }
 
+/**
+ * Outcome of a dehydrate() call. Distinguishes the three valid success paths:
+ * - "dehydrated"        — current state archived (the default success case)
+ * - "preserved-snapshot" — no current state, prior store snapshot left in place
+ * - "ghost"              — no current state, no prior snapshot, nothing to do
+ *
+ * Callers (orchestration, observability) should use this to differentiate
+ * between "session was archived" and "session was a ghost / preserved" so
+ * metrics and event records remain accurate.
+ */
+export type DehydrateOutcome =
+    | { kind: "dehydrated"; reason: string; lossy?: boolean }
+    | { kind: "preserved-snapshot"; reason: string }
+    | { kind: "ghost"; reason: string };
+
 /** Worker-level defaults — applied to every session. */
 export interface WorkerDefaults {
     frameworkBasePrompt?: string;
@@ -109,6 +124,23 @@ export class SessionManager {
     private factStore: FactStore | null = null;
     /** Lineage lookup for ancestor/descendant facts access. */
     private _getLineageSessionIds: ((sessionId: string) => Promise<string[]>) | null = null;
+    /**
+     * Per-session lifecycle locks used to serialize lifecycle operations
+     * (createSession/getOrCreate/resumeSession ↔ dehydrate) within this
+     * manager. Each entry is a chain of pending promises; release() resolves
+     * the head so the next waiter can proceed. Locks are deleted when no
+     * waiters remain.
+     *
+     * Both `getOrCreate()` and `dehydrate()` acquire this lock for their
+     * entire critical region so that:
+     *
+     *   - dehydrate() cannot return `{kind:"ghost"}` while a concurrent
+     *     `client.createSession()` is in-flight but hasn't yet populated
+     *     `this.sessions` or local files.
+     *   - getOrCreate() cannot observe stale predicates from a concurrent
+     *     dehydrate's TOCTOU window.
+     */
+    private _lifecycleLocks = new Map<string, Promise<void>>();
 
     constructor(
         private githubToken?: string,
@@ -289,6 +321,22 @@ export class SessionManager {
      * Merges: worker defaults → serializable config (from client) → in-memory config (tools/hooks).
      */
     async getOrCreate(
+        sessionId: string,
+        serializableConfig: SerializableSessionConfig,
+        options?: { turnIndex?: number; trace?: SessionTraceWriter },
+    ): Promise<ManagedSession> {
+        // Hold the lifecycle lock across the entire critical region so a
+        // concurrent dehydrate() cannot observe stale predicates and return
+        // a stale ghost classification while we are mid-creation.
+        const release = await this._acquireLifecycleLock(sessionId);
+        try {
+            return await this._getOrCreateLocked(sessionId, serializableConfig, options);
+        } finally {
+            release();
+        }
+    }
+
+    private async _getOrCreateLocked(
         sessionId: string,
         serializableConfig: SerializableSessionConfig,
         options?: { turnIndex?: number; trace?: SessionTraceWriter },
@@ -512,7 +560,19 @@ export class SessionManager {
      * write is retried separately so transient archive/blob failures can
      * recover before we bubble a terminal error back to the orchestration.
      */
-    async dehydrate(sessionId: string, reason: string, options?: { trace?: SessionTraceWriter }): Promise<void> {
+    async dehydrate(sessionId: string, reason: string, options?: { trace?: SessionTraceWriter }): Promise<DehydrateOutcome> {
+        // Hold the lifecycle lock across the ENTIRE dehydrate body so a
+        // concurrent getOrCreate()/createSession() cannot race the guard
+        // predicates or modify session state mid-dehydrate.
+        const release = await this._acquireLifecycleLock(sessionId);
+        try {
+            return await this._dehydrateLocked(sessionId, reason, options);
+        } finally {
+            release();
+        }
+    }
+
+    private async _dehydrateLocked(sessionId: string, reason: string, options?: { trace?: SessionTraceWriter }): Promise<DehydrateOutcome> {
         const DESTROY_MAX_RETRIES = 3;
         const trace = options?.trace;
         let lastDestroyError: Error | undefined;
@@ -520,6 +580,80 @@ export class SessionManager {
         let checkpointPrepared = false;
 
         emitSessionManagerTrace(sessionId, `dehydrate start reason=${reason}`, { trace });
+
+        // Ghost-session / preserved-snapshot guard.
+        //
+        // A session that was created but never produced any persistable state
+        // (e.g., LLM error before first turn checkpoint) has nothing to
+        // dehydrate. Rather than throwing "Session state directory not ready
+        // during dehydrate" downstream, we classify and short-circuit:
+        //
+        //   - GHOST       — no in-memory + no local + store proves no snapshot
+        //   - PRESERVED   — no in-memory + no local + store has prior snapshot
+        //
+        // Failure-mode policy: this guard FAILS CLOSED. If the session-store
+        // probe throws (transient unavailability, credentials, network), we do
+        // NOT classify the session as a ghost — we let the existing dehydrate
+        // path run so any real durable state is observed (or surfaces a loud
+        // error). Inability to inspect durable state is not proof of absence.
+        //
+        // Concurrency: the outer lifecycle lock (acquired in `dehydrate()`)
+        // serializes us against concurrent `getOrCreate()` for the same
+        // session, so the predicates remain consistent across the await.
+        if (!this.sessions.has(sessionId) && !fs.existsSync(sessionDir)) {
+            let storeProbeFailed = false;
+            let snapshotExists: boolean | undefined;
+            if (this.sessionStore) {
+                try {
+                    snapshotExists = await this.sessionStore.exists(sessionId);
+                } catch (probeErr: any) {
+                    storeProbeFailed = true;
+                    const probeError = normalizeError(probeErr);
+                    emitSessionManagerTrace(
+                        sessionId,
+                        `dehydrate guard: session-store exists() probe failed, falling through to normal dehydrate path error=${probeError.message}`,
+                        { trace, level: "warn" },
+                    );
+                    console.warn(
+                        `[SessionManager] dehydrate guard: session-store exists() probe failed for ${sessionId} ` +
+                        `(${probeError.message}); falling through to normal dehydrate path.`,
+                    );
+                }
+            }
+
+            // Re-check predicates AFTER the await — defense in depth, although
+            // the outer lifecycle lock should already prevent any concurrent
+            // mutation. If the lock contract is ever broken (e.g., a future
+            // call path that bypasses the lock), this re-check still catches
+            // appearing state instead of returning a stale ghost classification.
+            if (this.sessions.has(sessionId) || fs.existsSync(sessionDir)) {
+                emitSessionManagerTrace(
+                    sessionId,
+                    `dehydrate guard: state appeared during store probe, falling through to normal dehydrate path reason=${reason}`,
+                    { trace },
+                );
+                // fall through (do not return) — normal dehydrate path will run below.
+            } else if (!storeProbeFailed) {
+                if (snapshotExists === true) {
+                    emitSessionManagerTrace(
+                        sessionId,
+                        `dehydrate skipped: no current state, prior snapshot preserved reason=${reason}`,
+                        { trace },
+                    );
+                    return { kind: "preserved-snapshot", reason };
+                }
+                if (snapshotExists === false || this.sessionStore == null) {
+                    emitSessionManagerTrace(
+                        sessionId,
+                        `dehydrate skipped: ghost session (no in-memory, no local files, no prior snapshot) reason=${reason}`,
+                        { trace },
+                    );
+                    return { kind: "ghost", reason };
+                }
+            }
+            // storeProbeFailed === true → fall through to normal dehydrate path
+            // (which will surface a loud error if the snapshot really is missing).
+        }
 
         if (this.sessionStore && fs.existsSync(sessionDir)) {
             try {
@@ -665,9 +799,34 @@ export class SessionManager {
                 `[SessionManager] destroy() failed for ${sessionId} after ${DESTROY_MAX_RETRIES} attempts ` +
                 `(${lastDestroyError.message}), but session-store persistence succeeded. Session state is preserved.`
             );
-        } else {
-            emitSessionManagerTrace(sessionId, `dehydrate complete reason=${reason}`, { trace });
+            return { kind: "dehydrated", reason, lossy: true };
         }
+        emitSessionManagerTrace(sessionId, `dehydrate complete reason=${reason}`, { trace });
+        return { kind: "dehydrated", reason };
+    }
+
+    /**
+     * Acquire a per-session async lock for the duration of a critical lifecycle
+     * operation (createSession/getOrCreate vs dehydrate). Awaits any pending
+     * lock for the same session, then resolves with a release() function.
+     * Callers must invoke release() in a finally block.
+     */
+    private async _acquireLifecycleLock(sessionId: string): Promise<() => void> {
+        const previous = this._lifecycleLocks.get(sessionId);
+        let release!: () => void;
+        const next = new Promise<void>((resolve) => {
+            release = () => {
+                resolve();
+                if (this._lifecycleLocks.get(sessionId) === next) {
+                    this._lifecycleLocks.delete(sessionId);
+                }
+            };
+        });
+        this._lifecycleLocks.set(sessionId, next);
+        if (previous) {
+            try { await previous; } catch { /* ignore — previous holder errored, continue */ }
+        }
+        return release;
     }
 
     /**
@@ -729,12 +888,20 @@ export class SessionManager {
 
     /**
      * Destroy a session and remove from tracking.
+     *
+     * Acquires the per-session lifecycle lock to serialize against
+     * concurrent getOrCreate / dehydrate / reset for the same session.
      */
     async destroySession(sessionId: string): Promise<void> {
-        const session = this.sessions.get(sessionId);
-        if (session) {
-            await session.destroy();
-            this.sessions.delete(sessionId);
+        const release = await this._acquireLifecycleLock(sessionId);
+        try {
+            const session = this.sessions.get(sessionId);
+            if (session) {
+                await session.destroy();
+                this.sessions.delete(sessionId);
+            }
+        } finally {
+            release();
         }
     }
 
@@ -742,23 +909,42 @@ export class SessionManager {
      * Drop the warm in-memory session handle without deleting any persisted
      * local/session-store state. Used when the underlying Copilot session
      * becomes invalid and we want the next getOrCreate() to resume/hydrate it.
+     *
+     * Acquires the per-session lifecycle lock to serialize against
+     * concurrent getOrCreate / dehydrate for the same session.
      */
     async invalidateWarmSession(sessionId: string): Promise<void> {
-        const session = this.sessions.get(sessionId);
-        if (!session) return;
+        const release = await this._acquireLifecycleLock(sessionId);
         try {
-            await session.destroy();
-        } catch {}
-        this.sessions.delete(sessionId);
+            const session = this.sessions.get(sessionId);
+            if (!session) return;
+            try {
+                await session.destroy();
+            } catch {}
+            this.sessions.delete(sessionId);
+        } finally {
+            release();
+        }
     }
 
     /**
      * Fully reset a session's live and persisted Copilot state.
      * Used when the stored transcript/session state becomes unusable and the
      * runtime must recreate a fresh Copilot session for lossy replay.
+     *
+     * Public entry point — acquires the per-session lifecycle lock to
+     * serialize against concurrent getOrCreate / dehydrate / destroy.
+     * Internal callers (e.g. `_getOrCreateLocked`) that already hold the
+     * lock invoke `_resetSessionState()` directly to avoid recursive lock
+     * acquisition.
      */
     async resetSessionState(sessionId: string): Promise<void> {
-        await this._resetSessionState(sessionId);
+        const release = await this._acquireLifecycleLock(sessionId);
+        try {
+            await this._resetSessionState(sessionId);
+        } finally {
+            release();
+        }
     }
 
     /**
@@ -776,10 +962,35 @@ export class SessionManager {
         return [...this.sessions.keys()];
     }
 
-    /** Shutdown: destroy all sessions, stop CopilotClient. */
+    /**
+     * Shutdown: destroy all sessions, stop CopilotClient.
+     *
+     * Acquires the per-session lifecycle lock for each session before
+     * destroying it. This serializes shutdown against any in-flight
+     * getOrCreate / dehydrate / destroy / invalidate / reset for the
+     * same session, so we don't tear down a session while another
+     * lifecycle method is still using it.
+     *
+     * Lock acquisition is best-effort: if a per-session lock acquire
+     * itself errors (or races with a concurrent unbounded operation),
+     * we still proceed with shutdown to avoid hanging the worker.
+     */
     async shutdown(): Promise<void> {
-        for (const [_, session] of this.sessions) {
-            try { await session.destroy(); } catch {}
+        const sessionIds = [...this.sessions.keys()];
+        for (const id of sessionIds) {
+            let release: (() => void) | undefined;
+            try {
+                release = await this._acquireLifecycleLock(id);
+            } catch {}
+            try {
+                const session = this.sessions.get(id);
+                if (session) {
+                    try { await session.destroy(); } catch {}
+                    this.sessions.delete(id);
+                }
+            } finally {
+                if (release) release();
+            }
         }
         this.sessions.clear();
         if (this.client) {
