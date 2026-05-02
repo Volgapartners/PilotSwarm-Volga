@@ -29,6 +29,14 @@ describe("iter16 WS8 — pack hygiene", () => {
     const tsbuildinfo = files.filter((f) => f.path.endsWith(".tsbuildinfo"));
     expect(tsbuildinfo).toEqual([]);
 
-    expect(tarball.entryCount).toBeLessThan(150);
+    // Entry-count baseline history:
+    //   <150 original
+    //   <200 after prompt-testing surface (4 mutators + 4 suites + temp-registry +
+    //        v2 golden schema, ~14 new dist files) AND perf-evals tier 3 surface
+    //        (DbTracker, PgActivityPoller, DurabilityTracker, ResourceTracker,
+    //        ConcurrencyProfiler, BudgetChecker, reporter, ~16 new dist files +
+    //        baseline JSON)
+    // Headroom kept moderate: any further growth must be justified.
+    expect(tarball.entryCount).toBeLessThan(200);
   });
 });

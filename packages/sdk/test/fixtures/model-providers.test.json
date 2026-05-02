@@ -6,7 +6,7 @@
       "githubToken": "env:GITHUB_TOKEN",
       "models": [
         {
-          "name": "gpt-5.1",
+          "name": "gpt-5.4",
           "description": "Primary deterministic test model for PilotSwarm local and integration suites.",
           "cost": "high"
         },
@@ -14,6 +14,11 @@
           "name": "gpt-4.1",
           "description": "Fallback GPT model for tests that sweep multiple GitHub Copilot models.",
           "cost": "medium"
+        },
+        {
+          "name": "gpt-5.4-mini",
+          "description": "Lower-cost GPT model for compatibility / smoke checks.",
+          "cost": "low"
         },
         {
           "name": "gpt-4o",
@@ -33,5 +38,5 @@
       ]
     }
   ],
-  "defaultModel": "github-copilot:gpt-5.1"
+  "defaultModel": "github-copilot:gpt-5.4"
 }

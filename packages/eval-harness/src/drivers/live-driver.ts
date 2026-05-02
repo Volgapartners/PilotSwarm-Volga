@@ -205,7 +205,12 @@ export class LiveDriver implements Driver {
       finalResponse = (response as string | undefined) ?? "";
 
       const info = await session.getInfo().catch(() => null);
-      cmsState = info?.state ?? undefined;
+      // The PilotSwarm SDK exposes the session lifecycle on `info.status`.
+      // We also probe `info.state` defensively so injected non-canonical
+      // clients (test fakes, alt SDK builds) that surface state under the
+      // older field name still produce a non-undefined cmsState. Current
+      // SDK contract: `status` is authoritative.
+      cmsState = info?.status ?? (info as any)?.state ?? undefined;
     } catch (err) {
       primaryError = err;
     } finally {

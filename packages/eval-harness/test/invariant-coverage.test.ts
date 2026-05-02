@@ -1133,13 +1133,17 @@ describe("Family 7 — Package / public API readiness", () => {
     expect(paths.some((x) => x.endsWith(".tsbuildinfo"))).toBe(false);
   });
 
-  it("pack unpacked size is under 1.1MB", () => {
+  it("pack unpacked size is under 1.5MB", () => {
     const p = packOnce();
-    // Eval-platform expansion landed real ChaosDriver implementation +
-    // LatencyTracker/CostTracker; budget bumped from 1.0MB → 1.1MB to
-    // accommodate. Headroom intentionally small: any further growth must
-    // be justified.
-    expect(p.unpackedSize).toBeLessThan(1_100_000);
+    // Threshold history:
+    //   1.0MB original
+    //   1.1MB after eval-platform expansion (ChaosDriver + LatencyTracker/CostTracker)
+    //   1.5MB after prompt-testing surface (4 mutators + 4 suites + temp-registry,
+    //         ~1740 LOC, +golden v2 schema) AND perf-evals tier 3 surface
+    //         (DbTracker + PgActivityPoller + DurabilityTracker + ResourceTracker
+    //         + ConcurrencyProfiler + BudgetChecker + reporter, ~1400 LOC)
+    // Headroom intentionally small: any further growth must be justified.
+    expect(p.unpackedSize).toBeLessThan(1_500_000);
   });
 
   it("public exports include strict BaselineSchema (default) AND BaselineSchemaAllowEmpty (opt-in)", async () => {
