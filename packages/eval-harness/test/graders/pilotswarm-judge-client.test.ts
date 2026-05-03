@@ -337,6 +337,13 @@ describe("PilotSwarmJudgeClient", () => {
 
     const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    // G16: per-attempt retry warning is gated on EVAL_VERBOSE_TEARDOWN=1.
+    // This test asserts that under verbose mode the warning lands on
+    // stderr (NEVER stdout, which downstream JSON parsers may read).
+    // The complementary default-quiet behavior is asserted in the
+    // dedicated G16 test below.
+    const prevEnv = process.env.EVAL_VERBOSE_TEARDOWN;
+    process.env.EVAL_VERBOSE_TEARDOWN = "1";
     try {
       await client.judge(judgeRequest());
       const stderrHits = stderrSpy.mock.calls.filter((c) =>
@@ -348,6 +355,45 @@ describe("PilotSwarmJudgeClient", () => {
       expect(stderrHits.length).toBeGreaterThan(0);
       expect(stdoutHits.length).toBe(0);
     } finally {
+      if (prevEnv === undefined) delete process.env.EVAL_VERBOSE_TEARDOWN;
+      else process.env.EVAL_VERBOSE_TEARDOWN = prevEnv;
+      stderrSpy.mockRestore();
+      stdoutSpy.mockRestore();
+    }
+  });
+
+  it("G16: default-quiet — retry warning is suppressed when EVAL_VERBOSE_TEARDOWN is unset", async () => {
+    const registry = buildTestRegistry();
+    const fake = makeFakeCtor([
+      { sessionError: "503 upstream" },
+      { response: '{"reasoning":"x","rawScore":1,"normalizedScore":1,"pass":true}' },
+    ]);
+    const client = new PilotSwarmJudgeClient({
+      modelProviders: registry,
+      model: "gpt-4.1",
+      copilotClientCtor: fake.Ctor,
+      maxRetries: 1,
+      baseRetryDelayMs: 0,
+    });
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const prevEnv = process.env.EVAL_VERBOSE_TEARDOWN;
+    delete process.env.EVAL_VERBOSE_TEARDOWN;
+    try {
+      // Retries still happen — and the eventual response still resolves —
+      // but the per-attempt warning text MUST be suppressed.
+      await client.judge(judgeRequest());
+      const judgeStderrHits = stderrSpy.mock.calls.filter((c) =>
+        String(c[0]).includes("PilotSwarmJudgeClient"),
+      );
+      const judgeStdoutHits = stdoutSpy.mock.calls.filter((c) =>
+        String(c[0]).includes("PilotSwarmJudgeClient"),
+      );
+      expect(judgeStderrHits.length).toBe(0);
+      expect(judgeStdoutHits.length).toBe(0);
+    } finally {
+      if (prevEnv !== undefined) process.env.EVAL_VERBOSE_TEARDOWN = prevEnv;
       stderrSpy.mockRestore();
       stdoutSpy.mockRestore();
     }

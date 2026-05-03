@@ -278,10 +278,16 @@ export class LiveDriver implements Driver {
           // with a stop() failure — log it to stderr instead. When the
           // primary body succeeded, surface the stop() failure as the primary
           // error so resource-leak / shutdown bugs don't get swallowed.
+          //
+          // G16: keep cleanup-after-failure warning text opt-in so demo/perf
+          // runs stay quiet. The promote-to-primary-error semantics is
+          // unchanged — only the supplementary warning text is gated.
           if (primaryError !== null) {
-            process.stderr.write(
-              `LiveDriver: client.stop() failed during cleanup: ${err instanceof Error ? err.message : String(err)}\n`,
-            );
+            if (process.env.EVAL_VERBOSE_TEARDOWN === "1") {
+              process.stderr.write(
+                `LiveDriver: client.stop() failed during cleanup: ${err instanceof Error ? err.message : String(err)}\n`,
+              );
+            }
           } else {
             primaryError = err;
           }
@@ -296,10 +302,14 @@ export class LiveDriver implements Driver {
           // failure — log it to stderr instead. When the primary body
           // succeeded, surface the stop() failure as the primary error so
           // resource-leak / shutdown bugs don't get swallowed.
+          //
+          // G16: keep cleanup-after-failure warning text opt-in.
           if (primaryError !== null) {
-            process.stderr.write(
-              `LiveDriver: worker.stop() failed during cleanup: ${err instanceof Error ? err.message : String(err)}\n`,
-            );
+            if (process.env.EVAL_VERBOSE_TEARDOWN === "1") {
+              process.stderr.write(
+                `LiveDriver: worker.stop() failed during cleanup: ${err instanceof Error ? err.message : String(err)}\n`,
+              );
+            }
           } else {
             primaryError = err;
           }
@@ -314,10 +324,14 @@ export class LiveDriver implements Driver {
           // When the primary body succeeded, cleanup errors must surface;
           // promote the cleanup error to primaryError so the throw below
           // rethrows it.
+          //
+          // G16: keep cleanup-after-failure warning text opt-in.
           if (primaryError !== null) {
-            console.error(
-              `LiveDriver: env.cleanup() failed during cleanup error path: ${err instanceof Error ? err.message : String(err)}`,
-            );
+            if (process.env.EVAL_VERBOSE_TEARDOWN === "1") {
+              console.error(
+                `LiveDriver: env.cleanup() failed during cleanup error path: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
           } else {
             primaryError = err;
           }

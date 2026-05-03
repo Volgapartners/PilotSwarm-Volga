@@ -121,6 +121,16 @@ describe("F25: live-driver cleanup error masking", () => {
     }
     const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const consoleErrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // G16: cleanup-after-primary-error warning text is gated on
+    // EVAL_VERBOSE_TEARDOWN=1 so demo/perf runs stay quiet by default.
+    // This test asserts the warning IS emitted under verbose mode (the
+    // promote-to-primary semantics is already covered by the "primary
+    // path succeeds" test below). Under default (not-set), the warning
+    // is suppressed but primaryError is still rethrown — verified
+    // separately by the "default" coverage in the dedicated G16 test
+    // (see runner-iter14.test.ts: G16 default-quiet test).
+    const prevEnv = process.env.EVAL_VERBOSE_TEARDOWN;
+    process.env.EVAL_VERBOSE_TEARDOWN = "1";
     try {
       const driver = new LiveDriver(undefined, {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -138,6 +148,55 @@ describe("F25: live-driver cleanup error masking", () => {
         consoleErrSpy.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
       expect(allLogs).toMatch(/cleanup boom/);
     } finally {
+      if (prevEnv === undefined) delete process.env.EVAL_VERBOSE_TEARDOWN;
+      else process.env.EVAL_VERBOSE_TEARDOWN = prevEnv;
+      stderrSpy.mockRestore();
+      consoleErrSpy.mockRestore();
+    }
+  });
+
+  it("G16: default-quiet — primary error masks cleanup error WITHOUT emitting warning text", async () => {
+    const env = fakeEnv(async () => {
+      throw new Error("cleanup boom default");
+    });
+    class FailingWorker {
+      registerTools() {}
+      setSessionConfig() {}
+      async start() {
+        throw new Error("primary boom default");
+      }
+      async stop() {}
+    }
+    class NoopClient {
+      async start() {}
+      async stop() {}
+      async createSession() {
+        return { sessionId: "x", sendAndWait: async () => "", getInfo: async () => null };
+      }
+    }
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const consoleErrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const prevEnv = process.env.EVAL_VERBOSE_TEARDOWN;
+    delete process.env.EVAL_VERBOSE_TEARDOWN;
+    try {
+      const driver = new LiveDriver(undefined, {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        createEnv: () => env as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        WorkerCtor: FailingWorker as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ClientCtor: NoopClient as any,
+      });
+      await expect(driver.run(makeSample())).rejects.toThrow(/primary boom default/);
+      expect(env.cleanup).toHaveBeenCalled();
+      const allLogs =
+        stderrSpy.mock.calls.map((c) => String(c[0])).join("") +
+        "\n" +
+        consoleErrSpy.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
+      expect(allLogs).not.toMatch(/cleanup boom default/);
+      expect(allLogs).not.toMatch(/env\.cleanup\(\) failed during cleanup error path/);
+    } finally {
+      if (prevEnv !== undefined) process.env.EVAL_VERBOSE_TEARDOWN = prevEnv;
       stderrSpy.mockRestore();
       consoleErrSpy.mockRestore();
     }

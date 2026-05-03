@@ -232,9 +232,15 @@ export class PilotSwarmJudgeClient implements JudgeClient {
         }
         lastError = error;
         // stderr only — never stdout, which downstream JSON parsers may read.
-        process.stderr.write(
-          `PilotSwarmJudgeClient: attempt ${attempt + 1}/${this.maxRetries + 1} failed (${error.message}); retrying\n`,
-        );
+        // G16: gate the retry warning on EVAL_VERBOSE_TEARDOWN=1 to keep
+        // demo/perf runs clean. Retries are still observable via metrics
+        // and the final thrown error if retries exhaust; this is purely
+        // a per-attempt informational log.
+        if (process.env.EVAL_VERBOSE_TEARDOWN === "1") {
+          process.stderr.write(
+            `PilotSwarmJudgeClient: attempt ${attempt + 1}/${this.maxRetries + 1} failed (${error.message}); retrying\n`,
+          );
+        }
         await abortableSleep(this.retryDelayMs(attempt), options.signal);
       }
     }
