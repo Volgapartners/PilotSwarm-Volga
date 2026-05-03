@@ -564,7 +564,7 @@ const result = await runner.runTask(taskWithDurabilityExpectations);
 
 The grader emits `crash-recovery`, `post-recovery-state`, `tool-calls-after-recovery`, `dehydration`, `hydration`, and `worker-handoff` scores. Fault points: `before_turn`, `during_tool_call`, `after_tool_call`, `after_turn`, `after_dehydrate`, `before_hydrate`. Fault modes: `worker_crash`, `tool_timeout`, `tool_throw`, `network_disconnect`. The `datasets/durability-scenarios.v1.json` fixture is marked `runnable: false` because it is illustrative fixture data, not a live-runnable crash test; `loadEvalTask(path, { mode: "live" })` skips non-runnable datasets with a clear warning.
 
-`ChaosDriver` is exported only as an extension-point skeleton. Its base `run()` throws until a caller subclasses it and implements real worker-kill timing plus recovery observation.
+`ChaosDriver` wraps an inner `Driver` and overlays a synthetic `DurabilityObservation` on the returned `ObservedResult`. Its base `run()` does NOT crash workers, force dehydration, or otherwise perturb the inner driver — it executes the inner driver normally and tags the result with `{ scenario, faultPoint, faultMode, injected, recovered, ... }` for grading wrappers. To inject real faults, supply `beforeRunHook` / `afterRunHook` callbacks (e.g. for synthetic in-flight throws) or layer ChaosDriver around a driver that can perform real worker kills. For canonical product-level durability proof — real worker handoff, real dehydrate/hydrate, real cross-worker resumption — see the SDK-direct LIVE tests in `test/durability-live.test.ts` (they bypass ChaosDriver entirely and read CMS event evidence).
 
 ## V4: Multi-Turn & Trajectory Evaluation (experimental)
 
