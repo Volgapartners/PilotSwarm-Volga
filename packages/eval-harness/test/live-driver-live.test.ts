@@ -136,7 +136,7 @@ describe("LiveDriver LIVE smoke", () => {
   // FUNCTIONAL suite expansion (eval-platform expansion phase 3)
   // -------------------------------------------------------------------------
 
-  run("FUNCTIONAL: spawn_agent tool produces parent/child link with tool evidence", async () => {
+  run("FUNCTIONAL: spawn_agent tool produces real CMS evidence (session.agent_spawned with childSessionId)", async () => {
     const driver = new LiveDriver({ timeout: 240_000 });
     const dataset = loadEvalTask(resolve(__dirname, "../datasets/tool-call-correctness.v1.json"));
     const baseSample = dataset.samples[0]!;
@@ -153,12 +153,41 @@ describe("LiveDriver LIVE smoke", () => {
     const result = await runner.runTask({ ...dataset, samples: [sample] });
     const observed = result.cases[0]!.observed;
     expect(observed.sessionId).toBeTruthy();
-    // At least one of the spawn_agent / test_add tools must show up.
-    const toolNames = observed.toolCalls.map((c) => c.name);
-    expect(toolNames.some((n) => /spawn|add/.test(n))).toBe(true);
+
+    // Real CMS evidence: the parent session's event log MUST contain a
+    // `session.agent_spawned` event whose data.childSessionId is a
+    // non-empty string distinct from the parent session id. Fired by the
+    // spawn_agent system tool at orchestration.ts (manager.recordSessionEvent)
+    // and session-proxy.ts (bufferCmsEvent) — both code paths set
+    // data.childSessionId. Without this evidence the previous regex check
+    // (`/spawn|add/.test(toolName)`) trivially matched a plain test_add
+    // call and proved nothing about the spawn_agent system tool actually
+    // firing.
+    const cmsEvents = observed.cmsEvents ?? [];
+    expect(cmsEvents.length, "expected CMS events to be captured").toBeGreaterThan(0);
+    const spawned = cmsEvents.find((e) => e.eventType === "session.agent_spawned");
+    expect(
+      spawned,
+      `expected session.agent_spawned in event log; saw eventTypes=${JSON.stringify(cmsEvents.map((e) => e.eventType))}`,
+    ).toBeDefined();
+    const childSessionId = (spawned!.data as { childSessionId?: unknown } | undefined)?.childSessionId;
+    expect(typeof childSessionId, "session.agent_spawned.data.childSessionId must be a string").toBe("string");
+    expect((childSessionId as string).length, "childSessionId must be non-empty").toBeGreaterThan(0);
+    expect(childSessionId, "childSessionId must differ from parent sessionId").not.toBe(observed.sessionId);
   }, 360_000);
 
-  run("FUNCTIONAL: wait tool registers a durable timer (round-trip sanity)", async () => {
+  // NOTE: The wait tool's INLINE path (seconds <= worker.waitThreshold,
+  // default 30s) runs `setTimeout(seconds*1000)` directly in
+  // managed-session.ts:406-408 and emits NO session.wait_started /
+  // session.wait_completed events — those events only fire on the durable
+  // (orchestration) path when seconds > waitThreshold. This FUNCTIONAL
+  // test deliberately uses a SHORT wait (1s) to verify the inline-path is
+  // callable end-to-end without the LLM erroring out; it does NOT prove a
+  // durable timer ran. Canonical durable-timer proof — including
+  // session.dehydrated / session.hydrated / session.wait_started /
+  // session.wait_completed event evidence — lives in
+  // test/durability-live.test.ts.
+  run("FUNCTIONAL: wait tool is callable end-to-end (inline path, NOT durable-timer proof)", async () => {
     const driver = new LiveDriver({ timeout: 240_000 });
     const dataset = loadEvalTask(resolve(__dirname, "../datasets/tool-call-correctness.v1.json"));
     const baseSample = dataset.samples[0]!;
@@ -174,6 +203,8 @@ describe("LiveDriver LIVE smoke", () => {
     const result = await runner.runTask({ ...dataset, samples: [sample] });
     const observed = result.cases[0]!.observed;
     expect(observed.sessionId).toBeTruthy();
+    expect(observed.finalResponse, "wait+test_add must produce a non-empty response").toBeTruthy();
+    // Latency floor only — does NOT prove durability. See note above.
     expect(observed.latencyMs).toBeGreaterThanOrEqual(900);
   }, 360_000);
 
