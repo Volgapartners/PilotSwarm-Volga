@@ -6,6 +6,7 @@ import {
   type JudgeResult,
 } from "../types.js";
 import type { JudgeClient, JudgeOptions, JudgeRequest, JudgeResponse } from "./judge-types.js";
+import { JudgeOutputFormatError } from "./judge-types.js";
 
 type FetchLike = (url: string, init: RequestInit) => Promise<{
   ok: boolean;
@@ -179,14 +180,34 @@ export class OpenAIJudgeClient implements JudgeClient {
     const json = await resp.json() as OpenAIResponse;
     const content = json.choices?.[0]?.message?.content;
     if (!content) {
-      throw new Error("OpenAIJudgeClient: missing response content");
+      // Empty response = model failed to produce rubric output. Quality
+      // failure, not infrastructure: see JudgeOutputFormatError docs.
+      throw new JudgeOutputFormatError(
+        "OpenAIJudgeClient: missing response content",
+      );
     }
 
-    const parsed = JSON.parse(content) as unknown;
-    const result: JudgeResult = JudgeResultSchema.parse({
-      ...(parsed as Record<string, unknown>),
-      criterionId: request.criterion.id,
-    });
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content) as unknown;
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new JudgeOutputFormatError(
+        `OpenAIJudgeClient: judge response was not valid JSON (${detail})`,
+      );
+    }
+    let result: JudgeResult;
+    try {
+      result = JudgeResultSchema.parse({
+        ...(parsed as Record<string, unknown>),
+        criterionId: request.criterion.id,
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new JudgeOutputFormatError(
+        `OpenAIJudgeClient: judge response did not match rubric schema (${detail})`,
+      );
+    }
     const inputTokens = json.usage?.prompt_tokens ?? 0;
     const outputTokens = json.usage?.completion_tokens ?? 0;
     // F22: split prompt tokens into cached vs non-cached components and bill

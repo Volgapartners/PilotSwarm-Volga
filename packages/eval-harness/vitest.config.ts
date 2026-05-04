@@ -98,6 +98,7 @@ export default defineConfig({
     include: ["test/**/*.test.ts"],
     pool: "forks",
     fileParallelism,
+    setupFiles: ["./test/setup/patch-copilot-telemetry.ts"],
     testTimeout: 60_000,
     hookTimeout: 60_000,
     env: {

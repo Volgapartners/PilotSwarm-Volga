@@ -5,6 +5,7 @@ import type {
   JudgeRequest,
   JudgeResponse,
 } from "./judge-types.js";
+import { JudgeOutputFormatError } from "./judge-types.js";
 import {
   JudgeResultSchema,
   JudgeCostSchema,
@@ -49,7 +50,8 @@ const DEFAULT_JUDGE_ID = "default";
  */
 type CriterionOutcome =
   | { kind: "ok"; score: Score; cost: JudgeCost }
-  | { kind: "infraError"; score: Score };
+  | { kind: "infraError"; score: Score }
+  | { kind: "computed"; score: Score };
 
 /**
  * Rubric-based judge grader. The package bundles deterministic and
@@ -230,6 +232,24 @@ export class LLMJudgeGrader {
       // F16: refund the reservation so a transient client failure does not
       // permanently consume budget.
       this.totalCostUsd -= reservation.reserved;
+      // JudgeOutputFormatError = the judge model returned, billable tokens
+      // were spent, but its output couldn't be parsed into the rubric
+      // schema. That is a *quality* signal about the judge model itself
+      // (failed to follow rubric instructions), NOT an infra outage. Tag
+      // it as a failing-but-non-infra score so the eval still produces
+      // pass-rate signal for the case under judgment.
+      if (err instanceof JudgeOutputFormatError) {
+        return {
+          kind: "computed",
+          score: {
+            name: `judge/${criterion.id}`,
+            value: 0,
+            pass: false,
+            reason: `Judge output unparseable: ${err.message}`,
+            infraError: false,
+          },
+        };
+      }
       return {
         kind: "infraError",
         score: {

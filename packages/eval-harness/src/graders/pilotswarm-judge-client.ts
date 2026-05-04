@@ -47,6 +47,7 @@ import type {
   JudgeRequest,
   JudgeResponse,
 } from "./judge-types.js";
+import { JudgeOutputFormatError } from "./judge-types.js";
 
 // Import only the type so we don't pull the SDK at runtime when injected.
 type ModelProviderRegistryType = import("pilotswarm-sdk").ModelProviderRegistry;
@@ -383,7 +384,14 @@ export class PilotSwarmJudgeClient implements JudgeClient {
 
       const content = stripJsonFences(text).trim();
       if (!content) {
-        throw new Error("PilotSwarmJudgeClient: empty response content");
+        // Empty response = judge model failed to follow instructions.
+        // Quality failure (the model didn't produce a parseable rubric
+        // verdict), not infrastructure — surface as JudgeOutputFormatError
+        // so the grader records a non-infra failing Score instead of an
+        // infraError that hides the model behavior from quality stats.
+        throw new JudgeOutputFormatError(
+          "PilotSwarmJudgeClient: empty response content",
+        );
       }
 
       let parsed: unknown;
@@ -396,15 +404,23 @@ export class PilotSwarmJudgeClient implements JudgeClient {
         // The eval harness routinely processes adversarial / secret-leak
         // samples, so leaking judge content into infra-error strings (which
         // bubble into reports/logs) is a privacy risk.
-        throw new Error(
+        throw new JudgeOutputFormatError(
           `PilotSwarmJudgeClient: judge response was not valid JSON (${detail})`,
         );
       }
 
-      const result: JudgeResult = JudgeResultSchema.parse({
-        ...(parsed as Record<string, unknown>),
-        criterionId: request.criterion.id,
-      });
+      let result: JudgeResult;
+      try {
+        result = JudgeResultSchema.parse({
+          ...(parsed as Record<string, unknown>),
+          criterionId: request.criterion.id,
+        });
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        throw new JudgeOutputFormatError(
+          `PilotSwarmJudgeClient: judge response did not match rubric schema (${detail})`,
+        );
+      }
 
       const cost = this.computeCost(usage);
 
@@ -457,9 +473,42 @@ export class PilotSwarmJudgeClient implements JudgeClient {
       };
 
       try {
+        // Different @github/copilot builds emit text under different
+        // field names: top-level `content`, `data.deltaContent`,
+        // `data.content`, or — for the terminal `assistant.message`
+        // event — `data.content` as the whole final body. Capture all
+        // of them and dedupe on the final message: if a complete
+        // `assistant.message` arrives with non-empty content AND we
+        // already accumulated a strictly-prefix-matching delta stream,
+        // prefer the final form (it includes any post-streaming
+        // adjustments the SDK may have applied).
+        const pickStr = (...vals: unknown[]): string => {
+          for (const v of vals) {
+            if (typeof v === "string" && v.length > 0) return v;
+          }
+          return "";
+        };
         session.on("assistant.message_delta", (evt: any) => {
-          const piece = typeof evt?.content === "string" ? evt.content : "";
+          const piece = pickStr(
+            evt?.content,
+            evt?.data?.deltaContent,
+            evt?.data?.content,
+            evt?.delta?.content,
+          );
           if (piece) text += piece;
+        });
+        session.on("assistant.message", (evt: any) => {
+          const final = pickStr(evt?.data?.content, evt?.message?.content, evt?.content);
+          if (!final) return;
+          if (final.startsWith(text) || text.length === 0) {
+            text = final;
+          } else {
+            // Streaming and final disagree — append final after deltas
+            // rather than overwriting, so we preserve all signal. The
+            // judge parser tolerates extra trailing text after the
+            // JSON object.
+            text += final;
+          }
         });
 
         // Some SDK builds emit a separate completed event with usage stats. We
@@ -483,7 +532,52 @@ export class PilotSwarmJudgeClient implements JudgeClient {
         });
 
         session.on("session.error", (evt: any) => {
-          const message = typeof evt?.message === "string" ? evt.message : "session error";
+          // Capture the most informative scalar surface available. Some
+          // provider failures arrive with `evt.message` empty but
+          // `evt.error.message` populated, or a code+detail pair, or just
+          // a stringified payload — without these the failure surfaces as
+          // a useless "session error" with no diagnostic signal.
+          const candidates: unknown[] = [
+            evt?.message,
+            evt?.error?.message,
+            evt?.error,
+            evt?.detail,
+            evt?.code,
+            evt,
+          ];
+          let message = "session error";
+          for (const c of candidates) {
+            if (typeof c === "string" && c.length > 0) {
+              message = c;
+              break;
+            }
+            if (c && typeof c === "object") {
+              try {
+                const s = JSON.stringify(c);
+                if (s && s !== "{}") {
+                  message = s;
+                  break;
+                }
+              } catch {
+                /* unserializable — keep searching */
+              }
+            }
+          }
+          // Workaround: @github/copilot's `emitUserMessageSentimentTelemetry`
+          // can throw `TypeError: Cannot read properties of undefined
+          // (reading 'trim')` AFTER the model has already streamed its full
+          // response — the crash sits in a post-response telemetry hook
+          // and does not affect correctness of the assistant text. When we
+          // already captured non-empty text and the error matches that
+          // signature, treat it as benign and resolve with what we have
+          // instead of failing the whole judge call.
+          const isCopilotTelemetryCrash =
+            /reading 'trim'/.test(message) &&
+            /emitUserMessageSentimentTelemetry/.test(message);
+          if (isCopilotTelemetryCrash && text.length > 0) {
+            settleResolve({ text, usage });
+            return;
+          }
           // G6 V2 fix #5: tag session.error explicitly so isRetryable() can
           // distinguish provider-level transient failures from non-retryable
           // validation errors. The downstream `isRetryable` matches on the
