@@ -24,7 +24,12 @@
     "prepack": "npm run build",
     "pretest": "npm run build",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:live": "bin/run-live.sh",
+    "test:live:all": "bin/run-live.sh --all",
+    "test:live:cheap": "bin/run-live.sh --cheap",
+    "test:live:perf": "bin/run-live.sh --perf",
+    "test:live:judge": "bin/run-live.sh --judge"
   },
   "dependencies": {
     "zod": "^3.23.0"

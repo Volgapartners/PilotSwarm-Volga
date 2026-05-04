@@ -4,14 +4,24 @@ Evaluation harness for PilotSwarm agents. The deterministic fixture runner, stat
 
 The harness is organized into six capability suites — see [`docs/SUITES.md`](./docs/SUITES.md) for the full catalog and gating matrix.
 
-| Suite        | File                              | LIVE tests | Gating                                  |
-|--------------|-----------------------------------|-----------:|-----------------------------------------|
-| FUNCTIONAL   | `test/live-driver-live.test.ts`   | 9          | `LIVE=1`                                |
-| DURABILITY   | `test/durability-live.test.ts`    | 7          | `LIVE=1` (incl. real worker-handoff)    |
-| ABLATIONS    | `test/ablations-live.test.ts`     | 5          | `LIVE=1`                                |
-| LLM-JUDGE    | `test/llm-judge-live.test.ts`     | 5          | `LIVE=1 LIVE_JUDGE=1` + `OPENAI_API_KEY` **OR** `GITHUB_TOKEN`+`PS_MODEL_PROVIDERS_PATH` |
-| PERFORMANCE  | `test/performance-live.test.ts`   | 4          | `LIVE=1`                                |
-| SAFETY       | `test/safety-live.test.ts`        | 14         | `LIVE=1` (+ `LIVE_JUDGE=1`)             |
+| Suite        | File                                      | LIVE tests | Gating                                  |
+|--------------|-------------------------------------------|-----------:|-----------------------------------------|
+| FUNCTIONAL   | `test/live-driver-live.test.ts`           | 9          | `LIVE=1`                                |
+| DURABILITY   | `test/durability-live.test.ts`            | 7          | `LIVE=1` (incl. real worker-handoff)    |
+| ABLATIONS    | `test/ablations-live.test.ts`             | 5          | `LIVE=1`                                |
+| LLM-JUDGE    | `test/llm-judge-live.test.ts`             | 5          | `LIVE=1 LIVE_JUDGE=1` + `OPENAI_API_KEY` **OR** `GITHUB_TOKEN`+`PS_MODEL_PROVIDERS_PATH` |
+| PERFORMANCE — core    | `test/performance-live.test.ts`  | 8          | `LIVE=1` (DB-budget cases also need `PG_STAT_STATEMENTS_ENABLED=1`) |
+| PERFORMANCE — cold/warm | `test/perf-cold-warm-live.test.ts` | 1        | `LIVE=1`                                |
+| PERFORMANCE — resource | `test/perf-resource-live.test.ts` | 4         | `LIVE=1` (DB-budget cases also need `PG_STAT_STATEMENTS_ENABLED=1`) |
+| PERFORMANCE — concurrency | `test/perf-concurrency-live.test.ts` | 1     | `LIVE=1 PERF_HEAVY=1` (optional `PERF_HEAVY_N8=1`, `PERF_HEAVY_MAX_CONNECTIONS=<n>`) |
+| PERFORMANCE — durability | `test/perf-durability-live.test.ts` | 3       | `LIVE=1 PERF_DURABILITY=1`              |
+| SAFETY       | `test/safety-live.test.ts`                | 14         | `LIVE=1` (+ `LIVE_JUDGE=1` for judge-graded cases) |
+
+> **Gate flags** beyond `LIVE=1` are opt-ins for slow / costly suites:
+> - `LIVE_JUDGE=1` — runs LLM-as-judge tests (real model spend per sample).
+> - `PERF_HEAVY=1` — runs concurrency profiler (≥7 parallel LiveDriver sessions; ≥15 with `PERF_HEAVY_N8=1`). DB-connection heavy.
+> - `PERF_DURABILITY=1` — runs durability perf suite (mostly asserts deferred state until SDK emits `*-start` events).
+> - `PG_STAT_STATEMENTS_ENABLED=1` — converts DB-budget skips into real assertions; requires the extension loaded in Postgres.
 
 ## Quick Start
 
@@ -23,12 +33,60 @@ npx vitest run
 # Via the repo test runner
 ./scripts/run-tests.sh --suite=eval
 
-# All LIVE suites (requires PostgreSQL + GitHub token)
-LIVE=1 npx vitest run -- packages/eval-harness/test/*-live.test.ts
+# All LIVE suites — heavy / costly batch + N=8 concurrency + timestamped reports dir
+cd packages/eval-harness
+bin/run-live.sh --all
 
-# Single LIVE suite
-LIVE=1 npx vitest run -- packages/eval-harness/test/ablations-live.test.ts
+# Cheap smoke (LIVE=1 only, no judge, no heavy perf)
+bin/run-live.sh --cheap
+
+# A single suite — bare positional args are forwarded as file filters
+bin/run-live.sh --judge -- test/llm-judge-live.test.ts
+
+# Or via npm scripts (same behavior)
+npm run test:live           # default: LIVE=1, all live tests
+npm run test:live:all       # everything: judge + heavy + heavy-n8 + perf-durability + pg-stat
+npm run test:live:cheap     # LIVE=1 only
+npm run test:live:perf      # heavy + heavy-n8 + perf-durability + pg-stat
+npm run test:live:judge     # LIVE_JUDGE=1
 ```
+
+`bin/run-live.sh` flags:
+
+| Flag | Sets |
+|---|---|
+| `--live` (default ON) / `--no-live` | `LIVE=1` (or unset) |
+| `--judge` | `LIVE_JUDGE=1` |
+| `--heavy` | `PERF_HEAVY=1` (≥7 parallel sessions) |
+| `--heavy-n8` | `PERF_HEAVY=1 PERF_HEAVY_N8=1` (≥15 sessions) |
+| `--durability-perf` | `PERF_DURABILITY=1` |
+| `--pg-stat` | `PG_STAT_STATEMENTS_ENABLED=1` |
+| `--prompt-testing` | `PROMPT_TESTING=1` |
+| `--keep-env` | `KEEP_DURABILITY_ENV=1` (preserve harness env on teardown) |
+| `--verbose-teardown` | `EVAL_VERBOSE_TEARDOWN=1` |
+| `--reports-dir <path>` | `EVAL_REPORTS_DIR=<path>` (default `.eval-results/<ts>/`) |
+| `--no-reports` | disables auto-wired reports dir |
+| `--all` | judge + heavy + heavy-n8 + durability-perf + pg-stat |
+| `--perf` | heavy + heavy-n8 + durability-perf + pg-stat |
+| `--cheap` | LIVE only (clears prior gates) |
+| `--dry-run` | print resolved env + vitest invocation; exit 0 |
+
+Anything after `--` is forwarded verbatim to `vitest run`. Bare positional args are
+treated as file filters (default `test/*-live.test.ts`).
+
+### Credentials
+
+Vitest auto-loads the monorepo-root `.env` at config time, so you don't need
+the `env $(grep -v '^#' .env | xargs) …` shim anymore. `GITHUB_TOKEN` alone is
+sufficient: the LLM-judge tests construct a `PilotSwarmJudgeClient` against
+the bundled `packages/sdk/test/fixtures/model-providers.test.json` (Copilot
+via `env:GITHUB_TOKEN`). See `packages/eval-harness/.env.example` for the
+full set of env gates.
+
+> Note: do **not** pass `--` before the path filter when calling vitest directly —
+> vitest treats positional args after `--` as forwarded args, not file filters,
+> and the run silently expands to the whole workspace. `bin/run-live.sh`
+> handles this correctly: bare positional → file filter, post-`--` → vitest passthrough.
 
 Monorepo consumers import `pilotswarm-eval-harness` through the package export
 (`dist/index.js`). Run `npm run build` in `packages/eval-harness` before using
@@ -370,8 +428,12 @@ The default test suite does **not** exercise real LLM calls. To smoke-test the e
 
 ```bash
 cd packages/eval-harness
+bin/run-live.sh --cheap -- test/live-driver-live.test.ts
+# or, equivalent:
 LIVE=1 npx vitest run test/live-driver-live.test.ts
 ```
+
+See [Quick Start](#quick-start) above for the `bin/run-live.sh` flag table.
 
 ## JSONL Output Format
 
