@@ -23,7 +23,7 @@ function normalizeBlock(text?: string | null): string | undefined {
 
 export async function loadKnowledgeIndexFromFactStore(
     factStore: FactStore,
-    cap = 15,
+    cap = 50,
 ): Promise<KnowledgeIndex> {
     const skillResult = await factStore.readFacts(
         { keyPattern: "skills/%", scope: "shared", limit: cap },

@@ -1,9 +1,12 @@
 import React from "react";
+import { appendAnimatedDotsToRuns, useAnimatedDots } from "./chat-status.js";
 import {
     applyActiveHighlightRuns,
     computeLegacyLayout,
     getPromptInputRows,
     selectActiveSession,
+    selectAdminConsole,
+    selectAdminGhcpKeyEditorModal,
     selectChatPaneChrome,
     selectChatLines,
     selectActivityPane,
@@ -16,8 +19,10 @@ import {
     selectInspector,
     selectLogFilterModal,
     selectModelPickerModal,
+    selectReasoningEffortPickerModal,
     selectRenameSessionModal,
     selectSessionAgentPickerModal,
+    selectSessionOwnerFilterModal,
     selectStatusBar,
     selectThemePickerModal,
     selectConfirmModal,
@@ -96,7 +101,10 @@ function shallowEqualChatChrome(left, right) {
     if (Object.is(left, right)) return true;
     if (!left || !right) return false;
     return Object.is(left.color, right.color)
-        && shallowEqualArray(left.title, right.title, shallowEqualObject);
+    && Object.is(left.animateTitleRight, right.animateTitleRight)
+    && shallowEqualArray(left.title, right.title, shallowEqualObject)
+        && (Object.is(left.titleRight, right.titleRight)
+            || shallowEqualArray(left.titleRight, right.titleRight, shallowEqualObject));
 }
 
 function readProcessRssBytes() {
@@ -188,7 +196,11 @@ function renderInspectorPanel(platform, inspector, meta, width, height, frame) {
         marginBottom: PANE_GAP_Y,
         lines,
         scrollOffset: meta.inspectorScroll,
-        scrollMode: inspector.activeTab === "logs" || inspector.activeTab === "sequence" ? "bottom" : "top",
+        scrollMode: inspector.activeTab === "sequence"
+            ? "bottom"
+            : inspector.activeTab === "logs" && meta.inspectorFollowBottom
+                ? "bottom"
+                : "top",
         paneId: "inspector",
         paneLabel: inspector.activeTab === "sequence" ? "Sequence" : "Inspector",
         frame,
@@ -206,6 +218,7 @@ function fitText(value, maxWidth) {
 function buildWorkspacePaneFrames(layout) {
     const leftX = 0;
     const rightX = layout.leftHidden ? 0 : layout.leftWidth + (layout.rightHidden ? 0 : PANE_GAP_X);
+    const activityY = layout.inspectorHidden ? 0 : layout.inspectorPaneHeight + PANE_GAP_Y;
 
     return {
         sessions: layout.leftHidden ? null : {
@@ -220,15 +233,15 @@ function buildWorkspacePaneFrames(layout) {
             width: layout.leftWidth,
             height: layout.chatPaneHeight,
         },
-        inspector: layout.rightHidden ? null : {
+        inspector: layout.rightHidden || layout.inspectorHidden ? null : {
             x: rightX,
             y: 0,
             width: layout.rightWidth,
             height: layout.inspectorPaneHeight,
         },
-        activity: layout.rightHidden ? null : {
+        activity: layout.rightHidden || layout.activityHidden ? null : {
             x: rightX,
-            y: layout.inspectorPaneHeight + PANE_GAP_Y,
+            y: activityY,
             width: layout.rightWidth,
             height: layout.activityPaneHeight,
         },
@@ -278,7 +291,7 @@ const SessionList = React.memo(function SessionList({ controller, maxRows, width
     ), [rows]);
 
     return React.createElement(platform.Panel, {
-        title: "Sessions",
+        title: [{ text: "Sessions", color: "yellow", bold: true }],
         titleRight: titleRightRuns,
         color: "yellow",
         focused: sessionView.focused,
@@ -294,7 +307,6 @@ const SessionList = React.memo(function SessionList({ controller, maxRows, width
 
 const ChatPane = React.memo(function ChatPane({ controller, width, height, frame }) {
     const platform = useUiPlatform();
-    const chrome = useControllerSelector(controller, selectChatPaneChrome, shallowEqualChatChrome);
     const chatView = useControllerSelector(controller, (state) => {
         const activeSessionId = state.sessions.activeSessionId;
         return {
@@ -336,6 +348,15 @@ const ChatPane = React.memo(function ChatPane({ controller, width, height, frame
         chatView.connectionError,
         chatView.connectionMode,
     ]);
+    const chrome = React.useMemo(
+        () => selectChatPaneChrome(selectorState, { width: contentWidth }),
+        [contentWidth, selectorState],
+    );
+    const animatedDots = useAnimatedDots(Boolean(chrome?.animateTitleRight));
+    const animatedTitleRight = React.useMemo(
+        () => appendAnimatedDotsToRuns(chrome?.titleRight, animatedDots),
+        [animatedDots, chrome?.titleRight],
+    );
     const startupError = !chatView.activeSessionId && chatView.connectionError;
     const elements = React.useMemo(() => (startupError
         ? [
@@ -350,6 +371,7 @@ const ChatPane = React.memo(function ChatPane({ controller, width, height, frame
 
     return React.createElement(platform.Panel, {
         title: chrome.title,
+        titleRight: animatedTitleRight,
         color: chrome.color,
         focused: chatView.focused,
         width,
@@ -697,6 +719,7 @@ const InspectorPane = React.memo(function InspectorPane({ controller, width, hei
     const inspectorMeta = useControllerSelector(controller, (state) => ({
         inspectorTab: state.ui.inspectorTab,
         inspectorScroll: state.ui.scroll.inspector,
+        inspectorFollowBottom: state.ui.followBottom?.inspector !== false,
         focused: state.ui.focusRegion === "inspector",
     }), shallowEqualObject);
     if (inspectorMeta.inspectorTab === "files") {
@@ -763,6 +786,7 @@ const ActivityPane = React.memo(function ActivityPane({ controller, width, heigh
             activeSession: activeSessionId ? state.sessions.byId[activeSessionId] || null : null,
             activeHistory: activeSessionId ? state.history.bySessionId.get(activeSessionId) || null : null,
             scroll: state.ui.scroll.activity,
+            followBottom: state.ui.followBottom?.activity !== false,
             focused: state.ui.focusRegion === "activity",
         };
     }, shallowEqualObject);
@@ -791,7 +815,7 @@ const ActivityPane = React.memo(function ActivityPane({ controller, width, heigh
         height,
         lines: activity.lines,
         scrollOffset: activityState.scroll,
-        scrollMode: "bottom",
+        scrollMode: activityState.followBottom ? "bottom" : "top",
         paneId: "activity",
         paneLabel: "Activity",
         frame,
@@ -803,20 +827,30 @@ const PromptBar = React.memo(function PromptBar({ controller, rows }) {
     const promptState = useControllerSelector(controller, (state) => {
         const activeSessionId = state.sessions.activeSessionId;
         const activeSession = activeSessionId ? state.sessions.byId[activeSessionId] || null : null;
+        const outbox = activeSessionId && state.outbox?.bySessionId?.[activeSessionId]
+            ? state.outbox.bySessionId[activeSessionId]
+            : [];
         return {
             prompt: state.ui.prompt,
             promptCursor: state.ui.promptCursor,
             focused: state.ui.focusRegion === "prompt",
             answeringQuestion: Boolean(activeSession?.pendingQuestion?.question),
+            editingPending: state.ui.promptEdit?.sessionId === activeSessionId,
+            hasOutbox: outbox.length > 0,
+            hasPendingOutbox: outbox.some((item) => item?.phase === "pending"),
         };
     }, shallowEqualObject);
     return React.createElement(platform.Input, {
-        label: promptState.answeringQuestion ? "answer" : "you",
+        label: promptState.answeringQuestion ? "answer" : promptState.editingPending ? "pending" : "you",
         value: promptState.prompt,
         cursorIndex: promptState.promptCursor,
         focused: promptState.focused,
         placeholder: promptState.answeringQuestion
             ? "Type an answer and press Enter"
+            : promptState.editingPending
+                ? "Edit pending prompt, Enter sends batch, Esc cancels"
+                : promptState.hasOutbox
+                    ? "Type a message and press Enter to queue it"
             : "Type a message and press Enter",
         rows,
     });
@@ -934,6 +968,60 @@ function ModelPickerModalContainer({ controller }) {
     return React.createElement(ModelPickerModal, { state });
 }
 
+function ReasoningEffortPickerModal({ state }) {
+    const platform = useUiPlatform();
+    const modal = selectReasoningEffortPickerModal(state);
+    if (!modal) return null;
+
+    const viewport = typeof platform.getViewport === "function"
+        ? platform.getViewport()
+        : { width: 120, height: 40 };
+    const width = Math.max(46, Math.min(modal.idealWidth || 64, (viewport.width || 120) - 16));
+    const listHeight = Math.max(7, Math.min(modal.rows.length + 2, 10, (viewport.height || 40) - 16));
+    const detailsHeight = Math.max(6, Math.min(8, (viewport.height || 40) - listHeight - 10));
+    const lines = modal.rows.length > 0
+        ? modal.rows
+        : [{ text: "No reasoning efforts available.", color: "gray" }];
+    const contentRows = Math.max(1, listHeight - 2);
+    const scrollOffset = Math.max(0, modal.selectedRowIndex - Math.floor(contentRows / 2));
+
+    return React.createElement(platform.Overlay, null,
+        React.createElement(platform.Column, { width },
+            React.createElement(platform.Panel, {
+                title: modal.title,
+                color: "cyan",
+                focused: false,
+                width,
+                height: listHeight,
+                lines,
+                scrollOffset,
+                scrollMode: "top",
+                marginBottom: 1,
+                fillColor: "surface",
+            }),
+            React.createElement(platform.Panel, {
+                title: modal.detailsTitle || "Reasoning Details",
+                color: "cyan",
+                focused: false,
+                width,
+                height: detailsHeight,
+                lines: modal.detailsLines,
+                scrollOffset: 0,
+                scrollMode: "top",
+                fillColor: "surface",
+            }),
+        ));
+}
+
+function ReasoningEffortPickerModalContainer({ controller }) {
+    const state = useControllerSelector(controller, (rootState) => ({
+        ui: {
+            modal: rootState.ui.modal,
+        },
+    }), shallowEqualObject);
+    return React.createElement(ReasoningEffortPickerModal, { state });
+}
+
 function SessionAgentPickerModal({ state }) {
     const platform = useUiPlatform();
     const modal = selectSessionAgentPickerModal(state);
@@ -986,6 +1074,64 @@ function SessionAgentPickerModalContainer({ controller }) {
         },
     }), shallowEqualObject);
     return React.createElement(SessionAgentPickerModal, { state });
+}
+
+function SessionOwnerFilterModal({ state }) {
+    const platform = useUiPlatform();
+    const modal = selectSessionOwnerFilterModal(state);
+    if (!modal) return null;
+
+    const viewport = typeof platform.getViewport === "function"
+        ? platform.getViewport()
+        : { width: 120, height: 40 };
+    const width = Math.max(54, Math.min(modal.idealWidth || 76, (viewport.width || 120) - 16));
+    const listHeight = Math.max(8, Math.min(modal.rows.length + 2, 14, (viewport.height || 40) - 16));
+    const detailsHeight = Math.max(7, Math.min(9, (viewport.height || 40) - listHeight - 10));
+    const lines = modal.rows.length > 0
+        ? modal.rows
+        : [{ text: "No session filters available.", color: "gray" }];
+    const contentRows = Math.max(1, listHeight - 2);
+    const scrollOffset = Math.max(0, modal.selectedRowIndex - Math.floor(contentRows / 2));
+
+    return React.createElement(platform.Overlay, null,
+        React.createElement(platform.Column, { width },
+            React.createElement(platform.Panel, {
+                title: modal.title,
+                color: "cyan",
+                focused: false,
+                width,
+                height: listHeight,
+                lines,
+                scrollOffset,
+                scrollMode: "top",
+                marginBottom: 1,
+                fillColor: "surface",
+            }),
+            React.createElement(platform.Panel, {
+                title: modal.detailsTitle || "Session Filter",
+                color: "cyan",
+                focused: false,
+                width,
+                height: detailsHeight,
+                lines: modal.detailsLines,
+                scrollOffset: 0,
+                scrollMode: "top",
+                fillColor: "surface",
+            }),
+        ));
+}
+
+function SessionOwnerFilterModalContainer({ controller }) {
+    const state = useControllerSelector(controller, (rootState) => ({
+        auth: rootState.auth,
+        sessions: {
+            ownerFilter: rootState.sessions.ownerFilter,
+        },
+        ui: {
+            modal: rootState.ui.modal,
+        },
+    }), shallowEqualObject);
+    return React.createElement(SessionOwnerFilterModal, { state });
 }
 
 function RenameSessionModal({ state }) {
@@ -1395,6 +1541,179 @@ function ConfirmModalContainer({ controller }) {
     return React.createElement(ConfirmModal, { state });
 }
 
+function formatAdminPrincipalLabelTui(principal) {
+    if (!principal) return "Unknown user";
+    const name = String(principal.displayName || "").trim();
+    const email = String(principal.email || "").trim();
+    if (name && email && name.toLowerCase() !== email.toLowerCase()) return `${name} <${email}>`;
+    if (name) return name;
+    if (email) return email;
+    const provider = String(principal.provider || "").trim();
+    const subject = String(principal.subject || "").trim();
+    return [provider, subject].filter(Boolean).join(":") || "user";
+}
+
+function buildAdminConsoleLines(view) {
+    const lines = [];
+    lines.push([
+        { text: "Signed in as ", color: "gray" },
+        { text: formatAdminPrincipalLabelTui(view.principal), color: "white", bold: true },
+    ]);
+    if (view.principal?.provider || view.principal?.subject) {
+        lines.push([
+            { text: "Principal     ", color: "gray" },
+            { text: `${view.principal?.provider || "?"}:${view.principal?.subject || "?"}`, color: "gray" },
+        ]);
+    }
+    lines.push([{ text: "", color: "gray" }]);
+
+    if (view.loadError) {
+        lines.push([{ text: `! ${view.loadError}`, color: "red", bold: true }]);
+        lines.push([{ text: "", color: "gray" }]);
+    }
+
+    lines.push([{ text: "GitHub Copilot key", color: "cyan", bold: true }]);
+    lines.push([
+        { text: "Status  ", color: "gray" },
+        {
+            text: view.ghcpKey.configured ? "configured (overrides env GITHUB_TOKEN)" : "not configured (env GITHUB_TOKEN fallback)",
+            color: view.ghcpKey.configured ? "green" : "yellow",
+        },
+    ]);
+    lines.push([
+        { text: "        ", color: "gray" },
+        { text: view.ghcpKey.statusText, color: view.ghcpKey.error ? "red" : "gray" },
+    ]);
+    lines.push([{ text: "", color: "gray" }]);
+
+    lines.push([{ text: "Actions", color: "cyan", bold: true }]);
+    if (view.ghcpKey.editing) {
+        lines.push([
+            { text: " Enter ", color: "green", bold: true },
+            { text: "save  ", color: "gray" },
+            { text: "Esc ", color: "red", bold: true },
+            { text: "cancel", color: "gray" },
+        ]);
+    } else {
+        lines.push([
+            { text: " e ", color: "green", bold: true },
+            { text: view.ghcpKey.configured ? "replace key  " : "set key  ", color: "gray" },
+            ...(view.ghcpKey.configured
+                ? [{ text: "c ", color: "yellow", bold: true }, { text: "clear key  ", color: "gray" }]
+                : []),
+            { text: "r ", color: "cyan", bold: true },
+            { text: view.loading ? "refreshing..." : "refresh", color: "gray" },
+        ]);
+        lines.push([
+            { text: " Esc ", color: "red", bold: true },
+            { text: "close console and return to workspace", color: "gray" },
+        ]);
+    }
+
+    return lines;
+}
+
+function AdminConsolePanel({ controller, width, height, frame }) {
+    const platform = useUiPlatform();
+    const view = useControllerSelector(controller, selectAdminConsole, shallowEqualObject);
+    const lines = React.useMemo(() => buildAdminConsoleLines(view), [view]);
+    return React.createElement(platform.Panel, {
+        title: "Admin Console",
+        color: "cyan",
+        focused: true,
+        width,
+        height,
+        lines,
+        scrollOffset: 0,
+        scrollMode: "top",
+        frame,
+        fillColor: "surface",
+    });
+}
+
+function AdminGhcpKeyEditorModal({ state }) {
+    const platform = useUiPlatform();
+    const modal = selectAdminGhcpKeyEditorModal(state);
+    if (!modal) return null;
+
+    const viewport = typeof platform.getViewport === "function"
+        ? platform.getViewport()
+        : { width: 120, height: 40 };
+    const width = Math.max(56, Math.min(modal.idealWidth || 72, (viewport.width || 120) - 12));
+    const detailsHeight = Math.max(5, Math.min(6, (modal.detailsLines?.length || 0) + 2, (viewport.height || 40) - 14));
+    const helpHeight = Math.max(7, Math.min(8, (viewport.height || 40) - detailsHeight - 8));
+
+    const statusLines = [];
+    if (modal.error) {
+        statusLines.push([{ text: `! ${modal.error}`, color: "red", bold: true }]);
+    } else if (modal.saving) {
+        statusLines.push([{ text: "Saving...", color: "yellow" }]);
+    }
+
+    return React.createElement(platform.Overlay, null,
+        React.createElement(platform.Column, { width },
+            React.createElement(platform.Panel, {
+                title: modal.title,
+                color: "cyan",
+                focused: false,
+                width,
+                height: detailsHeight,
+                lines: modal.detailsLines,
+                scrollOffset: 0,
+                scrollMode: "top",
+                marginBottom: 1,
+                fillColor: "surface",
+            }),
+            React.createElement(platform.Input, {
+                label: "key",
+                // Render a masked value so on-screen viewers cannot
+                // capture the secret. The cursor index is preserved as-is
+                // because the masked length matches the source length.
+                value: modal.displayValue,
+                cursorIndex: modal.cursorIndex,
+                focused: !modal.saving,
+                placeholder: modal.placeholder,
+                rows: 1,
+                readOnly: modal.saving,
+            }),
+            statusLines.length > 0
+                ? React.createElement(platform.Panel, {
+                    title: "Status",
+                    color: modal.error ? "red" : "yellow",
+                    focused: false,
+                    width,
+                    height: 3,
+                    lines: statusLines,
+                    scrollOffset: 0,
+                    scrollMode: "top",
+                    marginBottom: 1,
+                    fillColor: "surface",
+                })
+                : null,
+            React.createElement(platform.Panel, {
+                title: modal.helpTitle || "Help",
+                color: "cyan",
+                focused: false,
+                width,
+                height: helpHeight,
+                lines: modal.helpLines,
+                scrollOffset: 0,
+                scrollMode: "top",
+                fillColor: "surface",
+            }),
+        ));
+}
+
+function AdminGhcpKeyEditorModalContainer({ controller }) {
+    // Project the slice this overlay actually depends on so the modal
+    // does not re-render on unrelated state churn (orchestration events,
+    // skill usage, etc.).
+    const state = useControllerSelector(controller, (rootState) => ({
+        admin: rootState.admin,
+    }), shallowEqualObject);
+    return React.createElement(AdminGhcpKeyEditorModal, { state });
+}
+
 export function SharedPilotSwarmApp({ controller, versionLabel = null }) {
     const platform = useUiPlatform();
     const layoutState = useControllerSelector(controller, (state) => ({
@@ -1406,11 +1725,13 @@ export function SharedPilotSwarmApp({ controller, versionLabel = null }) {
         themeId: state.ui.themeId,
         viewportWidth: state.ui.layout?.viewportWidth ?? 120,
         viewportHeight: state.ui.layout?.viewportHeight ?? 40,
+        adminVisible: Boolean(state.admin?.visible),
+        adminEditing: Boolean(state.admin?.ghcpKey?.editing),
     }), shallowEqualObject);
     const viewportWidth = layoutState.viewportWidth;
     const viewportHeight = layoutState.viewportHeight;
     const layout = React.useMemo(
-        () => computeLegacyLayout({ width: viewportWidth, height: viewportHeight }, layoutState.paneAdjust, layoutState.promptRows, 0, layoutState.fullscreenPane),
+        () => computeLegacyLayout({ width: viewportWidth, height: viewportHeight }, layoutState.paneAdjust, layoutState.promptRows, 0, 0, layoutState.fullscreenPane),
         [layoutState.fullscreenPane, layoutState.paneAdjust, layoutState.promptRows, viewportHeight, viewportWidth],
     );
     const frames = buildWorkspacePaneFrames(layout);
@@ -1436,7 +1757,14 @@ export function SharedPilotSwarmApp({ controller, versionLabel = null }) {
 
     return React.createElement(platform.Root, null,
         React.createElement(platform.Row, { flexGrow: 1 },
-            filesFullscreenActive
+            layoutState.adminVisible
+                ? React.createElement(AdminConsolePanel, {
+                    controller,
+                    width: layout.totalWidth,
+                    height: workspaceHeight,
+                    frame: frames.fullscreenPane,
+                })
+                : filesFullscreenActive
                 ? React.createElement(FilesBrowser, {
                     controller,
                     width: layout.totalWidth,
@@ -1493,13 +1821,13 @@ export function SharedPilotSwarmApp({ controller, versionLabel = null }) {
                         }),
                     ),
                     !layout.rightHidden && React.createElement(platform.Column, { key: "right", width: layout.rightWidth, flexGrow: 0 },
-                        React.createElement(InspectorPane, {
+                        !layout.inspectorHidden && React.createElement(InspectorPane, {
                             controller,
                             width: layout.rightWidth,
                             height: layout.inspectorPaneHeight,
                             frame: frames.inspector,
                         }),
-                        React.createElement(ActivityPane, {
+                        !layout.activityHidden && React.createElement(ActivityPane, {
                             controller,
                             width: layout.rightWidth,
                             height: layout.activityPaneHeight,
@@ -1515,11 +1843,14 @@ export function SharedPilotSwarmApp({ controller, versionLabel = null }) {
         React.createElement(ArtifactUploadModalContainer, { controller }),
         React.createElement(ArtifactPickerModalContainer, { controller }),
         React.createElement(ModelPickerModalContainer, { controller }),
+        React.createElement(ReasoningEffortPickerModalContainer, { controller }),
         React.createElement(ThemePickerModalContainer, { controller }),
         React.createElement(SessionAgentPickerModalContainer, { controller }),
+        React.createElement(SessionOwnerFilterModalContainer, { controller }),
         React.createElement(LogFilterModalContainer, { controller }),
         React.createElement(FilesFilterModalContainer, { controller }),
         React.createElement(HistoryFormatModalContainer, { controller }),
         React.createElement(ConfirmModalContainer, { controller }),
+        React.createElement(AdminGhcpKeyEditorModalContainer, { controller }),
     );
 }

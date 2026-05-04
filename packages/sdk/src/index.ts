@@ -38,7 +38,7 @@ export { SessionBlobStore } from "./blob-store.js";
 export { FilesystemSessionStore, FilesystemArtifactStore } from "./session-store.js";
 export { PgFactStore, createFactStoreForUrl } from "./facts-store.js";
 export { PgSessionCatalogProvider, computeCacheHitRatio, buildPgGuardrailConfig } from "./cms.js";
-export type { SessionCatalogProvider, SessionRow, SessionPageCursor, SessionPage, SessionRowUpdates, SessionEvent, SessionMetricSummary, SessionMetricSummaryUpsert, FleetStats, SessionTreeStats, SkillKind, SkillUsageRow, SessionTreeSkillUsage, FleetSkillUsageRow, FleetSkillUsage, InsertTurnMetricInput, TurnMetricRow, FleetTurnAnalyticsRow, HourlyTokenBucketRow, DbCallMetricBucketInput, FleetDbCallMetricRow, TopEventEmitterRow } from "./cms.js";
+export type { SessionCatalogProvider, SessionRow, SessionPageCursor, SessionPage, SessionRowUpdates, SessionEvent, SessionMetricSummary, SessionMetricSummaryUpsert, FleetStats, SessionTreeStats, SkillKind, SkillUsageRow, SessionTreeSkillUsage, FleetSkillUsageRow, FleetSkillUsage, InsertTurnMetricInput, TurnMetricRow, FleetTurnAnalyticsRow, HourlyTokenBucketRow, DbCallMetricBucketInput, FleetDbCallMetricRow, TopEventEmitterRow, UserStats, UserStatsBucket, UserStatsModelBucket, UserStatsOwnerKind, UserProfile, UserPrincipal } from "./cms.js";
 export { globalDbMetrics } from "./db-metrics.js";
 export type { DbMetricsSnapshot } from "./db-metrics.js";
 export { estimateCostUsd, MODEL_PRICING } from "./model-pricing.js";
@@ -52,7 +52,7 @@ export type {
     FactsStatsRow,
     FactsNamespace,
 } from "./facts-store.js";
-export type { SessionStateStore, SessionMetadata, ArtifactStore } from "./session-store.js";
+export type { SessionStateStore, SessionMetadata, ArtifactStore, ArtifactMetadata, ArtifactDownloadResult, ArtifactUploadOptions, ArtifactEncoding, ArtifactSource } from "./session-store.js";
 export type {
     PilotSwarmClientOptions,
     PilotSwarmWorkerOptions,
@@ -77,6 +77,7 @@ export type {
     PromptGuardrailVerdict,
     PromptGuardrailDecision,
     PromptGuardrailConfig,
+    SessionOwnerInfo,
 } from "./types.js";
 
 export {
@@ -106,7 +107,7 @@ export { createInspectTools } from "./inspect-tools.js";
 export { createResourceManagerTools } from "./resourcemgr-tools.js";
 // Model providers
 export { loadModelProviders, ModelProviderRegistry } from "./model-providers.js";
-export type { ModelEntry, ModelDescriptor, ModelProviderConfig, ModelProvidersFile, ResolvedProvider } from "./model-providers.js";
+export type { ModelEntry, ModelDescriptor, ModelProviderConfig, ModelProvidersFile, ResolvedProvider, ReasoningEffort } from "./model-providers.js";
 export { composeSystemPrompt, extractPromptContent, mergePromptSections } from "./prompt-layering.js";
 export type { PromptLayeringKind } from "./prompt-layering.js";
 
@@ -162,6 +163,9 @@ export type { SloThresholds } from "./slo-config.js";
 export { evaluateSloHealth, decideSloAction } from "./slo-policy.js";
 export type { SloStatus, SloViolation, SloHealthReport, SloAction } from "./slo-policy.js";
 export { createSloTools } from "./slo-tools.js";
+
+// Session ownership
+export { LOCAL_DEFAULT_USER_PRINCIPAL } from "./session-owner-utils.js";
 
 // Re-export defineTool from Copilot SDK for convenience
 export { defineTool } from "@github/copilot-sdk";

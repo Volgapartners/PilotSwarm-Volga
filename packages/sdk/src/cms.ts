@@ -10,6 +10,7 @@
 
 import { runCmsMigrations } from "./cms-migrator.js";
 import { globalDbMetrics } from "./db-metrics.js";
+import type { SessionOwnerInfo } from "./types.js";
 
 // ─── Types ───────────────────────────────────────────────────────
 
@@ -47,6 +48,10 @@ export interface SessionRow {
     agentId: string | null;
     /** Splash banner (terminal markup) from the agent definition. */
     splash: string | null;
+    /** Reasoning effort level set for this session. */
+    reasoningEffort: string | null;
+    /** Authenticated user associated with this session, if any. */
+    owner: SessionOwnerInfo | null;
 }
 
 /** Opaque cursor for keyset-paginated session listing. */
@@ -78,6 +83,8 @@ export interface SessionRowUpdates {
     isSystem?: boolean;
     agentId?: string | null;
     splash?: string | null;
+    reasoningEffort?: string | null;
+    owner?: SessionOwnerInfo | null;
 }
 
 // ─── Session Metric Summary Types ────────────────────────────────
@@ -87,6 +94,7 @@ export interface SessionMetricSummary {
     sessionId: string;
     agentId: string | null;
     model: string | null;
+    reasoningEffort: string | null;
     parentSessionId: string | null;
     snapshotSizeBytes: number;
     dehydrationCount: number;
@@ -256,6 +264,73 @@ export interface FleetSkillUsageRow extends SkillUsageRow {
 export interface FleetSkillUsage {
     windowStart: number | null;
     rows: FleetSkillUsageRow[];
+}
+
+// ─── User Stats & Profile Types ──────────────────────────────────
+
+export type UserStatsOwnerKind = "user" | "system" | "unowned";
+
+export interface UserStatsModelBucket {
+    model: string | null;
+    sessionIds: string[];
+    sessionCount: number;
+    totalSnapshotSizeBytes: number;
+    totalDehydrationCount: number;
+    totalHydrationCount: number;
+    totalLossyHandoffCount: number;
+    totalTokensInput: number;
+    totalTokensOutput: number;
+    totalTokensCacheRead: number;
+    totalTokensCacheWrite: number;
+    cacheHitRatio: number | null;
+}
+
+export interface UserStatsBucket {
+    ownerKind: UserStatsOwnerKind;
+    owner: SessionOwnerInfo | null;
+    sessionIds: string[];
+    sessionCount: number;
+    totalSnapshotSizeBytes: number;
+    totalTokensInput: number;
+    totalTokensOutput: number;
+    totalTokensCacheRead: number;
+    totalTokensCacheWrite: number;
+    cacheHitRatio: number | null;
+    byModel: UserStatsModelBucket[];
+}
+
+export interface UserStats {
+    windowStart: number | null;
+    earliestSessionCreatedAt: number | null;
+    users: UserStatsBucket[];
+    totals: {
+        sessionCount: number;
+        totalSnapshotSizeBytes: number;
+        totalTokensInput: number;
+        totalTokensOutput: number;
+        totalTokensCacheRead: number;
+        totalTokensCacheWrite: number;
+        cacheHitRatio: number | null;
+    };
+}
+
+export interface UserProfile {
+    userId: number;
+    provider: string;
+    subject: string;
+    email: string | null;
+    displayName: string | null;
+    profileSettings: Record<string, unknown>;
+    githubCopilotKeySet: boolean;
+    createdAt: Date | null;
+    updatedAt: Date | null;
+}
+
+export interface UserPrincipal {
+    provider: string;
+    subject: string;
+    email?: string | null;
+    displayName?: string | null;
 }
 
 // ─── Turn Metrics + DB Bucket Types (Phase 2) ────────────────────
@@ -462,6 +537,23 @@ export interface SessionCatalogProvider {
     /** Top (worker_node_id, event_type) pairs by event count within the given window. */
     getTopEventEmitters(params: { since: Date; limit?: number }): Promise<TopEventEmitterRow[]>;
 
+    // ── User Stats & Profiles ─────────────────────────────────
+
+    /** Get fleet-wide token usage stats grouped by owner. */
+    getUserStats(opts?: { includeDeleted?: boolean; since?: Date }): Promise<UserStats>;
+
+    /** Get or create a user profile by principal. Returns null if not found. */
+    getUserProfile(principal: UserPrincipal): Promise<UserProfile | null>;
+
+    /** Get the GitHub Copilot API key for a user principal. Returns null if not set. */
+    getUserGitHubCopilotKey(principal: UserPrincipal): Promise<string | null>;
+
+    /** Update a user's profile settings. Returns the updated profile. */
+    setUserProfileSettings(principal: UserPrincipal, settings: Record<string, unknown>): Promise<UserProfile>;
+
+    /** Set or clear a user's GitHub Copilot API key. Returns the updated profile. */
+    setUserGitHubCopilotKey(principal: UserPrincipal, key: string | null): Promise<UserProfile>;
+
     /** Cleanup / close connections. */
     close(): Promise<void>;
 }
@@ -587,6 +679,11 @@ function sqlForSchema(schema: string) {
             upsertDbCallMetricBucketBatch:    `${s}.cms_upsert_db_call_metric_bucket_batch`,
             getFleetDbCallMetrics:            `${s}.cms_get_fleet_db_call_metrics`,
             getTopEventEmitters:              `${s}.cms_get_top_event_emitters`,
+            getUserStatsByModel:              `${s}.cms_get_user_stats_by_model`,
+            getUserProfile:                   `${s}.cms_get_user_profile`,
+            getUserGitHubCopilotKey:          `${s}.cms_get_user_github_copilot_key`,
+            setUserProfileSettings:           `${s}.cms_set_user_profile_settings`,
+            setUserGitHubCopilotKey:          `${s}.cms_set_user_github_copilot_key`,
         },
     };
 }
@@ -620,11 +717,15 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
     }
 
     /** Factory: create and connect a PgSessionCatalogProvider. */
-    static async create(connectionString: string, schema?: string): Promise<PgSessionCatalogProvider> {
+    static async create(
+        connectionString: string,
+        schema?: string,
+        env: Record<string, string | undefined> = process.env,
+    ): Promise<PgSessionCatalogProvider> {
         const { default: pg } = await import("pg");
 
         const pool = new pg.Pool({
-            ...buildPgGuardrailConfig(),
+            ...buildPgGuardrailConfig(env),
             ...buildPgConnectionConfig(connectionString),
         });
 
@@ -944,6 +1045,120 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
         });
     }
 
+    async getUserStats(opts?: { includeDeleted?: boolean; since?: Date }): Promise<UserStats> {
+        const includeDeleted = opts?.includeDeleted ?? false;
+        const since = opts?.since ?? null;
+        const { rows } = await this.pool.query(
+            `SELECT * FROM ${this.sql.fn.getUserStatsByModel}($1, $2)`,
+            [includeDeleted, since],
+        );
+        const byOwner = new Map<string, UserStatsBucket>();
+        let earliestSessionCreatedAt: number | null = null;
+        const totals = {
+            sessionCount: 0, totalSnapshotSizeBytes: 0,
+            totalTokensInput: 0, totalTokensOutput: 0, totalTokensCacheRead: 0, totalTokensCacheWrite: 0,
+            cacheHitRatio: null as number | null,
+        };
+        for (const row of rows) {
+            const ownerKind = normalizeOwnerKind(row.owner_kind);
+            const owner = ownerKind === "user" && row.owner_provider && row.owner_subject
+                ? { provider: row.owner_provider, subject: row.owner_subject, email: row.owner_email ?? null, displayName: row.owner_display_name ?? null }
+                : null;
+            const ownerKey = userStatsOwnerKey(ownerKind, owner);
+            const sessionIds = Array.isArray(row.session_ids)
+                ? row.session_ids.map((id: unknown) => String(id || "")).filter(Boolean) : [];
+            const tokensInput = Number(row.total_tokens_input) || 0;
+            const tokensCacheRead = Number(row.total_tokens_cache_read) || 0;
+            const modelBucket: UserStatsModelBucket = {
+                model: row.model ?? null, sessionIds, sessionCount: Number(row.session_count) || 0,
+                totalSnapshotSizeBytes: Number(row.total_snapshot_size_bytes) || 0,
+                totalDehydrationCount: Number(row.total_dehydration_count) || 0,
+                totalHydrationCount: Number(row.total_hydration_count) || 0,
+                totalLossyHandoffCount: Number(row.total_lossy_handoff_count) || 0,
+                totalTokensInput: tokensInput, totalTokensOutput: Number(row.total_tokens_output) || 0,
+                totalTokensCacheRead: tokensCacheRead, totalTokensCacheWrite: Number(row.total_tokens_cache_write) || 0,
+                cacheHitRatio: computeCacheHitRatio(tokensInput, tokensCacheRead),
+            };
+            let bucket = byOwner.get(ownerKey);
+            if (!bucket) {
+                bucket = { ownerKind, owner, sessionIds: [], sessionCount: 0, totalSnapshotSizeBytes: 0,
+                    totalTokensInput: 0, totalTokensOutput: 0,
+                    totalTokensCacheRead: 0, totalTokensCacheWrite: 0, cacheHitRatio: null, byModel: [] };
+                byOwner.set(ownerKey, bucket);
+            }
+            bucket.byModel.push(modelBucket);
+            bucket.sessionIds.push(...sessionIds);
+            bucket.sessionCount += modelBucket.sessionCount;
+            bucket.totalSnapshotSizeBytes += modelBucket.totalSnapshotSizeBytes;
+            bucket.totalTokensInput += modelBucket.totalTokensInput;
+            bucket.totalTokensOutput += modelBucket.totalTokensOutput;
+            bucket.totalTokensCacheRead += modelBucket.totalTokensCacheRead;
+            bucket.totalTokensCacheWrite += modelBucket.totalTokensCacheWrite;
+            totals.sessionCount += modelBucket.sessionCount;
+            totals.totalSnapshotSizeBytes += modelBucket.totalSnapshotSizeBytes;
+            totals.totalTokensInput += modelBucket.totalTokensInput;
+            totals.totalTokensOutput += modelBucket.totalTokensOutput;
+            totals.totalTokensCacheRead += modelBucket.totalTokensCacheRead;
+            totals.totalTokensCacheWrite += modelBucket.totalTokensCacheWrite;
+            if (row.earliest_session_created_at) {
+                const ts = new Date(row.earliest_session_created_at).getTime();
+                if (Number.isFinite(ts) && (earliestSessionCreatedAt == null || ts < earliestSessionCreatedAt))
+                    earliestSessionCreatedAt = ts;
+            }
+        }
+        const users = Array.from(byOwner.values()).map((bucket) => ({
+            ...bucket, sessionIds: [...new Set(bucket.sessionIds)],
+            cacheHitRatio: computeCacheHitRatio(bucket.totalTokensInput, bucket.totalTokensCacheRead),
+            byModel: bucket.byModel.sort((a, b) => (b.totalTokensInput - a.totalTokensInput) || String(a.model || "").localeCompare(String(b.model || ""))),
+        })).sort((a, b) => (b.totalTokensInput - a.totalTokensInput) || (b.totalSnapshotSizeBytes - a.totalSnapshotSizeBytes) || userStatsOwnerLabel(a).localeCompare(userStatsOwnerLabel(b)));
+        return { windowStart: opts?.since ? opts.since.getTime() : null, earliestSessionCreatedAt, users,
+            totals: { ...totals, cacheHitRatio: computeCacheHitRatio(totals.totalTokensInput, totals.totalTokensCacheRead) } };
+    }
+
+    async getUserProfile(principal: UserPrincipal): Promise<UserProfile | null> {
+        const provider = principal?.provider?.trim();
+        const subject = principal?.subject?.trim();
+        if (!provider || !subject) return null;
+        const { rows } = await this.pool.query(`SELECT * FROM ${this.sql.fn.getUserProfile}($1, $2)`, [provider, subject]);
+        if (rows.length === 0) return null;
+        return rowToUserProfile(rows[0]);
+    }
+
+    async getUserGitHubCopilotKey(principal: UserPrincipal): Promise<string | null> {
+        const provider = principal?.provider?.trim();
+        const subject = principal?.subject?.trim();
+        if (!provider || !subject) return null;
+        const { rows } = await this.pool.query(`SELECT ${this.sql.fn.getUserGitHubCopilotKey}($1, $2) AS key`, [provider, subject]);
+        const raw = rows[0]?.key;
+        if (raw == null) return null;
+        const text = String(raw);
+        return text.length === 0 ? null : text;
+    }
+
+    async setUserProfileSettings(principal: UserPrincipal, settings: Record<string, unknown>): Promise<UserProfile> {
+        const provider = principal?.provider?.trim();
+        const subject = principal?.subject?.trim();
+        if (!provider || !subject) throw new Error("setUserProfileSettings: provider and subject are required");
+        const safeSettings = settings && typeof settings === "object" && !Array.isArray(settings) ? settings : {};
+        await this.pool.query(`SELECT ${this.sql.fn.setUserProfileSettings}($1, $2, $3, $4, $5::jsonb)`,
+            [provider, subject, principal.email ?? null, principal.displayName ?? null, JSON.stringify(safeSettings)]);
+        const profile = await this.getUserProfile(principal);
+        if (!profile) throw new Error("setUserProfileSettings: failed to read back the user profile after write");
+        return profile;
+    }
+
+    async setUserGitHubCopilotKey(principal: UserPrincipal, key: string | null): Promise<UserProfile> {
+        const provider = principal?.provider?.trim();
+        const subject = principal?.subject?.trim();
+        if (!provider || !subject) throw new Error("setUserGitHubCopilotKey: provider and subject are required");
+        const normalized = typeof key === "string" && key.trim().length > 0 ? key.trim() : null;
+        await this.pool.query(`SELECT ${this.sql.fn.setUserGitHubCopilotKey}($1, $2, $3, $4, $5)`,
+            [provider, subject, principal.email ?? null, principal.displayName ?? null, normalized]);
+        const profile = await this.getUserProfile(principal);
+        if (!profile) throw new Error("setUserGitHubCopilotKey: failed to read back the user profile after write");
+        return profile;
+    }
+
     async upsertSessionMetricSummary(sessionId: string, updates: SessionMetricSummaryUpsert): Promise<void> {
         return measureDbCall("cms.upsertSessionMetricSummary", async () => {
             await this.pool.query(
@@ -1181,6 +1396,15 @@ function rowToSessionRow(row: any): SessionRow {
         isSystem: row.is_system ?? false,
         agentId: row.agent_id ?? null,
         splash: row.splash ?? null,
+        reasoningEffort: row.reasoning_effort ?? null,
+        owner: row.owner_provider && row.owner_subject
+            ? {
+                provider: row.owner_provider,
+                subject: row.owner_subject,
+                email: row.owner_email ?? null,
+                displayName: row.owner_display_name ?? null,
+            }
+            : null,
     };
 }
 
@@ -1204,6 +1428,7 @@ function rowToSessionMetricSummary(row: any): SessionMetricSummary {
         sessionId: row.session_id,
         agentId: row.agent_id ?? null,
         model: row.model ?? null,
+        reasoningEffort: row.reasoning_effort ?? null,
         parentSessionId: row.parent_session_id ?? null,
         snapshotSizeBytes: Number(row.snapshot_size_bytes) || 0,
         dehydrationCount: Number(row.dehydration_count) || 0,
@@ -1239,6 +1464,49 @@ function rowToSkillUsageRow(row: any): SkillUsageRow {
         invocations: Number(row.invocations) || 0,
         firstUsedAt: new Date(row.first_used_at ?? row.last_used_at),
         lastUsedAt: new Date(row.last_used_at),
+    };
+}
+
+function normalizeOwnerKind(value: unknown): UserStatsOwnerKind {
+    return value === "system" || value === "unowned" ? value : "user";
+}
+
+function userStatsOwnerKey(ownerKind: UserStatsOwnerKind, owner: SessionOwnerInfo | null): string {
+    if (ownerKind !== "user") return ownerKind;
+    return `${owner?.provider || ""}${owner?.subject || ""}`;
+}
+
+function userStatsOwnerLabel(bucket: { ownerKind: UserStatsOwnerKind; owner: SessionOwnerInfo | null }): string {
+    if (bucket.ownerKind === "system") return "system";
+    if (bucket.ownerKind === "unowned") return "unowned";
+    return String(bucket.owner?.displayName || bucket.owner?.email || bucket.owner?.subject || "user");
+}
+
+function rowToUserProfile(row: any): UserProfile {
+    let parsedSettings: Record<string, unknown> = {};
+    const rawSettings = row?.profile_settings;
+    if (rawSettings && typeof rawSettings === "object" && !Array.isArray(rawSettings)) {
+        parsedSettings = rawSettings as Record<string, unknown>;
+    } else if (typeof rawSettings === "string" && rawSettings.length > 0) {
+        try {
+            const parsed = JSON.parse(rawSettings);
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                parsedSettings = parsed as Record<string, unknown>;
+            }
+        } catch {
+            parsedSettings = {};
+        }
+    }
+    return {
+        userId: Number(row.user_id) || 0,
+        provider: String(row.provider ?? ""),
+        subject: String(row.subject ?? ""),
+        email: row.email ?? null,
+        displayName: row.display_name ?? null,
+        profileSettings: parsedSettings,
+        githubCopilotKeySet: Boolean(row.github_copilot_key_set),
+        createdAt: row.created_at ? new Date(row.created_at) : null,
+        updatedAt: row.updated_at ? new Date(row.updated_at) : null,
     };
 }
 

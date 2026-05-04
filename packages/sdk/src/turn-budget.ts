@@ -239,8 +239,11 @@ export function applyAssistantOutputBudget(
     if (config.assistantOutputHardBudgetChars <= 0 || originalChars <= config.assistantOutputHardBudgetChars) {
         return { originalChars, effectiveChars: originalChars, trimmed: false, text: value };
     }
-    const text = smartTruncate(value, config.assistantOutputHardBudgetChars, "Response");
-    return { originalChars, effectiveChars: text.length, trimmed: true, text };
+    return trimToBudget(
+        value,
+        config.assistantOutputHardBudgetChars,
+        ASSISTANT_OUTPUT_TRUNCATION_NOTICE,
+    );
 }
 
 /** Number of turns that hit a soft or hard budget limit since process start. */

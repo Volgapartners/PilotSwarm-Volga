@@ -1,5 +1,6 @@
 import type { Tool, SessionConfig } from "@github/copilot-sdk";
 import type { SessionStateStore, ArtifactStore } from "./session-store.js";
+import type { ReasoningEffort } from "./model-providers.js";
 
 export const SESSION_STATE_MISSING_PREFIX = "SESSION_STATE_MISSING:";
 
@@ -11,11 +12,11 @@ export type TurnAction =
     | { type: "cron"; action: "set"; intervalSeconds: number; reason: string; events?: CapturedEvent[] }
     | { type: "cron"; action: "cancel"; events?: CapturedEvent[] }
     | { type: "input_required"; question: string; choices?: string[]; allowFreeform?: boolean; events?: CapturedEvent[] }
-    | { type: "spawn_agent"; task: string; model?: string; systemMessage?: string | { mode: "append" | "replace"; content: string }; toolNames?: string[]; agentName?: string; title?: string; content?: string; events?: CapturedEvent[] }
+    | { type: "spawn_agent"; task: string; model?: string; reasoningEffort?: ReasoningEffort; systemMessage?: string | { mode: "append" | "replace"; content: string }; toolNames?: string[]; agentName?: string; title?: string; content?: string; events?: CapturedEvent[] }
     | { type: "message_agent"; agentId: string; message: string; events?: CapturedEvent[] }
     | { type: "check_agents"; events?: CapturedEvent[] }
     | { type: "wait_for_agents"; agentIds: string[]; events?: CapturedEvent[] }
-    | { type: "list_sessions"; events?: CapturedEvent[] }
+    | { type: "list_sessions"; includeSystem?: boolean; ownerQuery?: string; ownerKind?: string; events?: CapturedEvent[] }
     | { type: "complete_agent"; agentId: string; events?: CapturedEvent[] }
     | { type: "cancel_agent"; agentId: string; reason?: string; events?: CapturedEvent[] }
     | { type: "delete_agent"; agentId: string; reason?: string; events?: CapturedEvent[] };
@@ -60,11 +61,11 @@ export type TurnResult =
     | ({ type: "cron"; action: "set"; intervalSeconds: number; reason: string; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
     | ({ type: "cron"; action: "cancel"; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
     | ({ type: "input_required"; question: string; choices?: string[]; allowFreeform?: boolean; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
-    | ({ type: "spawn_agent"; task: string; model?: string; systemMessage?: string | { mode: "append" | "replace"; content: string }; toolNames?: string[]; agentName?: string; title?: string; content?: string; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
+    | ({ type: "spawn_agent"; task: string; model?: string; reasoningEffort?: ReasoningEffort; systemMessage?: string | { mode: "append" | "replace"; content: string }; toolNames?: string[]; agentName?: string; title?: string; content?: string; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
     | ({ type: "message_agent"; agentId: string; message: string; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
     | ({ type: "check_agents"; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
     | ({ type: "wait_for_agents"; agentIds: string[]; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
-    | ({ type: "list_sessions"; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
+    | ({ type: "list_sessions"; includeSystem?: boolean; ownerQuery?: string; ownerKind?: string; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
     | ({ type: "complete_agent"; agentId: string; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
     | ({ type: "cancel_agent"; agentId: string; reason?: string; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
     | ({ type: "delete_agent"; agentId: string; reason?: string; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
@@ -96,6 +97,7 @@ export interface TurnOptions {
             agent_name?: string;
             task?: string;
             model?: string;
+            reasoning_effort?: ReasoningEffort;
             system_message?: string;
             tool_names?: string[];
             title?: string;
@@ -103,7 +105,11 @@ export interface TurnOptions {
         messageAgent(args: { agent_id: string; message: string }): Promise<string>;
         checkAgents(): Promise<string>;
         resolveWaitForAgents(agentIds?: string[]): Promise<string[]>;
-        listSessions(): Promise<string>;
+        listSessions(args?: {
+            include_system?: boolean;
+            owner_query?: string;
+            owner_kind?: string;
+        }): Promise<string>;
         completeAgent(args: { agent_id: string }): Promise<string>;
         cancelAgent(args: { agent_id: string; reason?: string }): Promise<string>;
         deleteAgent(args: { agent_id: string; reason?: string }): Promise<string>;
@@ -117,6 +123,7 @@ export interface TurnOptions {
 /** Serializable config — travels through duroxide (no functions). */
 export interface SerializableSessionConfig {
     model?: string;
+    reasoningEffort?: ReasoningEffort;
     systemMessage?: string | { mode: "append" | "replace"; content: string };
     /** Internal: orchestration-generated system guidance for the next turn only. */
     turnSystemPrompt?: string;
@@ -240,6 +247,15 @@ export interface PilotSwarmSessionInfo {
 export interface CronSchedule {
     intervalSeconds: number;
     reason: string;
+}
+
+// ─── Session Owner ───────────────────────────────────────────────
+
+export interface SessionOwnerInfo {
+    provider: string;
+    subject: string;
+    email?: string | null;
+    displayName?: string | null;
 }
 
 // ─── Orchestration Input ─────────────────────────────────────────
@@ -367,6 +383,8 @@ export interface OrchestrationInput {
     nestingLevel?: number;
     /** Whether this is a system session (e.g. Sweeper Agent). System sessions skip title summarization. */
     isSystem?: boolean;
+    /** Authenticated user associated with this session when available. */
+    owner?: SessionOwnerInfo;
     /** Agent definition ID bound to this session (e.g. "supervisor"). Used for policy validation. */
     agentId?: string;
     /** Session creation policy (loaded from session-policy.json). */

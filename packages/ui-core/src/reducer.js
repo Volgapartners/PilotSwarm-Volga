@@ -2,6 +2,13 @@ import { buildSessionTree } from "./session-tree.js";
 import { FOCUS_REGIONS } from "./commands.js";
 import { DEFAULT_HISTORY_EVENT_LIMIT, dedupeChatMessages } from "./history.js";
 import { getPromptInputRows } from "./layout.js";
+import { selectSessionRows } from "./selectors.js";
+import {
+    normalizeArtifactEntries,
+    normalizeSessionOwnerFilter,
+    normalizeStoredLayoutAdjustments,
+    normalizeStoredPinnedSessionIds,
+} from "./state.js";
 
 function cloneHistoryMap(historyMap) {
     return new Map(historyMap);
@@ -11,11 +18,35 @@ function cloneCollapsedIds(collapsedIds) {
     return new Set(collapsedIds);
 }
 
+function clonePinnedIds(pinnedIds) {
+    return Array.isArray(pinnedIds) ? [...pinnedIds] : [];
+}
+
+function cloneSelectedIds(selectedIds) {
+    return Array.isArray(selectedIds) ? [...selectedIds] : [];
+}
+
+function pruneIdList(ids, byId) {
+    const out = [];
+    const seen = new Set();
+    for (const id of ids || []) {
+        if (!id || seen.has(id)) continue;
+        if (!byId[id]) continue;
+        seen.add(id);
+        out.push(id);
+    }
+    return out;
+}
+
 function cloneOrderById(orderById) {
     return { ...(orderById || {}) };
 }
 
 function cloneFilesBySessionId(bySessionId) {
+    return { ...(bySessionId || {}) };
+}
+
+function cloneOutboxBySessionId(bySessionId) {
     return { ...(bySessionId || {}) };
 }
 
@@ -78,6 +109,13 @@ function mergeDefinedSessionFields(previousSession = {}, nextSession = {}) {
     let merged = previousSession || {};
     for (const [key, value] of Object.entries(nextSession || {})) {
         if (value === undefined) continue;
+        if (key === "pendingQuestion" && isAnsweredPendingQuestion(previousSession, value)) {
+            if (merged === previousSession) {
+                merged = { ...(previousSession || {}) };
+            }
+            merged.pendingQuestion = null;
+            continue;
+        }
         if (areStructuredValuesEqual(previousSession?.[key], value)) continue;
         if (merged === previousSession) {
             merged = { ...(previousSession || {}) };
@@ -87,9 +125,79 @@ function mergeDefinedSessionFields(previousSession = {}, nextSession = {}) {
     return merged;
 }
 
+function normalizedPendingQuestionText(pendingQuestion) {
+    return String(pendingQuestion?.question || "").trim();
+}
+
+function isAnsweredPendingQuestion(previousSession, pendingQuestion) {
+    const answeredQuestion = normalizedPendingQuestionText(previousSession?.answeredPendingQuestion);
+    const incomingQuestion = normalizedPendingQuestionText(pendingQuestion);
+    return Boolean(answeredQuestion && incomingQuestion && answeredQuestion === incomingQuestion);
+}
+
 function pickDefaultActiveSessionId(sessions = []) {
     const firstNonSystem = (sessions || []).find((session) => session?.sessionId && !session.isSystem);
     return firstNonSystem?.sessionId || null;
+}
+
+function hasSessionVisibilityFilter(sessions = {}) {
+    const query = String(sessions?.filterQuery || "").trim();
+    const ownerFilter = normalizeSessionOwnerFilter(sessions?.ownerFilter);
+    return Boolean(query) || ownerFilter.all !== true;
+}
+
+function resolveVisibleActiveSessionId(state, fallbackSessions = []) {
+    const visibleRows = selectSessionRows(state);
+    const currentSessionId = state.sessions?.activeSessionId || null;
+    if (currentSessionId && visibleRows.some((row) => row.sessionId === currentSessionId)) {
+        return currentSessionId;
+    }
+    if (hasSessionVisibilityFilter(state.sessions)) {
+        return visibleRows[0]?.sessionId || null;
+    }
+
+    const visibleSessions = visibleRows.length > 0
+        ? visibleRows
+            .map((row) => state.sessions?.byId?.[row.sessionId] || null)
+            .filter(Boolean)
+        : fallbackSessions;
+
+    return pickDefaultActiveSessionId(visibleSessions);
+}
+
+function updateUiForSessionSelection(state, nextActiveSessionId) {
+    if (nextActiveSessionId === state.sessions.activeSessionId) {
+        return state.ui;
+    }
+    return {
+        ...state.ui,
+        scroll: {
+            ...state.ui.scroll,
+            chat: 0,
+            inspector: 0,
+            activity: 0,
+        },
+        followBottom: {
+            ...(state.ui.followBottom || {}),
+            inspector: true,
+            activity: true,
+        },
+    };
+}
+
+function applyVisibleSessionSelection(state, nextSessions) {
+    const nextState = {
+        ...state,
+        sessions: nextSessions,
+    };
+    const nextActiveSessionId = resolveVisibleActiveSessionId(nextState, Object.values(nextSessions.byId || {}));
+    return {
+        sessions: {
+            ...nextSessions,
+            activeSessionId: nextActiveSessionId,
+        },
+        ui: updateUiForSessionSelection(state, nextActiveSessionId),
+    };
 }
 
 function assignStableSessionOrder(previousOrderById = {}, nextOrderOrdinal = 0, sessions = []) {
@@ -158,6 +266,15 @@ export function appReducer(state, action) {
                 },
             };
 
+        case "auth/context":
+            return {
+                ...state,
+                auth: {
+                    principal: action.principal ?? null,
+                    authorization: action.authorization ?? null,
+                },
+            };
+
         case "ui/status":
             return {
                 ...state,
@@ -175,6 +292,52 @@ export function appReducer(state, action) {
                     themeId: action.themeId || state.ui.themeId,
                 },
             };
+
+        case "profileSettings/apply": {
+            const settings = action.settings && typeof action.settings === "object" && !Array.isArray(action.settings)
+                ? action.settings
+                : {};
+            const hasTheme = Object.prototype.hasOwnProperty.call(settings, "themeId")
+                && typeof settings.themeId === "string"
+                && settings.themeId.trim();
+            const hasOwnerFilter = Object.prototype.hasOwnProperty.call(settings, "sessionOwnerFilter");
+            const hasLayout = Object.prototype.hasOwnProperty.call(settings, "layoutAdjustments");
+            const hasPins = Object.prototype.hasOwnProperty.call(settings, "pinnedSessionIds");
+            const nextLayout = hasLayout
+                ? {
+                    ...(state.ui.layout || {}),
+                    ...normalizeStoredLayoutAdjustments(settings.layoutAdjustments),
+                }
+                : state.ui.layout;
+            const nextPinnedIds = hasPins
+                ? normalizeStoredPinnedSessionIds(settings.pinnedSessionIds)
+                : state.sessions.pinnedIds;
+            const nextSessions = {
+                ...state.sessions,
+                ...(hasOwnerFilter
+                    ? {
+                        ownerFilter: normalizeSessionOwnerFilter(settings.sessionOwnerFilter),
+                        ownerFilterExplicit: true,
+                    }
+                    : {}),
+                pinnedIds: nextPinnedIds,
+                flat: hasPins
+                    ? buildSessionTree(Object.values(state.sessions.byId), state.sessions.collapsedIds, state.sessions.orderById, nextPinnedIds)
+                    : state.sessions.flat,
+            };
+            const selection = hasOwnerFilter || hasPins
+                ? applyVisibleSessionSelection(state, nextSessions)
+                : { sessions: nextSessions, ui: state.ui };
+            return {
+                ...state,
+                sessions: selection.sessions,
+                ui: {
+                    ...selection.ui,
+                    themeId: hasTheme ? settings.themeId.trim() : selection.ui.themeId,
+                    layout: nextLayout,
+                },
+            };
+        }
 
         case "ui/modal":
             return {
@@ -230,6 +393,18 @@ export function appReducer(state, action) {
                 },
             };
 
+        case "ui/activityPaneAdjust":
+            return {
+                ...state,
+                ui: {
+                    ...state.ui,
+                    layout: {
+                        ...(state.ui.layout || {}),
+                        activityPaneAdjust: Number(action.activityPaneAdjust) || 0,
+                    },
+                },
+            };
+
         case "ui/focus":
             return {
                 ...state,
@@ -240,13 +415,33 @@ export function appReducer(state, action) {
             };
 
         case "sessions/filterQuery":
-            return {
-                ...state,
-                sessions: {
+            {
+                const nextSessions = {
                     ...state.sessions,
                     filterQuery: typeof action.query === "string" ? action.query : "",
-                },
-            };
+                };
+                const selection = applyVisibleSessionSelection(state, nextSessions);
+                return {
+                    ...state,
+                    sessions: selection.sessions,
+                    ui: selection.ui,
+                };
+            }
+
+        case "sessions/ownerFilter":
+            {
+                const nextSessions = {
+                    ...state.sessions,
+                    ownerFilterExplicit: true,
+                    ownerFilter: normalizeSessionOwnerFilter(action.filter),
+                };
+                const selection = applyVisibleSessionSelection(state, nextSessions);
+                return {
+                    ...state,
+                    sessions: selection.sessions,
+                    ui: selection.ui,
+                };
+            }
 
         case "ui/modalSelection": {
             const modal = state.ui.modal;
@@ -278,6 +473,26 @@ export function appReducer(state, action) {
                 },
             };
 
+        case "ui/followBottom": {
+            if (action.pane !== "inspector" && action.pane !== "activity") {
+                return state;
+            }
+            const nextFollowBottom = Boolean(action.followBottom);
+            if (state.ui.followBottom?.[action.pane] === nextFollowBottom) {
+                return state;
+            }
+            return {
+                ...state,
+                ui: {
+                    ...state.ui,
+                    followBottom: {
+                        ...(state.ui.followBottom || {}),
+                        [action.pane]: nextFollowBottom,
+                    },
+                },
+            };
+        }
+
         case "ui/inspectorTab":
             return {
                 ...state,
@@ -290,6 +505,10 @@ export function appReducer(state, action) {
                     scroll: {
                         ...state.ui.scroll,
                         inspector: 0,
+                    },
+                    followBottom: {
+                        ...(state.ui.followBottom || {}),
+                        inspector: true,
                     },
                 },
                 files: action.inspectorTab === "files"
@@ -305,7 +524,9 @@ export function appReducer(state, action) {
                 ...state,
                 ui: {
                     ...state.ui,
-                    statsViewMode: action.statsViewMode === "fleet" ? "fleet" : "session",
+                    statsViewMode: ["session", "fleet", "users"].includes(action.statsViewMode)
+                        ? action.statsViewMode
+                        : "session",
                     scroll: {
                         ...state.ui.scroll,
                         inspector: 0,
@@ -322,6 +543,15 @@ export function appReducer(state, action) {
                     promptCursor: clampPromptCursor(action.prompt, action.promptCursor, state.ui.promptCursor),
                     promptRows: getPromptInputRows(action.prompt),
                     promptAttachments: normalizePromptAttachments(action.prompt, state.ui.promptAttachments),
+                },
+            };
+
+        case "ui/promptEdit":
+            return {
+                ...state,
+                ui: {
+                    ...state.ui,
+                    promptEdit: action.promptEdit ?? null,
                 },
             };
 
@@ -391,21 +621,29 @@ export function appReducer(state, action) {
                     collapsedIds.add(sessionId);
                 }
             }
-            const flat = buildSessionTree(mergedSessions, collapsedIds, orderById);
-            const activeSessionId = state.sessions.activeSessionId && flat.some((entry) => entry.sessionId === state.sessions.activeSessionId)
-                ? state.sessions.activeSessionId
-                : pickDefaultActiveSessionId(mergedSessions);
+            // Drop pins/selection for sessions that no longer exist; only
+            // keep pins on top-level rows (children cannot be pinned).
+            const survivingPins = pruneIdList(state.sessions.pinnedIds, byId)
+                .filter((sessionId) => !byId[sessionId]?.parentSessionId);
+            const survivingSelected = pruneIdList(state.sessions.selectedIds, byId);
+            const flat = buildSessionTree(mergedSessions, collapsedIds, orderById, survivingPins);
+            const nextSessions = {
+                ...state.sessions,
+                byId,
+                collapsedIds,
+                pinnedIds: survivingPins,
+                selectedIds: survivingSelected,
+                selectMode: state.sessions.selectMode && survivingSelected.length > 0,
+                flat,
+                activeSessionId: state.sessions.activeSessionId,
+                orderById,
+                nextOrderOrdinal,
+            };
+            const selection = applyVisibleSessionSelection(state, nextSessions);
             return {
                 ...state,
-                sessions: {
-                    ...state.sessions,
-                    byId,
-                    collapsedIds,
-                    flat,
-                    activeSessionId,
-                    orderById,
-                    nextOrderOrdinal,
-                },
+                sessions: selection.sessions,
+                ui: selection.ui,
             };
         }
 
@@ -426,15 +664,19 @@ export function appReducer(state, action) {
                 state.sessions.nextOrderOrdinal,
                 Object.values(byId),
             );
+            const nextSessions = {
+                ...state.sessions,
+                byId,
+                flat: buildSessionTree(Object.values(byId), state.sessions.collapsedIds, orderById, state.sessions.pinnedIds),
+                activeSessionId: state.sessions.activeSessionId,
+                orderById,
+                nextOrderOrdinal,
+            };
+            const selection = applyVisibleSessionSelection(state, nextSessions);
             return {
                 ...state,
-                sessions: {
-                    ...state.sessions,
-                    byId,
-                    flat: buildSessionTree(Object.values(byId), state.sessions.collapsedIds, orderById),
-                    orderById,
-                    nextOrderOrdinal,
-                },
+                sessions: selection.sessions,
+                ui: selection.ui,
             };
         }
 
@@ -452,6 +694,11 @@ export function appReducer(state, action) {
                         chat: 0,
                         inspector: 0,
                         activity: 0,
+                    },
+                    followBottom: {
+                        ...(state.ui.followBottom || {}),
+                        inspector: true,
+                        activity: true,
                     },
                 },
             };
@@ -482,7 +729,7 @@ export function appReducer(state, action) {
                 sessions: {
                     ...state.sessions,
                     collapsedIds,
-                    flat: buildSessionTree(Object.values(state.sessions.byId), collapsedIds, state.sessions.orderById),
+                    flat: buildSessionTree(Object.values(state.sessions.byId), collapsedIds, state.sessions.orderById, state.sessions.pinnedIds),
                 },
             };
         }
@@ -495,7 +742,94 @@ export function appReducer(state, action) {
                 sessions: {
                     ...state.sessions,
                     collapsedIds,
-                    flat: buildSessionTree(Object.values(state.sessions.byId), collapsedIds, state.sessions.orderById),
+                    flat: buildSessionTree(Object.values(state.sessions.byId), collapsedIds, state.sessions.orderById, state.sessions.pinnedIds),
+                },
+            };
+        }
+
+        case "sessions/pinToggle": {
+            const sessionId = String(action.sessionId || "").trim();
+            if (!sessionId) return state;
+            const session = state.sessions.byId[sessionId];
+            // Pinning is a TOP-LEVEL-only concept. System sessions and child
+            // sessions cannot be pinned.
+            if (!session || session.isSystem || session.parentSessionId) return state;
+            const current = clonePinnedIds(state.sessions.pinnedIds);
+            const existingIndex = current.indexOf(sessionId);
+            const nextPinned = existingIndex >= 0
+                ? current.filter((id) => id !== sessionId)
+                : [...current, sessionId];
+            return {
+                ...state,
+                sessions: {
+                    ...state.sessions,
+                    pinnedIds: nextPinned,
+                    flat: buildSessionTree(Object.values(state.sessions.byId), state.sessions.collapsedIds, state.sessions.orderById, nextPinned),
+                },
+            };
+        }
+
+        case "sessions/selectMode": {
+            const enabled = Boolean(action.enabled);
+            if (enabled === Boolean(state.sessions.selectMode)
+                && (enabled || state.sessions.selectedIds.length === 0)) {
+                return state;
+            }
+            return {
+                ...state,
+                sessions: {
+                    ...state.sessions,
+                    selectMode: enabled,
+                    selectedIds: enabled ? state.sessions.selectedIds : [],
+                },
+            };
+        }
+
+        case "sessions/selectToggle": {
+            const sessionId = String(action.sessionId || "").trim();
+            const session = sessionId ? state.sessions.byId[sessionId] : null;
+            if (!session) return state;
+            // System sessions (PilotSwarm, Sweeper, Resource Manager, etc.)
+            // are managed by the worker and cannot be bulk-terminated.
+            if (session.isSystem) return state;
+            const current = cloneSelectedIds(state.sessions.selectedIds);
+            const existingIndex = current.indexOf(sessionId);
+            const nextSelected = existingIndex >= 0
+                ? current.filter((id) => id !== sessionId)
+                : [...current, sessionId];
+            return {
+                ...state,
+                sessions: {
+                    ...state.sessions,
+                    selectedIds: nextSelected,
+                    selectMode: nextSelected.length > 0 ? true : state.sessions.selectMode,
+                },
+            };
+        }
+
+        case "sessions/selectSet": {
+            const ids = Array.isArray(action.sessionIds) ? action.sessionIds : [];
+            // System sessions are not selectable for bulk operations.
+            const next = pruneIdList(ids, state.sessions.byId)
+                .filter((id) => !state.sessions.byId[id]?.isSystem);
+            return {
+                ...state,
+                sessions: {
+                    ...state.sessions,
+                    selectedIds: next,
+                    selectMode: next.length > 0 ? true : state.sessions.selectMode,
+                },
+            };
+        }
+
+        case "sessions/selectClear": {
+            if (state.sessions.selectedIds.length === 0 && !state.sessions.selectMode) return state;
+            return {
+                ...state,
+                sessions: {
+                    ...state.sessions,
+                    selectedIds: [],
+                    selectMode: false,
                 },
             };
         }
@@ -543,11 +877,36 @@ export function appReducer(state, action) {
             if (ids.length === 0) return state;
             const nextHistory = cloneHistoryMap(state.history.bySessionId);
             for (const id of ids) nextHistory.delete(id);
+            const nextOutbox = cloneOutboxBySessionId(state.outbox?.bySessionId);
+            for (const id of ids) delete nextOutbox[id];
             return {
                 ...state,
                 history: {
                     ...state.history,
                     bySessionId: nextHistory,
+                },
+                outbox: {
+                    ...state.outbox,
+                    bySessionId: nextOutbox,
+                },
+            };
+        }
+
+        case "outbox/setSessionItems": {
+            const sessionId = action.sessionId;
+            if (!sessionId) return state;
+            const items = Array.isArray(action.items) ? action.items.filter(Boolean) : [];
+            const nextOutbox = cloneOutboxBySessionId(state.outbox?.bySessionId);
+            if (items.length === 0) {
+                delete nextOutbox[sessionId];
+            } else {
+                nextOutbox[sessionId] = items;
+            }
+            return {
+                ...state,
+                outbox: {
+                    ...state.outbox,
+                    bySessionId: nextOutbox,
                 },
             };
         }
@@ -731,9 +1090,161 @@ export function appReducer(state, action) {
                 fleetStats: {
                     loading: false,
                     data: action.data || null,
+                    userStats: action.userStats || null,
                     skillUsage: action.skillUsage || null,
                     sharedFactsStats: action.sharedFactsStats || null,
                     fetchedAt: Date.now(),
+                },
+            };
+        }
+
+        case "admin/visibility": {
+            const visible = Boolean(action.visible);
+            if (state.admin.visible === visible) return state;
+            return {
+                ...state,
+                admin: {
+                    ...state.admin,
+                    visible,
+                    // Closing the console resets any in-progress edit so the
+                    // next open starts on the read-only view, not on a stale
+                    // draft.
+                    ghcpKey: visible
+                        ? state.admin.ghcpKey
+                        : { editing: false, draft: "", saving: false, error: null, lastSavedAt: state.admin.ghcpKey.lastSavedAt },
+                },
+            };
+        }
+        case "admin/profile/loading": {
+            return {
+                ...state,
+                admin: {
+                    ...state.admin,
+                    loading: true,
+                    loadError: null,
+                },
+            };
+        }
+        case "admin/profile/loaded": {
+            return {
+                ...state,
+                admin: {
+                    ...state.admin,
+                    loading: false,
+                    loadError: null,
+                    profile: action.profile || null,
+                    ghcpKey: {
+                        ...state.admin.ghcpKey,
+                        // A successful load doesn't clobber an in-progress
+                        // edit; the user may be in the middle of typing.
+                        error: state.admin.ghcpKey.editing ? state.admin.ghcpKey.error : null,
+                    },
+                },
+            };
+        }
+        case "admin/profile/loadFailed": {
+            return {
+                ...state,
+                admin: {
+                    ...state.admin,
+                    loading: false,
+                    loadError: action.error ? String(action.error) : "Failed to load profile",
+                },
+            };
+        }
+        case "admin/ghcpKey/beginEdit": {
+            const draft = typeof action.draft === "string" ? action.draft : "";
+            return {
+                ...state,
+                admin: {
+                    ...state.admin,
+                    ghcpKey: {
+                        editing: true,
+                        draft,
+                        cursorIndex: draft.length,
+                        saving: false,
+                        error: null,
+                        lastSavedAt: state.admin.ghcpKey.lastSavedAt,
+                    },
+                },
+            };
+        }
+        case "admin/ghcpKey/setDraft": {
+            if (!state.admin.ghcpKey.editing) return state;
+            const draft = typeof action.draft === "string" ? action.draft : "";
+            const cursorRaw = Number.isFinite(action.cursorIndex) ? Number(action.cursorIndex) : draft.length;
+            const cursorIndex = Math.max(0, Math.min(cursorRaw, draft.length));
+            if (draft === state.admin.ghcpKey.draft && cursorIndex === state.admin.ghcpKey.cursorIndex) return state;
+            return {
+                ...state,
+                admin: {
+                    ...state.admin,
+                    ghcpKey: {
+                        ...state.admin.ghcpKey,
+                        draft,
+                        cursorIndex,
+                        error: null,
+                    },
+                },
+            };
+        }
+        case "admin/ghcpKey/cancelEdit": {
+            if (!state.admin.ghcpKey.editing && !state.admin.ghcpKey.draft) return state;
+            return {
+                ...state,
+                admin: {
+                    ...state.admin,
+                    ghcpKey: {
+                        editing: false,
+                        draft: "",
+                        cursorIndex: 0,
+                        saving: false,
+                        error: null,
+                        lastSavedAt: state.admin.ghcpKey.lastSavedAt,
+                    },
+                },
+            };
+        }
+        case "admin/ghcpKey/saving": {
+            return {
+                ...state,
+                admin: {
+                    ...state.admin,
+                    ghcpKey: {
+                        ...state.admin.ghcpKey,
+                        saving: true,
+                        error: null,
+                    },
+                },
+            };
+        }
+        case "admin/ghcpKey/saveFailed": {
+            return {
+                ...state,
+                admin: {
+                    ...state.admin,
+                    ghcpKey: {
+                        ...state.admin.ghcpKey,
+                        saving: false,
+                        error: action.error ? String(action.error) : "Failed to save key",
+                    },
+                },
+            };
+        }
+        case "admin/ghcpKey/saved": {
+            return {
+                ...state,
+                admin: {
+                    ...state.admin,
+                    profile: action.profile || state.admin.profile,
+                    ghcpKey: {
+                        editing: false,
+                        draft: "",
+                        cursorIndex: 0,
+                        saving: false,
+                        error: null,
+                        lastSavedAt: Date.now(),
+                    },
                 },
             };
         }
@@ -788,12 +1299,13 @@ export function appReducer(state, action) {
                 previews: {},
                 downloads: {},
             };
-            const entries = Array.isArray(action.entries) ? [...action.entries] : [];
-            const selectedFilename = current.selectedFilename && entries.includes(current.selectedFilename)
+            const entries = normalizeArtifactEntries(action.entries);
+            const hasFilename = (filename) => entries.some((entry) => entry.filename === filename);
+            const selectedFilename = current.selectedFilename && hasFilename(current.selectedFilename)
                 ? current.selectedFilename
-                : (action.selectedFilename && entries.includes(action.selectedFilename)
+                : (action.selectedFilename && hasFilename(action.selectedFilename)
                     ? action.selectedFilename
-                    : (entries[0] || null));
+                    : (entries[0]?.filename || null));
             bySessionId[action.sessionId] = {
                 ...current,
                 entries,
@@ -926,6 +1438,10 @@ export function appReducer(state, action) {
                     content: action.content || "",
                     contentType: action.contentType || "text/plain",
                     renderMode: action.renderMode || "text",
+                    isBinary: action.isBinary === true,
+                    sizeBytes: Number.isFinite(action.sizeBytes) ? action.sizeBytes : null,
+                    uploadedAt: action.uploadedAt || "",
+                    source: action.source || "agent",
                 },
             };
             bySessionId[action.sessionId] = {
@@ -994,6 +1510,51 @@ export function appReducer(state, action) {
                 files: {
                     ...state.files,
                     bySessionId,
+                },
+            };
+        }
+
+        case "files/deleted": {
+            const bySessionId = cloneFilesBySessionId(state.files.bySessionId);
+            const current = bySessionId[action.sessionId] || {
+                entries: [],
+                previews: {},
+                downloads: {},
+                selectedFilename: null,
+            };
+            const entries = normalizeArtifactEntries(current.entries).filter((entry) => entry.filename !== action.filename);
+            const nextSelectedFilename = current.selectedFilename === action.filename
+                ? (entries[0]?.filename || null)
+                : current.selectedFilename;
+            const { [action.filename]: _deletedPreview, ...previews } = current.previews || {};
+            const { [action.filename]: _deletedDownload, ...downloads } = current.downloads || {};
+            const deletedArtifactId = action.sessionId && action.filename
+                ? `${action.sessionId}/${action.filename}`
+                : null;
+
+            bySessionId[action.sessionId] = {
+                ...current,
+                entries,
+                previews,
+                downloads,
+                selectedFilename: nextSelectedFilename,
+            };
+
+            return {
+                ...state,
+                files: {
+                    ...state.files,
+                    bySessionId,
+                    selectedArtifactId: state.files.selectedArtifactId === deletedArtifactId
+                        ? (nextSelectedFilename ? `${action.sessionId}/${nextSelectedFilename}` : null)
+                        : state.files.selectedArtifactId,
+                },
+                ui: {
+                    ...state.ui,
+                    scroll: {
+                        ...state.ui.scroll,
+                        filePreview: 0,
+                    },
                 },
             };
         }

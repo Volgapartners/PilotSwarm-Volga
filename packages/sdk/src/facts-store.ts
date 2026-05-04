@@ -137,9 +137,13 @@ function normalizeLikePattern(pattern?: string): string | undefined {
     return pattern;
 }
 
-export async function createFactStoreForUrl(storeUrl: string, schema?: string): Promise<FactStore> {
+export async function createFactStoreForUrl(
+    storeUrl: string,
+    schema?: string,
+    env: Record<string, string | undefined> = process.env,
+): Promise<FactStore> {
     if (storeUrl.startsWith("postgres://") || storeUrl.startsWith("postgresql://")) {
-        return PgFactStore.create(storeUrl, schema);
+        return PgFactStore.create(storeUrl, schema, env);
     }
     throw new Error(
         "PilotSwarm facts require a PostgreSQL store. " +
@@ -157,7 +161,11 @@ export class PgFactStore implements FactStore {
         this.sql = sqlForSchema(schema);
     }
 
-    static async create(connectionString: string, schema?: string): Promise<PgFactStore> {
+    static async create(
+        connectionString: string,
+        schema?: string,
+        env: Record<string, string | undefined> = process.env,
+    ): Promise<PgFactStore> {
         const { default: pg } = await import("pg");
 
         const parsed = new URL(connectionString);
@@ -165,13 +173,13 @@ export class PgFactStore implements FactStore {
             .includes(parsed.searchParams.get("sslmode") ?? "");
         parsed.searchParams.delete("sslmode");
 
-        const stmtTimeout = resolveEnvInt("PG_STATEMENT_TIMEOUT_MS", 0);
+        const stmtTimeout = resolveEnvInt("PG_STATEMENT_TIMEOUT_MS", 0, env);
         const pool = new pg.Pool({
             connectionString: parsed.toString(),
-            max: resolveEnvInt("DB_POOL_MAX", DEFAULT_DB_POOL_MAX, undefined, 1),
-            connectionTimeoutMillis: resolveEnvInt("PG_CONNECTION_TIMEOUT_MS", DEFAULT_PG_CONNECTION_TIMEOUT_MS),
-            idleTimeoutMillis: resolveEnvInt("PG_IDLE_TIMEOUT_MS", DEFAULT_PG_IDLE_TIMEOUT_MS),
-            query_timeout: resolveEnvInt("PG_QUERY_TIMEOUT_MS", DEFAULT_PG_QUERY_TIMEOUT_MS),
+            max: resolveEnvInt("DB_POOL_MAX", DEFAULT_DB_POOL_MAX, env, 1),
+            connectionTimeoutMillis: resolveEnvInt("PG_CONNECTION_TIMEOUT_MS", DEFAULT_PG_CONNECTION_TIMEOUT_MS, env),
+            idleTimeoutMillis: resolveEnvInt("PG_IDLE_TIMEOUT_MS", DEFAULT_PG_IDLE_TIMEOUT_MS, env),
+            query_timeout: resolveEnvInt("PG_QUERY_TIMEOUT_MS", DEFAULT_PG_QUERY_TIMEOUT_MS, env),
             ...(stmtTimeout > 0 ? { statement_timeout: stmtTimeout } : {}),
             ...(needsSsl ? { ssl: { rejectUnauthorized: false } } : {}),
         });

@@ -85,6 +85,31 @@ export function CMS_MIGRATIONS(schema: string): MigrationEntry[] {
             name: "top_event_emitters",
             sql: migration_0013_top_event_emitters(schema),
         },
+        {
+            version: "0014",
+            name: "session_owner_users",
+            sql: migration_0014_session_owner_users(schema),
+        },
+        {
+            version: "0015",
+            name: "user_stats_by_model",
+            sql: migration_0015_user_stats_by_model(schema),
+        },
+        {
+            version: "0016",
+            name: "user_profile_and_copilot_key",
+            sql: migration_0016_user_profile_and_copilot_key(schema),
+        },
+        {
+            version: "0017",
+            name: "session_reasoning_effort",
+            sql: migration_0017_session_reasoning_effort(schema),
+        },
+        {
+            version: "0018",
+            name: "session_reasoning_effort_read_views",
+            sql: migration_0018_session_reasoning_effort_read_views(schema),
+        },
     ];
 }
 
@@ -1581,6 +1606,292 @@ BEGIN
     GROUP BY se.worker_node_id, se.event_type
     ORDER BY event_count DESC, last_seen_at DESC
     LIMIT v_limit;
+END;
+$$ LANGUAGE plpgsql;
+`;
+}
+
+// ─── Migration 0014: Session Owner Users (upstream 0008) ─────────
+
+function migration_0014_session_owner_users(schema: string): string {
+    const s = `"${schema}"`;
+    return `
+CREATE TABLE IF NOT EXISTS ${s}.users (
+    user_id      BIGSERIAL PRIMARY KEY,
+    provider     TEXT NOT NULL,
+    subject      TEXT NOT NULL,
+    email        TEXT,
+    display_name TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_${schema}_users_provider_subject
+    ON ${s}.users(provider, subject);
+CREATE TABLE IF NOT EXISTS ${s}.session_owners (
+    session_id  TEXT PRIMARY KEY REFERENCES ${s}.sessions(session_id) ON DELETE CASCADE,
+    user_id     BIGINT NOT NULL REFERENCES ${s}.users(user_id),
+    assigned_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_${schema}_session_owners_user
+    ON ${s}.session_owners(user_id);
+CREATE OR REPLACE FUNCTION ${s}.cms_register_user(
+    p_provider TEXT, p_subject TEXT, p_email TEXT, p_display_name TEXT
+) RETURNS BIGINT AS $$
+DECLARE
+    v_provider TEXT := NULLIF(BTRIM(p_provider), '');
+    v_subject  TEXT := NULLIF(BTRIM(p_subject), '');
+    v_user_id  BIGINT;
+BEGIN
+    IF v_provider IS NULL OR v_subject IS NULL THEN
+        RAISE EXCEPTION 'User provider and subject are required';
+    END IF;
+    INSERT INTO ${s}.users (provider, subject, email, display_name)
+    VALUES (v_provider, v_subject, NULLIF(BTRIM(p_email), ''), NULLIF(BTRIM(p_display_name), ''))
+    ON CONFLICT (provider, subject) DO NOTHING;
+    SELECT user_id INTO v_user_id FROM ${s}.users WHERE provider = v_provider AND subject = v_subject;
+    RETURN v_user_id;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION ${s}.cms_set_session_owner(
+    p_session_id TEXT, p_provider TEXT, p_subject TEXT, p_email TEXT, p_display_name TEXT
+) RETURNS VOID AS $$
+DECLARE
+    v_user_id   BIGINT;
+    v_is_system BOOLEAN;
+BEGIN
+    SELECT is_system INTO v_is_system FROM ${s}.sessions WHERE session_id = p_session_id AND deleted_at IS NULL;
+    IF NOT FOUND OR v_is_system THEN RETURN; END IF;
+    v_user_id := ${s}.cms_register_user(p_provider, p_subject, p_email, p_display_name);
+    INSERT INTO ${s}.session_owners (session_id, user_id) VALUES (p_session_id, v_user_id) ON CONFLICT (session_id) DO NOTHING;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION ${s}.cms_inherit_session_owner(
+    p_session_id TEXT, p_parent_session_id TEXT
+) RETURNS VOID AS $$
+DECLARE
+    v_is_system BOOLEAN;
+BEGIN
+    SELECT is_system INTO v_is_system FROM ${s}.sessions WHERE session_id = p_session_id AND deleted_at IS NULL;
+    IF NOT FOUND OR v_is_system THEN RETURN; END IF;
+    INSERT INTO ${s}.session_owners (session_id, user_id)
+    SELECT p_session_id, so.user_id FROM ${s}.session_owners so WHERE so.session_id = p_parent_session_id
+    ON CONFLICT (session_id) DO NOTHING;
+END;
+$$ LANGUAGE plpgsql;
+`;
+}
+
+// ─── Migration 0015: User Stats By Model (upstream 0009) ─────────
+
+function migration_0015_user_stats_by_model(schema: string): string {
+    const s = `"${schema}"`;
+    return `
+CREATE OR REPLACE FUNCTION ${s}.cms_get_user_stats_by_model(
+    p_include_deleted BOOLEAN,
+    p_since           TIMESTAMPTZ
+) RETURNS TABLE (
+    owner_kind                  TEXT,
+    owner_provider              TEXT,
+    owner_subject               TEXT,
+    owner_email                 TEXT,
+    owner_display_name          TEXT,
+    model                       TEXT,
+    session_ids                 TEXT[],
+    session_count               INT,
+    total_snapshot_size_bytes    BIGINT,
+    total_dehydration_count     INT,
+    total_hydration_count       INT,
+    total_lossy_handoff_count   INT,
+    total_tokens_input          BIGINT,
+    total_tokens_output         BIGINT,
+    total_tokens_cache_read     BIGINT,
+    total_tokens_cache_write    BIGINT,
+    earliest_session_created_at TIMESTAMPTZ
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH base AS (
+        SELECT
+            CASE WHEN sess.is_system THEN 'system' WHEN u.user_id IS NULL THEN 'unowned' ELSE 'user' END::text AS owner_kind,
+            u.provider, u.subject, u.email, u.display_name,
+            m.model, m.session_id, m.created_at, m.snapshot_size_bytes,
+            m.dehydration_count, m.hydration_count, m.lossy_handoff_count,
+            m.tokens_input, m.tokens_output, m.tokens_cache_read, m.tokens_cache_write
+        FROM ${s}.session_metric_summaries m
+        INNER JOIN ${s}.sessions sess ON sess.session_id = m.session_id
+        LEFT JOIN ${s}.session_owners so ON so.session_id = m.session_id
+        LEFT JOIN ${s}.users u ON u.user_id = so.user_id
+        WHERE (p_include_deleted OR m.deleted_at IS NULL) AND (p_since IS NULL OR m.created_at >= p_since)
+    )
+    SELECT b.owner_kind, b.provider, b.subject, b.email, b.display_name, b.model,
+        ARRAY_AGG(b.session_id ORDER BY b.created_at DESC), COUNT(*)::int,
+        COALESCE(SUM(b.snapshot_size_bytes),0)::bigint, COALESCE(SUM(b.dehydration_count),0)::int,
+        COALESCE(SUM(b.hydration_count),0)::int, COALESCE(SUM(b.lossy_handoff_count),0)::int,
+        COALESCE(SUM(b.tokens_input),0)::bigint, COALESCE(SUM(b.tokens_output),0)::bigint,
+        COALESCE(SUM(b.tokens_cache_read),0)::bigint, COALESCE(SUM(b.tokens_cache_write),0)::bigint,
+        MIN(b.created_at)
+    FROM base b
+    GROUP BY b.owner_kind, b.provider, b.subject, b.email, b.display_name, b.model
+    ORDER BY COALESCE(SUM(b.tokens_input),0)::bigint DESC, b.owner_kind, b.display_name, b.email, b.model;
+END;
+$$ LANGUAGE plpgsql;
+`;
+}
+
+// ─── Migration 0016: User Profile + GitHub Copilot Key (upstream 0010) ──
+
+function migration_0016_user_profile_and_copilot_key(schema: string): string {
+    const s = `"${schema}"`;
+    return `
+ALTER TABLE ${s}.users ADD COLUMN IF NOT EXISTS profile_settings JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE ${s}.users ADD COLUMN IF NOT EXISTS github_copilot_key TEXT;
+CREATE OR REPLACE FUNCTION ${s}.cms_get_user_profile(p_provider TEXT, p_subject TEXT)
+RETURNS TABLE (user_id BIGINT, provider TEXT, subject TEXT, email TEXT, display_name TEXT,
+    profile_settings JSONB, github_copilot_key_set BOOLEAN, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ) AS $$
+DECLARE
+    v_provider TEXT := NULLIF(BTRIM(p_provider), '');
+    v_subject  TEXT := NULLIF(BTRIM(p_subject),  '');
+BEGIN
+    IF v_provider IS NULL OR v_subject IS NULL THEN RETURN; END IF;
+    RETURN QUERY SELECT u.user_id, u.provider, u.subject, u.email, u.display_name,
+        COALESCE(u.profile_settings, '{}'::jsonb), (u.github_copilot_key IS NOT NULL)::boolean,
+        u.created_at, u.updated_at
+    FROM ${s}.users u WHERE u.provider = v_provider AND u.subject = v_subject;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION ${s}.cms_get_user_github_copilot_key(p_provider TEXT, p_subject TEXT) RETURNS TEXT AS $$
+DECLARE
+    v_provider TEXT := NULLIF(BTRIM(p_provider), ''); v_subject TEXT := NULLIF(BTRIM(p_subject), ''); v_key TEXT;
+BEGIN
+    IF v_provider IS NULL OR v_subject IS NULL THEN RETURN NULL; END IF;
+    SELECT u.github_copilot_key INTO v_key FROM ${s}.users u WHERE u.provider = v_provider AND u.subject = v_subject;
+    RETURN v_key;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION ${s}.cms_set_user_profile_settings(
+    p_provider TEXT, p_subject TEXT, p_email TEXT, p_display_name TEXT, p_settings JSONB
+) RETURNS BIGINT AS $$
+DECLARE v_user_id BIGINT; v_settings JSONB := COALESCE(p_settings, '{}'::jsonb);
+BEGIN
+    v_user_id := ${s}.cms_register_user(p_provider, p_subject, p_email, p_display_name);
+    UPDATE ${s}.users SET profile_settings = v_settings, updated_at = now() WHERE user_id = v_user_id;
+    RETURN v_user_id;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION ${s}.cms_set_user_github_copilot_key(
+    p_provider TEXT, p_subject TEXT, p_email TEXT, p_display_name TEXT, p_key TEXT
+) RETURNS BIGINT AS $$
+DECLARE v_user_id BIGINT; v_key TEXT := NULLIF(BTRIM(p_key), '');
+BEGIN
+    v_user_id := ${s}.cms_register_user(p_provider, p_subject, p_email, p_display_name);
+    UPDATE ${s}.users SET github_copilot_key = v_key, updated_at = now() WHERE user_id = v_user_id;
+    RETURN v_user_id;
+END;
+$$ LANGUAGE plpgsql;
+`;
+}
+
+// ─── Migration 0017: Session Reasoning Effort (upstream 0011) ────
+
+function migration_0017_session_reasoning_effort(schema: string): string {
+    const s = `"${schema}"`;
+    return `
+ALTER TABLE ${s}.sessions ADD COLUMN IF NOT EXISTS reasoning_effort TEXT;
+ALTER TABLE ${s}.session_metric_summaries ADD COLUMN IF NOT EXISTS reasoning_effort TEXT;
+UPDATE ${s}.session_metric_summaries m SET reasoning_effort = sess.reasoning_effort, updated_at = now()
+FROM ${s}.sessions sess WHERE sess.session_id = m.session_id AND m.reasoning_effort IS NULL AND sess.reasoning_effort IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_${schema}_sms_agent_model_reasoning ON ${s}.session_metric_summaries(agent_id, model, reasoning_effort);
+`;
+}
+
+// ─── Migration 0018: Reasoning Effort Read Views (upstream 0012) ─
+
+function migration_0018_session_reasoning_effort_read_views(schema: string): string {
+    const s = `"${schema}"`;
+    return `
+DROP FUNCTION IF EXISTS ${s}.cms_list_sessions();
+CREATE FUNCTION ${s}.cms_list_sessions()
+RETURNS TABLE (
+    session_id TEXT, orchestration_id TEXT, title TEXT, title_locked BOOLEAN,
+    state TEXT, model TEXT, reasoning_effort TEXT,
+    created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, last_active_at TIMESTAMPTZ, deleted_at TIMESTAMPTZ,
+    current_iteration INTEGER, last_error TEXT, parent_session_id TEXT, wait_reason TEXT,
+    is_system BOOLEAN, agent_id TEXT, splash TEXT,
+    owner_provider TEXT, owner_subject TEXT, owner_email TEXT, owner_display_name TEXT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT sess.session_id, sess.orchestration_id, sess.title, sess.title_locked, sess.state, sess.model,
+        sess.reasoning_effort, sess.created_at, sess.updated_at, sess.last_active_at, sess.deleted_at,
+        sess.current_iteration, sess.last_error, sess.parent_session_id, sess.wait_reason,
+        sess.is_system, sess.agent_id, sess.splash,
+        u.provider, u.subject, u.email, u.display_name
+    FROM ${s}.sessions sess
+    LEFT JOIN ${s}.session_owners so ON so.session_id = sess.session_id
+    LEFT JOIN ${s}.users u ON u.user_id = so.user_id
+    WHERE sess.deleted_at IS NULL ORDER BY sess.updated_at DESC;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP FUNCTION IF EXISTS ${s}.cms_list_sessions_page(INT, TIMESTAMPTZ, TEXT, BOOL);
+CREATE FUNCTION ${s}.cms_list_sessions_page(
+    p_limit             INT         DEFAULT 51,
+    p_cursor_updated_at TIMESTAMPTZ DEFAULT NULL,
+    p_cursor_session_id TEXT        DEFAULT NULL,
+    p_include_deleted   BOOL        DEFAULT FALSE
+) RETURNS TABLE (
+    session_id TEXT, orchestration_id TEXT, title TEXT, title_locked BOOLEAN,
+    state TEXT, model TEXT, reasoning_effort TEXT,
+    created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, last_active_at TIMESTAMPTZ, deleted_at TIMESTAMPTZ,
+    current_iteration INTEGER, last_error TEXT, parent_session_id TEXT, wait_reason TEXT,
+    is_system BOOLEAN, agent_id TEXT, splash TEXT,
+    owner_provider TEXT, owner_subject TEXT, owner_email TEXT, owner_display_name TEXT
+) AS $$
+DECLARE
+    v_limit INT := GREATEST(1, LEAST(COALESCE(p_limit, 51), 201));
+BEGIN
+    RETURN QUERY
+    SELECT sess.session_id, sess.orchestration_id, sess.title, sess.title_locked, sess.state, sess.model,
+        sess.reasoning_effort, sess.created_at, sess.updated_at, sess.last_active_at, sess.deleted_at,
+        sess.current_iteration, sess.last_error, sess.parent_session_id, sess.wait_reason,
+        sess.is_system, sess.agent_id, sess.splash,
+        u.provider, u.subject, u.email, u.display_name
+    FROM ${s}.sessions sess
+    LEFT JOIN ${s}.session_owners so ON so.session_id = sess.session_id
+    LEFT JOIN ${s}.users u ON u.user_id = so.user_id
+    WHERE
+        (p_include_deleted OR sess.deleted_at IS NULL)
+        AND (
+            p_cursor_updated_at IS NULL
+            OR sess.updated_at < p_cursor_updated_at
+            OR (sess.updated_at = p_cursor_updated_at AND sess.session_id < p_cursor_session_id)
+        )
+    ORDER BY sess.updated_at DESC, sess.session_id DESC
+    LIMIT v_limit;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP FUNCTION IF EXISTS ${s}.cms_get_session(TEXT);
+CREATE FUNCTION ${s}.cms_get_session(p_session_id TEXT)
+RETURNS TABLE (
+    session_id TEXT, orchestration_id TEXT, title TEXT, title_locked BOOLEAN,
+    state TEXT, model TEXT, reasoning_effort TEXT,
+    created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, last_active_at TIMESTAMPTZ, deleted_at TIMESTAMPTZ,
+    current_iteration INTEGER, last_error TEXT, parent_session_id TEXT, wait_reason TEXT,
+    is_system BOOLEAN, agent_id TEXT, splash TEXT,
+    owner_provider TEXT, owner_subject TEXT, owner_email TEXT, owner_display_name TEXT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT sess.session_id, sess.orchestration_id, sess.title, sess.title_locked, sess.state, sess.model,
+        sess.reasoning_effort, sess.created_at, sess.updated_at, sess.last_active_at, sess.deleted_at,
+        sess.current_iteration, sess.last_error, sess.parent_session_id, sess.wait_reason,
+        sess.is_system, sess.agent_id, sess.splash,
+        u.provider, u.subject, u.email, u.display_name
+    FROM ${s}.sessions sess
+    LEFT JOIN ${s}.session_owners so ON so.session_id = sess.session_id
+    LEFT JOIN ${s}.users u ON u.user_id = so.user_id
+    WHERE sess.session_id = p_session_id AND sess.deleted_at IS NULL;
 END;
 $$ LANGUAGE plpgsql;
 `;
