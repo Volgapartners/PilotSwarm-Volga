@@ -131,16 +131,27 @@ describe("Ablations LIVE", () => {
     }).runTask({ ...dataset, samples: [sample] });
     const baseline = baselineFromMultiTrialResult(baselineRun);
 
-    // Inject a degraded variant: zero passes.
+    // Inject a degraded variant: zero passes. Schema invariant requires
+    // passRate to match passCount / (trials - errorCount), so reset
+    // passRate alongside the per-sample counts and recompute the
+    // task-level summary so the result still validates.
+    const degradedSamples = baselineRun.samples.map((s) => ({
+      ...s,
+      passCount: 0,
+      failCount: s.trials,
+      errorCount: 0,
+      passRate: 0,
+      noQualitySignal: false,
+    }));
     const degraded = {
       ...baselineRun,
-      samples: baselineRun.samples.map((s) => ({
-        ...s,
-        passCount: 0,
-        failCount: s.trials,
-        errorCount: 0,
-        noQualitySignal: false,
-      })),
+      samples: degradedSamples,
+      summary: {
+        ...baselineRun.summary,
+        meanPassRate: 0,
+        stddevPassRate: 0,
+        infraErrorRate: 0,
+      },
     };
     const detector = new RegressionDetector({ alpha: 0.05 });
     const detection = detector.detect(baseline, degraded);

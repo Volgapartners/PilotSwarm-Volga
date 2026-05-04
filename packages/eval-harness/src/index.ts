@@ -215,6 +215,7 @@ export type {
   JudgeClient,
   JudgeCache,
 } from "./graders/judge-types.js";
+export { JudgeOutputFormatError } from "./graders/judge-types.js";
 export {
   FakeJudgeClient,
 } from "./graders/fake-judge-client.js";
@@ -258,7 +259,11 @@ export type {
   RegressionDetectorConfig,
   RegressionDetectorOptions,
 } from "./regression.js";
-export { saveBaseline, loadBaseline } from "./baseline.js";
+export {
+  saveBaseline,
+  loadBaseline,
+  baselineFromMultiTrialResult,
+} from "./baseline.js";
 export type { SaveBaselineOptions, LoadBaselineOptions } from "./baseline.js";
 export { PRCommentReporter } from "./reporters/pr-comment.js";
 

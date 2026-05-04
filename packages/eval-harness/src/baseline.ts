@@ -27,6 +27,31 @@ export interface LoadBaselineOptions {
 // allowing this enables broken-stays-broken gaming with regression-only CI gates.
 const LOW_QUALITY_BASELINE_PASS_RATE_FLOOR = 0.5;
 
+// In-memory projection of MultiTrialResult → Baseline. Same shape as
+// what `saveBaseline` would persist, but without filesystem I/O or
+// quality refusal — the caller (typically tests) is responsible for
+// any guardrails. Kept narrow so RegressionDetector can consume it
+// directly without round-tripping through disk.
+export function baselineFromMultiTrialResult(
+  result: MultiTrialResult,
+): Baseline {
+  return {
+    schemaVersion: 1,
+    taskId: result.taskId,
+    taskVersion: result.taskVersion,
+    ...(result.model !== undefined ? { model: result.model } : {}),
+    createdAt: new Date().toISOString(),
+    samples: result.samples.map((s) => ({
+      sampleId: s.sampleId,
+      passRate: s.passRate ?? 0,
+      trials: s.trials,
+      nonErrorTrials: s.trials - s.errorCount,
+      infraErrorCount: s.errorCount,
+      passCount: s.passCount,
+    })),
+  };
+}
+
 export function saveBaseline(
   result: MultiTrialResult,
   filePath: string,
