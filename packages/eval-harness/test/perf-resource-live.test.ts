@@ -27,6 +27,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const live = process.env.LIVE === "1";
 const strictPgStat = process.env.PG_STAT_STATEMENTS_ENABLED === "1";
+// pg_stat_statements is database-global. When file parallelism is on,
+// concurrent test files pollute each other's snapshots — DB-call counts
+// and peak-connection observations both reflect cluster-wide load, not
+// the cell under measurement. Skip those budgets when running parallel.
+const isolated =
+  process.env.PS_EVAL_FILE_PARALLELISM !== "1";
 
 const databaseUrl =
   process.env.DATABASE_URL ||
@@ -43,7 +49,10 @@ describe("Resource perf LIVE", () => {
   // Reaudit G4 fix: DB-budget tests now skip via Vitest when LIVE=1 but
   // PG_STAT_STATEMENTS_ENABLED is not set, instead of silently passing
   // after a `console.log("SKIP: ...")`.
-  const dbRun = (live && strictPgStat) ? it : it.skip;
+  const dbRun = (live && strictPgStat && isolated) ? it : it.skip;
+  // Peak-connections asserts max concurrent conns ≤ budget, but with
+  // file parallelism every other test file's pool conns count too.
+  const isolatedRun = (live && isolated) ? it : it.skip;
 
   run("PERF: peak RSS memory during single-turn run within budget", async () => {
     const dataset = loadEvalTask(
@@ -78,7 +87,7 @@ describe("Resource perf LIVE", () => {
     expect(checker.passed, checker.violations.join(", ")).toBe(true);
   }, 360_000);
 
-  run("PERF: postgres connection peak during single-turn run within budget", async () => {
+  isolatedRun("PERF: postgres connection peak during single-turn run within budget", async () => {
     const dataset = loadEvalTask(
       resolve(__dirname, "../datasets/tool-call-correctness.v1.json"),
     );

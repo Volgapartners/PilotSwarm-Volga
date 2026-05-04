@@ -30,6 +30,9 @@ const databaseUrl =
 
 const live = process.env.LIVE === "1";
 const strictPgStat = process.env.PG_STAT_STATEMENTS_ENABLED === "1";
+// pg_stat_statements is database-global. Parallel test files pollute each
+// other's snapshots so DB-call counts are not isolated per cell.
+const isolated = process.env.PS_EVAL_FILE_PARALLELISM !== "1";
 
 async function precheckPgStat(): Promise<{ ok: boolean; reason?: string }> {
   const tracker = new DbTracker({ connectionString: databaseUrl });
@@ -43,7 +46,7 @@ describe("Performance & cost LIVE", () => {
   // passes) when LIVE=1 but PG_STAT_STATEMENTS_ENABLED is not set.
   // Setting PG_STAT_STATEMENTS_ENABLED=1 makes them run AND fail loudly
   // if the extension is unavailable at probe time.
-  const dbRun = (live && strictPgStat) ? it : it.skip;
+  const dbRun = (live && strictPgStat && isolated) ? it : it.skip;
 
   run("PERF: single-turn latency p50/p95/p99 within configured budget", async () => {
     const dataset = loadEvalTask(resolve(__dirname, "../datasets/tool-call-correctness.v1.json"));
