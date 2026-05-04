@@ -43,6 +43,7 @@ PG_STAT_STATEMENTS_ENABLED=0
 PROMPT_TESTING=0
 KEEP_DURABILITY_ENV=0
 EVAL_VERBOSE_TEARDOWN=0
+PS_EVAL_FILE_PARALLELISM=0
 
 REPORTS_DIR=""           # empty → auto-generate timestamped dir
 NO_REPORTS=0
@@ -68,6 +69,12 @@ Suite gates (set the matching env var to 1 for the run):
 Behavior knobs:
   --keep-env            KEEP_DURABILITY_ENV=1
   --verbose-teardown    EVAL_VERBOSE_TEARDOWN=1
+  --parallel-files      PS_EVAL_FILE_PARALLELISM=1
+                        Run *-live.test.ts files in parallel. Default OFF
+                        because each file opens SDK pg pools and the local
+                        Postgres saturates at max_connections=200 with ~3
+                        parallel files. Only flip this on if you've bumped
+                        max_connections (or know what you're doing).
   --reports-dir <path>  EVAL_REPORTS_DIR=<path>   (relative to PKG_DIR)
   --no-reports          do not auto-create EVAL_REPORTS_DIR
 
@@ -127,6 +134,7 @@ while (( $# > 0 )); do
     --prompt-testing) PROMPT_TESTING=1 ;;
     --keep-env) KEEP_DURABILITY_ENV=1 ;;
     --verbose-teardown) EVAL_VERBOSE_TEARDOWN=1 ;;
+    --parallel-files) PS_EVAL_FILE_PARALLELISM=1 ;;
     --reports-dir)
       shift; [[ $# -gt 0 ]] || { echo "--reports-dir needs a path" >&2; exit 2; }
       REPORTS_DIR="$1" ;;
@@ -184,6 +192,7 @@ push_env() {
 (( PROMPT_TESTING == 1 )) && push_env PROMPT_TESTING 1
 (( KEEP_DURABILITY_ENV == 1 )) && push_env KEEP_DURABILITY_ENV 1
 (( EVAL_VERBOSE_TEARDOWN == 1 )) && push_env EVAL_VERBOSE_TEARDOWN 1
+(( PS_EVAL_FILE_PARALLELISM == 1 )) && push_env PS_EVAL_FILE_PARALLELISM 1
 (( NO_REPORTS == 0 )) && push_env EVAL_REPORTS_DIR "${REPORTS_DIR}"
 
 if (( DRY_RUN == 1 )); then
