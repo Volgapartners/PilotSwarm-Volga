@@ -146,8 +146,19 @@ while (( $# > 0 )); do
 done
 
 # Default test glob if no positional / no passthrough file given.
+# Expand the glob from inside PKG_DIR so vitest receives concrete file
+# paths — vitest 4 treats unmatched glob args as literal filters and
+# exits "No test files found" if the shell never expanded them.
 if (( ${#TESTS[@]} == 0 )); then
-  TESTS=("${TEST_GLOB_DEFAULT[@]}")
+  pushd "${PKG_DIR}" >/dev/null
+  shopt -s nullglob
+  TESTS=( ${TEST_GLOB_DEFAULT[@]} )
+  shopt -u nullglob
+  popd >/dev/null
+  if (( ${#TESTS[@]} == 0 )); then
+    echo "no live test files matched ${TEST_GLOB_DEFAULT[*]} under ${PKG_DIR}" >&2
+    exit 1
+  fi
 fi
 
 # Reports dir resolution
