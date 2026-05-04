@@ -47,6 +47,32 @@ function loadRepoEnv(): Record<string, string> {
 
 const repoEnv = loadRepoEnv();
 
+// LIVE-suite parallelism discipline:
+//
+// Each LIVE test file spins up real `PilotSwarmWorker` instances that
+// open their own Postgres connection pools. With vitest's default
+// `fileParallelism: true`, multiple `*-live.test.ts` files run
+// concurrently and we exhaust `max_connections` (observed: a single
+// Postgres at max_connections=200 saturates with ~3 parallel live
+// files, each holding an SDK pool + perf-concurrency holding many).
+// The DB returns `53300 sorry, too many clients already` and every
+// in-flight LiveDriver.run() fails as an infra error.
+//
+// Detect LIVE via either process.env or the just-loaded repoEnv (the
+// shell wrapper exports LIVE=1 before invoking vitest, but we also
+// support callers who set LIVE in the repo .env). When LIVE is on,
+// force file-level serialization: parallel within-file `it()` is fine,
+// parallel across files is not.
+//
+// Override via PS_EVAL_FILE_PARALLELISM=1 if you have a Postgres with
+// genuinely large `max_connections` AND want the wallclock win.
+const liveEnabled =
+  (process.env.LIVE ?? repoEnv.LIVE ?? "0") !== "0" &&
+  (process.env.LIVE ?? repoEnv.LIVE ?? "") !== "";
+const forceFileParallel =
+  (process.env.PS_EVAL_FILE_PARALLELISM ?? "") === "1";
+const fileParallelism = forceFileParallel ? true : !liveEnabled;
+
 // Timeout discipline:
 //
 //   * Default `testTimeout` (60s) applies to all unit/contract tests.
@@ -71,6 +97,7 @@ export default defineConfig({
   test: {
     include: ["test/**/*.test.ts"],
     pool: "forks",
+    fileParallelism,
     testTimeout: 60_000,
     hookTimeout: 60_000,
     env: {
