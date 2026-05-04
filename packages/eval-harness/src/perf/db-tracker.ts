@@ -312,6 +312,12 @@ export class DbTracker {
       if (!exists) {
         return emptySnapshot("pg_stat_statements extension not installed");
       }
+      // pg_stat_statements is cluster-wide. Filter by the connected
+      // database's dbid so concurrent activity in other databases on
+      // the same Postgres server (e.g. another app's write traffic)
+      // does not pollute per-turn / per-spawn budget measurements.
+      // current_database() resolves at query time so the same tracker
+      // can be reused across schemas without rebuilding.
       const res = await client.query<{
         queryid: string | null;
         calls: string;
@@ -325,6 +331,7 @@ export class DbTracker {
                 COALESCE(mean_exec_time, 0)::text AS mean_exec_time,
                 LEFT(query, 500) AS query
          FROM pg_stat_statements
+         WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
          ORDER BY total_exec_time DESC
          LIMIT 5000`,
       );
