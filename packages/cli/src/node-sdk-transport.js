@@ -389,7 +389,15 @@ export class NodeSdkTransport {
         this.store = store;
         this.mode = mode;
         this.client = null;
-        this.mgmt = new PilotSwarmManagementClient({ store });
+        this.duroxideSchema = process.env.PILOTSWARM_DUROXIDE_SCHEMA || undefined;
+        this.cmsSchema = process.env.PILOTSWARM_CMS_SCHEMA || undefined;
+        this.factsSchema = process.env.PILOTSWARM_FACTS_SCHEMA || undefined;
+        this.mgmt = new PilotSwarmManagementClient({
+            store,
+            ...(this.duroxideSchema ? { duroxideSchema: this.duroxideSchema } : {}),
+            ...(this.cmsSchema ? { cmsSchema: this.cmsSchema } : {}),
+            ...(this.factsSchema ? { factsSchema: this.factsSchema } : {}),
+        });
         this.artifactStore = createArtifactStore();
         this.sessionHandles = new Map();
         this.workers = [];
@@ -411,6 +419,9 @@ export class NodeSdkTransport {
             this.workers = await startEmbeddedWorkers({
                 count: workerCount,
                 store: this.store,
+                duroxideSchema: this.duroxideSchema,
+                cmsSchema: this.cmsSchema,
+                factsSchema: this.factsSchema,
             });
         }
         const sessionCreationMetadata = this.resolveSessionCreationMetadata();
@@ -419,6 +430,9 @@ export class NodeSdkTransport {
         this.creatableAgents = sessionCreationMetadata.creatableAgents;
         this.client = new PilotSwarmClient({
             store: this.store,
+            ...(this.duroxideSchema ? { duroxideSchema: this.duroxideSchema } : {}),
+            ...(this.cmsSchema ? { cmsSchema: this.cmsSchema } : {}),
+            ...(this.factsSchema ? { factsSchema: this.factsSchema } : {}),
             ...(this.sessionPolicy ? { sessionPolicy: this.sessionPolicy } : {}),
             ...(this.allowedAgentNames.length > 0 ? { allowedAgentNames: this.allowedAgentNames } : {}),
         });

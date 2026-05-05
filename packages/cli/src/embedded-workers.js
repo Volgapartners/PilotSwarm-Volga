@@ -4,7 +4,13 @@ import os from "node:os";
 import { createRequire } from "node:module";
 import { PilotSwarmWorker } from "pilotswarm-sdk";
 
-export async function startEmbeddedWorkers({ count, store }) {
+export async function startEmbeddedWorkers({
+    count,
+    store,
+    duroxideSchema,
+    cmsSchema,
+    factsSchema,
+}) {
     const workers = [];
     if (!count || count <= 0) return workers;
 
@@ -39,6 +45,9 @@ export async function startEmbeddedWorkers({ count, store }) {
                 workerNodeId: `local-${index}`,
                 systemMessage: workerModuleConfig.systemMessage || process.env._TUI_SYSTEM_MESSAGE || undefined,
                 pluginDirs,
+                ...(duroxideSchema ? { duroxideSchema } : {}),
+                ...(cmsSchema ? { cmsSchema } : {}),
+                ...(factsSchema ? { factsSchema } : {}),
             });
 
             const workerTools = typeof workerModuleConfig.createTools === "function"
