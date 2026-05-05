@@ -36,7 +36,42 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { resolve, basename, join, relative } from "node:path";
+import { resolve, basename, join, relative, dirname } from "node:path";
+
+// -------------------------------------------------------------------
+// Repo / package layout resolution
+// -------------------------------------------------------------------
+//
+// The script lives at packages/eval-harness/bin/report.mjs. From its
+// own URL we walk up two levels to the eval-harness package root and
+// three to the repo root. Resolved once at module load — every render
+// path goes through these so nothing is hand-typed.
+
+const SCRIPT_PATH = new URL(import.meta.url).pathname;
+const PKG_ROOT = resolve(SCRIPT_PATH, "../../"); // packages/eval-harness/
+const REPO_ROOT = resolve(PKG_ROOT, "../../"); // monorepo root
+
+/**
+ * Render an absolute path inside a backtick code span. If `mustExist`,
+ * verifies the path exists on disk and renders `path-not-found:<abs>`
+ * when it doesn't, so a broken pointer in the report can never silently
+ * mislead a reader.
+ */
+function renderPath(abs, { mustExist = false } = {}) {
+  const a = String(abs);
+  if (mustExist && !existsSync(a)) {
+    return `\`path-not-found:${a}\``;
+  }
+  return `\`${a}\``;
+}
+
+function repoPath(...parts) {
+  return resolve(REPO_ROOT, ...parts);
+}
+
+function pkgPath(...parts) {
+  return resolve(PKG_ROOT, ...parts);
+}
 
 function parseArgs(argv) {
   const opts = { dir: "", out: "", stdout: false };
@@ -69,10 +104,7 @@ function printHelp() {
 }
 
 function findLatestReportsDir() {
-  const root = resolve(
-    new URL(import.meta.url).pathname,
-    "../../.eval-results",
-  );
+  const root = pkgPath(".eval-results");
   let entries;
   try {
     entries = readdirSync(root, { withFileTypes: true });
@@ -135,6 +167,27 @@ const SUITES = [
   "PROMPT-TESTING",
   "OTHER",
 ];
+
+// Each suite header lists the test file(s) that drive it so the reader
+// can jump straight from a failing suite to the source. Paths are
+// pkg-relative; resolved to absolute via pkgPath() at render time and
+// rendered as `path-not-found:` if the file moved.
+const SUITE_TEST_FILES = {
+  FUNCTIONAL: ["test/live-driver-live.test.ts"],
+  DURABILITY: ["test/durability-live.test.ts"],
+  ABLATIONS: ["test/ablations-live.test.ts"],
+  "LLM-JUDGE": ["test/llm-judge-live.test.ts"],
+  PERFORMANCE: [
+    "test/performance-live.test.ts",
+    "test/perf-resource-live.test.ts",
+    "test/perf-cold-warm-live.test.ts",
+    "test/perf-concurrency-live.test.ts",
+    "test/perf-durability-live.test.ts",
+  ],
+  SAFETY: ["test/safety-live.test.ts"],
+  "PROMPT-TESTING": ["test/prompt-testing-live.test.ts"],
+  OTHER: [],
+};
 
 function classifySuite({ taskId, caseId, runId }) {
   const tid = String(taskId ?? "");
@@ -576,6 +629,7 @@ function renderMarkdown(agg) {
   out.push("## Contents");
   out.push("");
   out.push("- [Run context](#run-context)");
+  out.push("- [Paths](#paths)");
   out.push("- [Top-line totals](#top-line-totals)");
   out.push("- [Suite breakdown](#suite-breakdown)");
   for (const suite of SUITES) {
@@ -589,6 +643,7 @@ function renderMarkdown(agg) {
   out.push("- [Prompt-testing variants](#prompt-testing-variants)");
   out.push("- [How to read this](#how-to-read-this)");
   out.push("- [What to do next](#what-to-do-next)");
+  out.push("- [Where to look next](#where-to-look-next)");
   out.push("");
 
   // -----------------------------------------------------------------
@@ -642,6 +697,38 @@ function renderMarkdown(agg) {
   ]) {
     out.push(`| ${k} | ${env[k] ?? "—"} |`);
   }
+  out.push("");
+
+  // -----------------------------------------------------------------
+  // Paths — every absolute path the reader might want to open, in one
+  // place, all verified with existsSync at render time.
+  // -----------------------------------------------------------------
+  out.push('<a id="paths"></a>');
+  out.push("## Paths");
+  out.push("");
+  out.push("All paths absolute. Open in your editor / `cd`-able directly. Missing paths render as `path-not-found:<abs>`.");
+  out.push("");
+  out.push("| What | Path |");
+  out.push("|---|---|");
+  out.push(`| Reports dir (this run) | ${renderPath(agg.dir, { mustExist: true })} |`);
+  out.push(`| Repo root | ${renderPath(REPO_ROOT, { mustExist: true })} |`);
+  out.push(`| Eval-harness package | ${renderPath(PKG_ROOT, { mustExist: true })} |`);
+  out.push(
+    `| System prompt under test | ${renderPath(repoPath("packages/sdk/plugins/system/agents/default.agent.md"), { mustExist: true })} |`,
+  );
+  out.push(`| Live test root | ${renderPath(pkgPath("test"), { mustExist: true })} |`);
+  out.push(`| Source root | ${renderPath(pkgPath("src"), { mustExist: true })} |`);
+  out.push(`| Datasets dir | ${renderPath(pkgPath("datasets"), { mustExist: true })} |`);
+  const goldensDir = pkgPath("datasets/goldens");
+  if (existsSync(goldensDir)) {
+    out.push(`| Goldens dir | ${renderPath(goldensDir, { mustExist: true })} |`);
+  } else {
+    out.push(
+      `| Goldens dir | _(not yet captured — see \`packages/eval-harness/docs/PROMPT-ITERATION.md\` § Golden-snapshot regression flow)_ |`,
+    );
+  }
+  out.push(`| Run-live wrapper | ${renderPath(pkgPath("bin/run-live.sh"), { mustExist: true })} |`);
+  out.push(`| Report generator | ${renderPath(pkgPath("bin/report.mjs"), { mustExist: true })} |`);
   out.push("");
 
   // -----------------------------------------------------------------
@@ -699,6 +786,15 @@ function renderMarkdown(agg) {
       `\`${bar(b.passed, b.total, 24)}\` ${pct(b.passed, b.total)}  (${b.passed}/${b.total} pass, ${b.failed} fail, ${b.errored} infra-err)`,
     );
     out.push("");
+    const testFiles = SUITE_TEST_FILES[suite] ?? [];
+    if (testFiles.length > 0) {
+      out.push(
+        `_Test file${testFiles.length === 1 ? "" : "s"}:_ ${testFiles
+          .map((rel) => renderPath(pkgPath(rel), { mustExist: true }))
+          .join(", ")}`,
+      );
+      out.push("");
+    }
     if (suite === "PROMPT-TESTING") {
       // Collapsed roll-up — full detail in the Prompt-testing variants section
       out.push(
@@ -1064,43 +1160,121 @@ function renderMarkdown(agg) {
   out.push('<a id="what-to-do-next"></a>');
   out.push("## What to do next");
   out.push("");
+  out.push(
+    "All commands below are copy-pasteable from the repo root (" +
+      renderPath(REPO_ROOT, { mustExist: true }) +
+      ").",
+  );
+  out.push("");
   // Build action list off observed failure categories
   const haveCats = new Set(fails.map((f) => classifyFailure(f)));
+  const runLive = renderPath(pkgPath("bin/run-live.sh"), { mustExist: true });
+  const agentMd = repoPath("packages/sdk/plugins/system/agents/default.agent.md");
+  const promptTestingFile = renderPath(pkgPath("test/prompt-testing-live.test.ts"), {
+    mustExist: true,
+  });
+  const ablationsFile = renderPath(pkgPath("test/ablations-live.test.ts"), {
+    mustExist: true,
+  });
+  const judgeFile = renderPath(pkgPath("test/llm-judge-live.test.ts"), {
+    mustExist: true,
+  });
+  const troubleshootingDoc = renderPath(pkgPath("docs/TROUBLESHOOTING.md"), {
+    mustExist: true,
+  });
   if (haveCats.has("infra")) {
     out.push(
-      "- **Infra failures present.** Don't chase prompts yet. Inspect the failing case's raw artifact JSON in this dir, then re-run the single suite — `bin/run-live.sh -- test/<file>-live.test.ts -t '<test name>'`. See `docs/TROUBLESHOOTING.md`.",
+      `- **Infra failures present.** Don't chase prompts yet. Inspect each failing case's raw artifact JSON (paths inline in the [Failures](#failures) section), then re-run the single suite — \`${pkgPath("bin/run-live.sh")} -- <test-file> -t '<test name>'\`. See ${troubleshootingDoc}.`,
     );
   }
   if (haveCats.has("sdk-perf")) {
     out.push(
-      "- **SDK perf budget overrun.** Profile PilotSwarm directly with `--pg-stat --heavy` and inspect `LatencyTracker` / `DbTracker` console output. The jsonl doesn't carry the budget delta — re-run with vitest's reporter visible.",
+      `- **SDK perf budget overrun.** Profile PilotSwarm directly with \`${pkgPath("bin/run-live.sh")} --pg-stat --heavy\` and inspect \`LatencyTracker\` / \`DbTracker\` console output. The jsonl doesn't carry the budget delta — re-run with vitest's reporter visible.`,
     );
   }
   if (haveCats.has("model-quality (deterministic grader)")) {
     out.push(
-      "- **Deterministic grader fails (tool-call / response containment).** Most often: prompt iteration. Edit `packages/sdk/plugins/system/agents/default.agent.md`, then `bin/run-live.sh --prompt-testing -- test/prompt-testing-live.test.ts -t '<test name>'` to confirm. Use ablations (`bin/run-live.sh -- test/ablations-live.test.ts`) to identify which section of the prompt is load-bearing.",
+      `- **Deterministic grader fails (tool-call / response containment).** Most often: prompt iteration. Edit ${renderPath(agentMd, { mustExist: true })}, then \`${pkgPath("bin/run-live.sh")} --prompt-testing -- ${pkgPath("test/prompt-testing-live.test.ts")} -t '<test name>'\` to confirm. Use ablations (\`${pkgPath("bin/run-live.sh")} -- ${pkgPath("test/ablations-live.test.ts")}\`) to identify which section of the prompt is load-bearing.`,
     );
   }
   if (haveCats.has("model-quality (judge-graded)")) {
     out.push(
-      "- **Judge-graded fails.** Re-run with the judge sub-suite: `bin/run-live.sh --judge -- test/llm-judge-live.test.ts -t '<test name>'`. If the judge reasoning looks miscalibrated, swap `LIVE_JUDGE_MODEL` and re-run for cross-judge agreement.",
+      `- **Judge-graded fails.** Re-run with the judge sub-suite: \`${pkgPath("bin/run-live.sh")} --judge -- ${pkgPath("test/llm-judge-live.test.ts")} -t '<test name>'\`. If the judge reasoning looks miscalibrated, swap \`LIVE_JUDGE_MODEL\` and re-run for cross-judge agreement.`,
     );
   }
   if (fails.length === 0) {
     out.push(
-      "- **All green.** If this was a smoke / single-trial pass, bump `PROMPT_TESTING_TRIALS=5` (or run `bin/run-live.sh --all`) before treating it as conclusive — single LIVE trials are stochastic.",
+      `- **All green.** If this was a smoke / single-trial pass, bump \`PROMPT_TESTING_TRIALS=5\` (or run \`${pkgPath("bin/run-live.sh")} --all\`) before treating it as conclusive — single LIVE trials are stochastic.`,
     );
   }
   out.push(
-    "- **Drill into a failing case:** every failure entry above includes a relative `<runId>/<caseId>.json` pointer with full `scores`, `observed.toolCalls`, and the complete `cmsEvents` log.",
+    "- **Drill into a failing case:** every failure entry above lists the absolute jsonl path, the failure-detail JSON path (when present), the test file, and a copy-pasteable re-run command.",
   );
   out.push(
-    "- **Compare across runs:** there is no automatic baseline diff in this report — compare two `REPORT-*.md` outputs side-by-side, or roll up the jsonl across dirs (recipe in `docs/PROMPT-ITERATION.md` § Reading the LIVE reports).",
+    `- **Compare across runs:** there is no automatic baseline diff in this report — compare two \`REPORT-*.md\` outputs side-by-side, or roll up the jsonl across dirs (recipe in ${renderPath(pkgPath("docs/PROMPT-ITERATION.md"), { mustExist: true })} § Reading the LIVE reports).`,
   );
   out.push("");
   out.push(
-    "Raw artifacts live alongside this report: one `<runId>.jsonl` per task plus `<runId>/<caseId>.json` for any failing case. Re-run `bin/report.mjs` against the same dir to refresh after additional jsonl writes.",
+    `Raw artifacts live alongside this report at ${renderPath(agg.dir, { mustExist: true })}: one \`<runId>.jsonl\` per task plus \`<runId>/<caseId>.json\` for any failing case. Re-run \`${pkgPath("bin/report.mjs")}\` against the same dir to refresh after additional jsonl writes.`,
   );
+  out.push("");
+
+  // -----------------------------------------------------------------
+  // Where to look next — doc index, every entry an absolute path so the
+  // reader can `cat` / open without searching.
+  // -----------------------------------------------------------------
+  out.push('<a id="where-to-look-next"></a>');
+  out.push("## Where to look next");
+  out.push("");
+  out.push("| Doc | What's in here |");
+  out.push("|---|---|");
+  const docs = [
+    [
+      "docs/PROMPT-ITERATION.md",
+      "Day-to-day loop for editing the system prompt and getting fast LIVE signal back; report layout reference.",
+    ],
+    [
+      "docs/TROUBLESHOOTING.md",
+      "First-stop when you see infra failures or driver timeouts.",
+    ],
+    [
+      "docs/SUITES.md",
+      "Canonical inventory of every test suite, its gating env, and what it covers.",
+    ],
+    [
+      "docs/JUDGE-CLIENTS.md",
+      "OpenAI vs PilotSwarm judge client selection precedence and cost-rate contract.",
+    ],
+    [
+      "docs/DRIVERS.md",
+      "FakeDriver / LiveDriver / ChaosDriver contracts and when to use which.",
+    ],
+    [
+      "docs/PERF.md",
+      "LatencyTracker / CostTracker / DB-budget signal; how budgets gate.",
+    ],
+    [
+      "docs/CI-INTEGRATION.md",
+      "How to wire eval-harness into CI, gating, and report archival.",
+    ],
+    [
+      "docs/CONTRIBUTING.md",
+      "Adding new graders / suites / datasets without breaking the runner contract.",
+    ],
+    [
+      "docs/INVARIANT-COVERAGE.md",
+      "Which SDK invariants are exercised by which tests; coverage gaps.",
+    ],
+    [
+      "docs/PROMPT-TESTING-SPEC-DRIFT.md",
+      "Schema drift between the v1 path-suffixed goldens and the v2 internal schema.",
+    ],
+  ];
+  for (const [rel, blurb] of docs) {
+    const abs = pkgPath(rel);
+    out.push(`| ${renderPath(abs, { mustExist: true })} | ${blurb} |`);
+  }
+  out.push("");
   out.push("");
 
   return out.join("\n");
