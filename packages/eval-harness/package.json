@@ -29,7 +29,8 @@
     "test:live:all": "bin/run-live.sh --all",
     "test:live:cheap": "bin/run-live.sh --cheap",
     "test:live:perf": "bin/run-live.sh --perf",
-    "test:live:judge": "bin/run-live.sh --judge"
+    "test:live:judge": "bin/run-live.sh --judge",
+    "report": "node bin/report.mjs"
   },
   "dependencies": {
     "zod": "^3.23.0"

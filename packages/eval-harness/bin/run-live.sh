@@ -44,6 +44,7 @@ PROMPT_TESTING=0
 KEEP_DURABILITY_ENV=0
 EVAL_VERBOSE_TEARDOWN=0
 PS_EVAL_FILE_PARALLELISM=0
+GENERATE_REPORT=0
 
 REPORTS_DIR=""           # empty → auto-generate timestamped dir
 NO_REPORTS=0
@@ -77,6 +78,9 @@ Behavior knobs:
                         max_connections (or know what you're doing).
   --reports-dir <path>  EVAL_REPORTS_DIR=<path>   (relative to PKG_DIR)
   --no-reports          do not auto-create EVAL_REPORTS_DIR
+  --report              after vitest exits, generate a consolidated
+                        Markdown report at REPORT-<ts>.md inside the
+                        reports dir (uses bin/report.mjs)
 
 Grouped flags:
   --all                 judge + heavy + heavy-n8 + durability-perf + pg-stat
@@ -135,6 +139,7 @@ while (( $# > 0 )); do
     --keep-env) KEEP_DURABILITY_ENV=1 ;;
     --verbose-teardown) EVAL_VERBOSE_TEARDOWN=1 ;;
     --parallel-files) PS_EVAL_FILE_PARALLELISM=1 ;;
+    --report) GENERATE_REPORT=1 ;;
     --reports-dir)
       shift; [[ $# -gt 0 ]] || { echo "--reports-dir needs a path" >&2; exit 2; }
       REPORTS_DIR="$1" ;;
@@ -215,4 +220,34 @@ if [[ "${EVAL_SKIP_BUILD:-0}" != "1" ]]; then
 fi
 
 # shellcheck disable=SC2068
-exec env ${ENV_PAIRS[@]} npx vitest run "${TESTS[@]}" ${VITEST_PASSTHRU[@]+"${VITEST_PASSTHRU[@]}"}
+if (( GENERATE_REPORT == 0 )); then
+  exec env ${ENV_PAIRS[@]} npx vitest run "${TESTS[@]}" ${VITEST_PASSTHRU[@]+"${VITEST_PASSTHRU[@]}"}
+fi
+
+# Run vitest, capture exit code, generate report regardless, exit with
+# vitest's code so CI gating still fires.
+set +e
+env ${ENV_PAIRS[@]} npx vitest run "${TESTS[@]}" ${VITEST_PASSTHRU[@]+"${VITEST_PASSTHRU[@]}"}
+VITEST_EXIT=$?
+set -e
+
+REPORT_TARGET=""
+if (( NO_REPORTS == 0 )) && [[ -n "${REPORTS_DIR}" ]]; then
+  if [[ "${REPORTS_DIR}" = /* ]]; then
+    REPORT_TARGET="${REPORTS_DIR}"
+  else
+    REPORT_TARGET="${PKG_DIR}/${REPORTS_DIR}"
+  fi
+fi
+
+if [[ -d "${REPORT_TARGET}" ]]; then
+  REPORT_PATH="$(node "${PKG_DIR}/bin/report.mjs" "${REPORT_TARGET}")" || true
+  if [[ -n "${REPORT_PATH}" ]]; then
+    echo ""
+    echo "Report: ${REPORT_PATH}"
+  fi
+else
+  echo "[run-live.sh] --report requested but REPORT_TARGET '${REPORT_TARGET}' is not a directory; skipping." >&2
+fi
+
+exit "${VITEST_EXIT}"

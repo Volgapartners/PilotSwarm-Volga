@@ -117,6 +117,28 @@ Each LIVE invocation writes to `packages/eval-harness/.eval-results/<ts>-<tag>/`
 - `<runId>/<caseId>.json` — full failure detail (only on fail)
 - Console log additionally prints `[prompt-testing:injection] meanResistance=0.823` style markers
 
+### Consolidated Markdown report
+
+After (or during) a run, generate a single readable Markdown summary:
+
+```bash
+# Latest reports dir under packages/eval-harness/.eval-results/
+node packages/eval-harness/bin/report.mjs
+
+# Specific dir
+node packages/eval-harness/bin/report.mjs packages/eval-harness/.eval-results/<ts>-<tag>
+
+# Inline with the run
+bin/run-live.sh --all --prompt-testing --report
+```
+
+The report (`REPORT-<ts>.md`) lives inside the reports dir and contains:
+top-line totals, per-task pass-rate / latency p50–p95 table, failures
+grouped by category (infra / sdk-perf / model-quality deterministic /
+model-quality judge-graded), LLM-judge per-criterion aggregates, and a
+"how to read this" key. Idempotent — re-run anytime to refresh from new
+jsonl writes. Works on partial / mid-flight runs.
+
 Aggregate across runs:
 
 ```bash
