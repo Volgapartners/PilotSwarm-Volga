@@ -989,8 +989,37 @@ function renderMarkdown(agg) {
             out.push(`    - seq=${ev.seq} ${fmtCmsEvent(ev)}`);
           }
         }
+        // Absolute paths for every artifact + a re-run command
+        out.push(
+          `  - _raw jsonl:_ ${renderPath(join(agg.dir, f.jsonlFile), { mustExist: true })}`,
+        );
         if (f.failDetail) {
-          out.push(`  - _raw artifact:_ \`${f.failDetail}\``);
+          out.push(
+            `  - _failure detail:_ ${renderPath(join(agg.dir, f.failDetail), { mustExist: true })}`,
+          );
+        }
+        const suiteFiles = SUITE_TEST_FILES[f.suite] ?? [];
+        if (suiteFiles.length > 0) {
+          out.push(
+            `  - _test file${suiteFiles.length === 1 ? "" : "s"}:_ ${suiteFiles
+              .map((rel) => renderPath(pkgPath(rel), { mustExist: true }))
+              .join(", ")}`,
+          );
+          // Re-run hint — first test file gets the full command; the
+          // user picks `-t '<token>'` from runId or caseId. Prefer a
+          // human-readable runId (e.g. `live-functional-spawn-agent` →
+          // `spawn-agent`) when it exists; fall back to caseId. Skip
+          // GUID-shaped runIds — vitest's `-t` would never match them.
+          const guidLike = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-/.test(
+            String(f.runId ?? ""),
+          );
+          const filterToken =
+            !guidLike && typeof f.runId === "string" && /^[a-z]/.test(f.runId)
+              ? f.runId.replace(/^(live-|safety-)/, "")
+              : String(f.caseId ?? "");
+          out.push(
+            `  - _re-run:_ \`${pkgPath("bin/run-live.sh")} -- ${pkgPath(suiteFiles[0])} -t '${filterToken}'\``,
+          );
         }
         out.push("");
       }
