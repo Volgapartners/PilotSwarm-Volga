@@ -90,6 +90,22 @@ const AUTH_FAILURE_USER_HINT =
     "Open the Admin Console (portal toolbar 'Admin' button or TUI Shift+A) " +
     "to update your GitHub Copilot key, then resend the prompt to retry.";
 
+/**
+ * Detects permanent model-unavailability errors of the form
+ * `Model "X" is not available` (the model name is embedded in the message).
+ * Retrying these is pointless — the same model will keep failing — and
+ * without this guard the session enters an infinite dehydrate/rehydrate loop.
+ * Treat as non-retryable; surface a hint to update model_providers.json.
+ */
+function isModelUnavailableError(message?: string): boolean {
+    return /model\s*(".*?"\s*)?is\s*not\s*(available|supported|accessible)/i.test(String(message || ""));
+}
+
+const MODEL_UNAVAILABLE_USER_HINT =
+    "The configured model is not available on this provider. " +
+    "Update the defaultModel (or model_providers.json) to a model that is deployed, " +
+    "then resend the prompt to retry.";
+
 function buildConnectionClosedRetryDetail(retryAttempt: number): string {
     return `Live Copilot connection lost; retry ${retryAttempt}/${COPILOT_CONNECTION_CLOSED_MAX_RETRIES} in ${COPILOT_CONNECTION_CLOSED_RETRY_DELAY_SECONDS}s.`;
 }
@@ -2076,6 +2092,18 @@ export function* durableSessionOrchestration_1_0_51(
                 return;
             }
 
+            if (isModelUnavailableError(errorMsg)) {
+                const blockedDetail = `${errorMsg} — ${MODEL_UNAVAILABLE_USER_HINT}`;
+                ctx.traceInfo(`[orch] runTurn FAILED with model-unavailable error; not retrying: ${errorMsg}`);
+                publishStatus("error", {
+                    error: blockedDetail,
+                    retriesExhausted: true,
+                    modelUnavailable: true,
+                });
+                retryCount = 0;
+                return;
+            }
+
             retryCount++;
             ctx.traceInfo(`[orch] runTurn FAILED (attempt ${retryCount}/${MAX_RETRIES}): ${errorMsg}`);
 
@@ -2996,6 +3024,18 @@ export function* durableSessionOrchestration_1_0_51(
                     publishStatus("failed", { error: fatalError, fatal: true });
                     yield manager.updateCmsState(input.sessionId, "failed", fatalError);
                     throw new Error(fatalError);
+                }
+
+                if (isModelUnavailableError(result.message)) {
+                    const blockedDetail = `${result.message} — ${MODEL_UNAVAILABLE_USER_HINT}`;
+                    ctx.traceInfo(`[orch] turn returned model-unavailable error; not retrying: ${result.message}`);
+                    publishStatus("error", {
+                        error: blockedDetail,
+                        retriesExhausted: true,
+                        modelUnavailable: true,
+                    });
+                    retryCount = 0;
+                    return;
                 }
 
                 retryCount++;

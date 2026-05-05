@@ -19,6 +19,21 @@
                     "name": "claude-sonnet-4.6",
                     "description": "Claude Sonnet 4.6. Strong all-rounder. Good balance of capability and speed. Use for general coding, analysis, and multi-step tasks.",
                     "cost": "medium"
+                },
+                {
+                    "name": "gpt-4.1",
+                    "description": "GPT-4.1 via GitHub Copilot. Strong reasoning, planning, and coding tasks. 128K context.",
+                    "cost": "high"
+                },
+                {
+                    "name": "gpt-5-mini",
+                    "description": "GPT-5 mini via GitHub Copilot. Fast, lightweight everyday model. 264K context, supports reasoning effort.",
+                    "cost": "medium"
+                },
+                {
+                    "name": "gpt-4o",
+                    "description": "GPT-4o via GitHub Copilot. Versatile, vision-capable. 128K context.",
+                    "cost": "medium"
                 }
             ]
         },

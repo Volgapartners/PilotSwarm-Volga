@@ -6,17 +6,22 @@
             "githubToken": "env:GITHUB_TOKEN",
             "models": [
                 {
-                    "name": "gpt-5.4",
-                    "description": "GPT-5.4. Strong flagship GPT model for harder reasoning, planning, and coding tasks through GitHub Copilot.",
+                    "name": "gpt-4.1",
+                    "description": "GPT-4.1 via GitHub Copilot. Strong reasoning, planning, and coding tasks. 128K context.",
                     "cost": "high"
                 },
                 {
-                    "name": "gpt-5.4-mini",
-                    "description": "GPT-5.4 Mini. Faster, lighter-weight GPT option for everyday chat, drafting, and cheaper iteration.",
+                    "name": "gpt-5-mini",
+                    "description": "GPT-5 mini via GitHub Copilot. Fast, lightweight everyday model. 264K context, supports reasoning effort.",
+                    "cost": "medium"
+                },
+                {
+                    "name": "gpt-4o",
+                    "description": "GPT-4o via GitHub Copilot. Versatile, vision-capable. 128K context.",
                     "cost": "medium"
                 }
             ]
         }
     ],
-    "defaultModel": "github-copilot:gpt-5.4-mini"
+    "defaultModel": "github-copilot:gpt-5-mini"
 }

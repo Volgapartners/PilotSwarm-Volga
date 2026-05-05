@@ -328,6 +328,14 @@ describe("isModelFallbackEligibleError — eligible (model-layer errors)", () =>
         expect(isModelFallbackEligibleError("Model is not available")).toBe(true);
     });
 
+    it("returns true for 'Model \"gpt-5.4-mini\" is not available' (model name in message)", () => {
+        expect(isModelFallbackEligibleError('Model "gpt-5.4-mini" is not available.')).toBe(true);
+    });
+
+    it("returns true for full Execution failed wrapping of model-not-available", () => {
+        expect(isModelFallbackEligibleError('Execution failed: Model "gpt-5.4-mini" is not available.')).toBe(true);
+    });
+
     it("returns true for 'rate limit exceeded'", () => {
         expect(isModelFallbackEligibleError("rate limit exceeded")).toBe(true);
     });

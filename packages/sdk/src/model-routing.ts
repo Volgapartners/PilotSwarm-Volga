@@ -195,7 +195,7 @@ export function routeTurn(
  * where trying an alternative model may succeed.
  */
 const FALLBACK_ELIGIBLE_PATTERNS: ReadonlyArray<RegExp> = [
-    /model\s*(not\s*found|is\s*not\s*(available|supported|accessible))/i,
+    /model\s*(".*?"\s*)?(not\s*found|is\s*not\s*(available|supported|accessible))/i,
     /rate\s*limit/i,
     /\b429\b/,
     /\b503\b/,
