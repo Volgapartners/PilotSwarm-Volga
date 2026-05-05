@@ -1198,7 +1198,7 @@ function renderMarkdown(agg) {
   );
   out.push("");
   out.push(
-    "Suites map by case-id prefix: `live.functional.*`/`live.subagent.*` → FUNCTIONAL, `perf.*` → PERFORMANCE, `ablation.*` → ABLATIONS, `direct.*`/`indirect.*`/`output.*`/`tool-abuse.*`/`subjective.*` → SAFETY, `*::*::*` (or `pt-cell-*` task) → PROMPT-TESTING. See [`docs/SUITES.md`](../../docs/SUITES.md) for the canonical list.",
+    `Suites map by case-id prefix: \`live.functional.*\`/\`live.subagent.*\` → FUNCTIONAL, \`perf.*\` → PERFORMANCE, \`ablation.*\` → ABLATIONS, \`direct.*\`/\`indirect.*\`/\`output.*\`/\`tool-abuse.*\`/\`subjective.*\` → SAFETY, \`*::*::*\` (or \`pt-cell-*\` task) → PROMPT-TESTING. See ${renderPath(pkgPath("docs/SUITES.md"), { mustExist: true })} for the canonical list.`,
   );
   out.push("");
 
