@@ -4,6 +4,8 @@ Evaluation harness for PilotSwarm agents. The deterministic fixture runner, stat
 
 The harness is organized into six capability suites — see [`docs/SUITES.md`](./docs/SUITES.md) for the full catalog and gating matrix.
 
+Iterating on PilotSwarm's actual system prompt (`packages/sdk/plugins/system/agents/default.agent.md`)? See [`docs/PROMPT-ITERATION.md`](./docs/PROMPT-ITERATION.md) for the inner-loop / single-suite-LIVE / full-LIVE workflow.
+
 | Suite        | File                                      | LIVE tests | Gating                                  |
 |--------------|-------------------------------------------|-----------:|-----------------------------------------|
 | FUNCTIONAL   | `test/live-driver-live.test.ts`           | 9          | `LIVE=1`                                |
