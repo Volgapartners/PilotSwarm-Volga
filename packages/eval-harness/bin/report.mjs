@@ -13,9 +13,30 @@
 //   bin/report.mjs --stdout                 # write Markdown to stdout
 //
 // Output: REPORT-<ts>.md in the reports dir (or --out path).
+//
+// The report layout (in order):
+//
+//   1. TOC + run header (env fingerprint, suite gates, judge models, wall)
+//   2. Top-line totals + ASCII pass-rate bar
+//   3. Suite breakdown (FUNCTIONAL / DURABILITY / ABLATIONS / LLM-JUDGE /
+//      PERFORMANCE / SAFETY / PROMPT-TESTING / OTHER) with per-suite
+//      pass-rate bars and case tables
+//   4. Performance highlights (slowest cases, latency p50/p95/p99 by suite,
+//      cost-aggregate when present)
+//   5. Failures grouped by category, each with reasons + observed response
+//      excerpt + key CMS events + raw-artifact pointer
+//   6. LLM-judge scores (criterion aggregate + non-pass details)
+//   7. Prompt-testing variant matrix (collapsed pt-cell-* rollup)
+//   8. "How to read this" + "What to do next" actionable block
 
-import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { resolve, basename, join } from "node:path";
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { resolve, basename, join, relative } from "node:path";
 
 function parseArgs(argv) {
   const opts = { dir: "", out: "", stdout: false };
@@ -60,7 +81,6 @@ function findLatestReportsDir() {
   }
   const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
   if (dirs.length === 0) return null;
-  // Prefer timestamped suffixes; fall back to mtime
   const sorted = dirs
     .map((name) => {
       const full = join(root, name);
@@ -96,22 +116,65 @@ function readJsonl(path) {
   return lines;
 }
 
+// -------------------------------------------------------------------
+// Suite mapping
+// -------------------------------------------------------------------
+//
+// taskId is too coarse (every functional/perf/ablation/regression case
+// is `tool-call-correctness`). Use a layered classifier on caseId +
+// taskId + runId to land each sample in the right capability suite.
+// Order matters; first match wins.
+
+const SUITES = [
+  "FUNCTIONAL",
+  "DURABILITY",
+  "ABLATIONS",
+  "LLM-JUDGE",
+  "PERFORMANCE",
+  "SAFETY",
+  "PROMPT-TESTING",
+  "OTHER",
+];
+
+function classifySuite({ taskId, caseId, runId }) {
+  const tid = String(taskId ?? "");
+  const cid = String(caseId ?? "");
+  const rid = String(runId ?? "");
+  if (tid.startsWith("pt-cell-") || cid.includes("::")) return "PROMPT-TESTING";
+  if (tid.startsWith("safety-") || /^(direct|indirect|output|tool-abuse|subjective)\./.test(cid))
+    return "SAFETY";
+  if (/^perf\./.test(cid) || rid.includes("performance")) return "PERFORMANCE";
+  if (/^ablation\./.test(cid)) return "ABLATIONS";
+  if (rid === "live-llm-judge" || rid.includes("llm-judge")) return "LLM-JUDGE";
+  if (rid.includes("durability") || /durability|chaos|handoff/.test(cid))
+    return "DURABILITY";
+  if (
+    /^live\.functional\./.test(cid) ||
+    /^live\.subagent\./.test(cid) ||
+    rid.startsWith("live-functional") ||
+    rid.startsWith("live-subagent") ||
+    rid.startsWith("live-parallel") ||
+    rid.startsWith("live-tool-registration")
+  )
+    return "FUNCTIONAL";
+  // Fallback: a bare `single.add.basic` case from `tool-call-correctness`
+  // most likely came from an unnamed multi-trial run — treat as FUNCTIONAL
+  // smoke unless we have a more specific signal.
+  if (cid === "single.add.basic" && tid === "tool-call-correctness") return "FUNCTIONAL";
+  return "OTHER";
+}
+
 function classifyFailure(sample) {
-  // Heuristic. Order matters.
-  // 1. infraError === true on any score → infra
-  // 2. observed undefined → infra
-  // 3. score reasons mentioning specific patterns → SDK / model / judge
   if (sample.errored) return "infra";
+  if (sample.infraErrorMessage) return "infra";
   for (const s of sample.scores ?? []) {
     if (s.infraError === true) return "infra";
   }
-  // Heuristic: judge-named scores → model-quality fail
   for (const s of sample.scores ?? []) {
     if (typeof s.name === "string" && s.name.startsWith("judge/")) {
       return "model-quality (judge-graded)";
     }
   }
-  // Heuristic: budget-named violations → SDK perf signal
   for (const s of sample.scores ?? []) {
     if (
       typeof s.reason === "string" &&
@@ -124,6 +187,10 @@ function classifyFailure(sample) {
   }
   return "model-quality (deterministic grader)";
 }
+
+// -------------------------------------------------------------------
+// Formatting helpers
+// -------------------------------------------------------------------
 
 function fmtDur(ms) {
   if (typeof ms !== "number" || !Number.isFinite(ms)) return "—";
@@ -142,14 +209,98 @@ function escapeCell(s) {
   return String(s).replace(/\|/g, "\\|").replace(/\n/g, " ");
 }
 
+function bar(passed, total, width = 24) {
+  if (!total) return "·".repeat(width);
+  const filled = Math.round((passed / total) * width);
+  const empty = width - filled;
+  return `${"█".repeat(filled)}${"░".repeat(empty)}`;
+}
+
+function pctNum(n, d) {
+  if (!d) return 0;
+  return (n / d) * 100;
+}
+
+function percentile(sorted, p) {
+  if (sorted.length === 0) return null;
+  const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * p));
+  return sorted[idx];
+}
+
+function truncate(s, n) {
+  if (typeof s !== "string") return "";
+  if (s.length <= n) return s;
+  return `${s.slice(0, n).trimEnd()}…`;
+}
+
+function slug(s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+// -------------------------------------------------------------------
+// Environment fingerprint (best-effort, no secrets)
+// -------------------------------------------------------------------
+
+function dbHost(url) {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    return u.host || null;
+  } catch {
+    // Plain `host:port/db` strings — grab anything between // and / or @ and /
+    const m = String(url).match(/@([^/?]+)/);
+    return m ? m[1] : null;
+  }
+}
+
+function envFingerprint() {
+  const e = process.env;
+  return {
+    LIVE: e.LIVE ?? null,
+    LIVE_JUDGE: e.LIVE_JUDGE ?? null,
+    PERF_HEAVY: e.PERF_HEAVY ?? null,
+    PERF_HEAVY_N8: e.PERF_HEAVY_N8 ?? null,
+    PERF_DURABILITY: e.PERF_DURABILITY ?? null,
+    PG_STAT_STATEMENTS_ENABLED: e.PG_STAT_STATEMENTS_ENABLED ?? null,
+    PROMPT_TESTING: e.PROMPT_TESTING ?? null,
+    PS_EVAL_FILE_PARALLELISM: e.PS_EVAL_FILE_PARALLELISM ?? null,
+    LIVE_JUDGE_MODEL: e.LIVE_JUDGE_MODEL ?? null,
+    LIVE_JUDGE_MODEL_A: e.LIVE_JUDGE_MODEL_A ?? null,
+    LIVE_JUDGE_MODEL_B: e.LIVE_JUDGE_MODEL_B ?? null,
+    LIVE_MATRIX_MODELS: e.LIVE_MATRIX_MODELS ?? null,
+    LIVE_ABLATION_MODELS: e.LIVE_ABLATION_MODELS ?? null,
+    PROMPT_TESTING_MODELS: e.PROMPT_TESTING_MODELS ?? null,
+    DATABASE_HOST: dbHost(e.DATABASE_URL),
+    GITHUB_TOKEN_PRESENT: e.GITHUB_TOKEN ? "yes" : "no",
+    OPENAI_API_KEY_PRESENT: e.OPENAI_API_KEY ? "yes" : "no",
+    PS_MODEL_PROVIDERS_PATH: e.PS_MODEL_PROVIDERS_PATH ?? null,
+  };
+}
+
+// -------------------------------------------------------------------
+// Aggregation
+// -------------------------------------------------------------------
+
 function aggregate(dir) {
   const entries = readdirSync(dir);
   const jsonl = entries.filter((n) => n.endsWith(".jsonl"));
 
-  const byTask = new Map();
-  const allFails = [];
-  const judgeScores = [];
+  const samples = []; // enriched
   const summaries = [];
+  const failureDetailFiles = new Set(
+    entries.filter((n) => {
+      const full = join(dir, n);
+      try {
+        return statSync(full).isDirectory();
+      } catch {
+        return false;
+      }
+    }),
+  );
+
   let earliestRun = null;
   let latestSummary = null;
 
@@ -157,12 +308,12 @@ function aggregate(dir) {
     const lines = readJsonl(join(dir, name));
     const runLine = lines.find((l) => l.type === "run");
     const summaryLine = lines.find((l) => l.type === "summary");
-    const samples = lines.filter((l) => l.type === "sample");
+    const sampleLines = lines.filter((l) => l.type === "sample");
 
+    const runId =
+      runLine?.runId ?? summaryLine?.runId ?? basename(name, ".jsonl");
     const taskId =
-      summaryLine?.taskId ??
-      runLine?.task ??
-      basename(name, ".jsonl").slice(0, 8);
+      summaryLine?.taskId ?? runLine?.task ?? basename(name, ".jsonl").slice(0, 8);
 
     if (runLine?.startedAt) {
       const t = new Date(runLine.startedAt).getTime();
@@ -172,73 +323,67 @@ function aggregate(dir) {
       const t = new Date(summaryLine.finishedAt).getTime();
       if (!latestSummary || t > latestSummary) latestSummary = t;
     }
-    if (summaryLine) summaries.push(summaryLine);
-
-    if (!byTask.has(taskId)) {
-      byTask.set(taskId, {
-        taskId,
-        runs: 0,
-        total: 0,
-        passed: 0,
-        failed: 0,
-        errored: 0,
-        latencies: [],
-      });
-    }
-    const t = byTask.get(taskId);
-    t.runs += 1;
     if (summaryLine) {
-      t.total += summaryLine.total ?? 0;
-      t.passed += summaryLine.passed ?? 0;
-      t.failed += summaryLine.failed ?? 0;
-      t.errored += summaryLine.errored ?? 0;
+      summaries.push({ ...summaryLine, runId, taskId, jsonlFile: name });
     }
 
-    for (const s of samples) {
-      if (typeof s.observed?.latencyMs === "number") {
-        t.latencies.push(s.observed.latencyMs);
-      }
-      // Capture judge scores
-      for (const sc of s.scores ?? []) {
-        if (typeof sc.name === "string" && sc.name.startsWith("judge/")) {
-          judgeScores.push({
-            taskId,
-            caseId: s.caseId,
-            criterion: sc.name.replace(/^judge\//, ""),
-            value: sc.value,
-            pass: sc.pass,
-            infraError: sc.infraError === true,
-            reason: sc.reason ?? "",
-          });
+    for (const s of sampleLines) {
+      const suite = classifySuite({
+        taskId,
+        caseId: s.caseId,
+        runId,
+      });
+      // Determine failure-detail file path (relative to dir) if present
+      let failDetail = null;
+      if (s.pass === false || s.errored === true) {
+        // EvalRunner writes <dir>/<runId>/<sanitizedCaseId>.json. Try a
+        // few sanitization variants — the runner has shifted between
+        // keeping `.` and replacing it.
+        const variants = [
+          String(s.caseId ?? "").replace(/[^A-Za-z0-9._-]/g, "_"),
+          String(s.caseId ?? "").replace(/[^A-Za-z0-9_-]/g, "_"),
+        ];
+        for (const v of variants) {
+          const rel = join(runId, `${v}.json`);
+          if (existsSync(join(dir, rel))) {
+            failDetail = rel;
+            break;
+          }
+        }
+        if (!failDetail && failureDetailFiles.has(runId)) {
+          // Fall back to a single matching file in the runId dir
+          try {
+            const files = readdirSync(join(dir, runId));
+            const json = files.find((f) => f.endsWith(".json"));
+            if (json) failDetail = join(runId, json);
+          } catch {
+            // ignore
+          }
         }
       }
-      if (s.pass === false || s.errored === true) {
-        const failingScores = (s.scores ?? []).filter((sc) => sc.pass === false);
-        allFails.push({
-          taskId,
-          caseId: s.caseId,
-          category: classifyFailure(s),
-          durationMs: s.durationMs,
-          reasons: failingScores.map((sc) => `**${sc.name}**: ${sc.reason}`),
-          observedResponse:
-            typeof s.observed?.finalResponse === "string"
-              ? s.observed.finalResponse.slice(0, 240)
-              : "",
-        });
-      }
+      // `infraError` may be a string error message (preserved by EvalRunner
+      // for driver timeouts / transport errors). Capture it for the failure
+      // renderer; treat it as infra in classifyFailure().
+      const infraErrorMessage =
+        typeof s.infraError === "string" && s.infraError.length > 0
+          ? s.infraError
+          : null;
+      samples.push({
+        runId,
+        taskId,
+        suite,
+        caseId: s.caseId,
+        pass: s.pass,
+        errored: s.errored === true,
+        infraErrorMessage,
+        scores: s.scores ?? [],
+        observed: s.observed ?? {},
+        durationMs: s.durationMs,
+        latencyMs: s.observed?.latencyMs,
+        failDetail,
+        jsonlFile: name,
+      });
     }
-  }
-
-  // Aggregate latency p50/p95
-  for (const t of byTask.values()) {
-    if (t.latencies.length === 0) {
-      t.p50 = null;
-      t.p95 = null;
-      continue;
-    }
-    const sorted = [...t.latencies].sort((a, b) => a - b);
-    t.p50 = sorted[Math.floor(sorted.length * 0.5)];
-    t.p95 = sorted[Math.floor(sorted.length * 0.95)] ?? sorted[sorted.length - 1];
   }
 
   return {
@@ -246,123 +391,548 @@ function aggregate(dir) {
     earliestRun,
     latestSummary,
     summaries,
-    byTask: [...byTask.values()].sort((a, b) =>
-      a.taskId.localeCompare(b.taskId),
-    ),
-    allFails,
-    judgeScores,
+    samples,
   };
 }
 
-function renderMarkdown(agg) {
-  const totals = agg.byTask.reduce(
-    (acc, t) => {
-      acc.total += t.total;
-      acc.passed += t.passed;
-      acc.failed += t.failed;
-      acc.errored += t.errored;
-      return acc;
-    },
-    { total: 0, passed: 0, failed: 0, errored: 0 },
-  );
-  const wall =
-    agg.earliestRun && agg.latestSummary
-      ? fmtDur(agg.latestSummary - agg.earliestRun)
-      : "in progress / unknown";
-  const reportTs = new Date().toISOString();
+function summariseSuites(samples, summaries) {
+  const bySuite = new Map();
+  for (const s of SUITES) {
+    bySuite.set(s, {
+      suite: s,
+      total: 0,
+      passed: 0,
+      failed: 0,
+      errored: 0,
+      latencies: [],
+      cases: new Map(), // caseId -> {runs, passed, failed, errored, latencies}
+      runIds: new Set(),
+    });
+  }
+  for (const sample of samples) {
+    const b = bySuite.get(sample.suite);
+    b.total += 1;
+    const isInfra = sample.errored || sample.infraErrorMessage;
+    if (isInfra) b.errored += 1;
+    else if (sample.pass) b.passed += 1;
+    else b.failed += 1;
+    if (typeof sample.latencyMs === "number") b.latencies.push(sample.latencyMs);
+    b.runIds.add(sample.runId);
+    const caseKey = sample.caseId ?? "(no caseId)";
+    if (!b.cases.has(caseKey)) {
+      b.cases.set(caseKey, {
+        caseId: caseKey,
+        runs: 0,
+        passed: 0,
+        failed: 0,
+        errored: 0,
+        latencies: [],
+      });
+    }
+    const c = b.cases.get(caseKey);
+    c.runs += 1;
+    if (isInfra) c.errored += 1;
+    else if (sample.pass) c.passed += 1;
+    else c.failed += 1;
+    if (typeof sample.latencyMs === "number") c.latencies.push(sample.latencyMs);
+  }
+  // Compute percentiles
+  for (const b of bySuite.values()) {
+    const sorted = [...b.latencies].sort((a, b) => a - b);
+    b.p50 = percentile(sorted, 0.5);
+    b.p95 = percentile(sorted, 0.95);
+    b.p99 = percentile(sorted, 0.99);
+    for (const c of b.cases.values()) {
+      const cs = [...c.latencies].sort((a, b) => a - b);
+      c.p50 = percentile(cs, 0.5);
+      c.p95 = percentile(cs, 0.95);
+    }
+  }
+  return bySuite;
+}
 
+// -------------------------------------------------------------------
+// CMS event filtering — pull a few key event types per failure to
+// explain "what the agent actually did" without dumping the full log.
+// -------------------------------------------------------------------
+
+const KEY_CMS_EVENTS = new Set([
+  "user.message",
+  "session.turn_started",
+  "session.turn_completed",
+  "tool.user_requested",
+  "tool.executed",
+  "tool.failed",
+  "guardrail.decision",
+  "session.error",
+  "session.refused",
+  "session.assistant_message",
+  "subagent.spawned",
+  "subagent.completed",
+]);
+
+function summariseCmsEvents(events, max = 6) {
+  if (!Array.isArray(events) || events.length === 0) return [];
+  const picked = events.filter((e) => KEY_CMS_EVENTS.has(e?.eventType));
+  // Always include first user.message + last turn_completed + any tool.*
+  // events even if total exceeds `max` — prioritize tool.* because that's
+  // where the actionable signal lives.
+  const ordered = [];
+  const seen = new Set();
+  const push = (ev) => {
+    const k = `${ev.seq}-${ev.eventType}`;
+    if (seen.has(k)) return;
+    seen.add(k);
+    ordered.push(ev);
+  };
+  for (const ev of picked) {
+    if (ev.eventType?.startsWith("tool.")) push(ev);
+  }
+  for (const ev of picked) {
+    if (ev.eventType === "guardrail.decision") push(ev);
+  }
+  for (const ev of picked) {
+    if (
+      ev.eventType === "session.turn_started" ||
+      ev.eventType === "session.turn_completed"
+    )
+      push(ev);
+  }
+  for (const ev of picked) push(ev);
+  ordered.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+  return ordered.slice(0, max);
+}
+
+function fmtCmsEvent(ev) {
+  const t = ev.eventType;
+  const data = ev.data ?? {};
+  if (t === "tool.user_requested" || t === "tool.executed" || t === "tool.failed") {
+    const tool = data.toolName ?? data.name ?? "?";
+    const args =
+      data.args && typeof data.args === "object"
+        ? JSON.stringify(data.args).slice(0, 100)
+        : "";
+    return `\`${t}\` → ${tool}${args ? ` ${args}` : ""}`;
+  }
+  if (t === "guardrail.decision") {
+    return `\`${t}\` → ${data.action ?? "?"} (${truncate(data.reason ?? "", 60)})`;
+  }
+  if (t === "session.turn_completed" || t === "session.turn_started") {
+    return `\`${t}\` (turn ${data.iteration ?? "?"})`;
+  }
+  if (t === "user.message") {
+    return `\`${t}\` ${truncate(String(data.content ?? ""), 80)}`;
+  }
+  return `\`${t}\``;
+}
+
+// -------------------------------------------------------------------
+// Markdown rendering
+// -------------------------------------------------------------------
+
+function renderMarkdown(agg) {
   const out = [];
+  const totals = { total: 0, passed: 0, failed: 0, errored: 0 };
+  for (const s of agg.samples) {
+    totals.total += 1;
+    if (s.errored || s.infraErrorMessage) totals.errored += 1;
+    else if (s.pass) totals.passed += 1;
+    else totals.failed += 1;
+  }
+  const wallMs =
+    agg.earliestRun && agg.latestSummary
+      ? agg.latestSummary - agg.earliestRun
+      : null;
+  const reportTs = new Date().toISOString();
+  const env = envFingerprint();
+  const bySuite = summariseSuites(agg.samples, agg.summaries);
+
+  // -----------------------------------------------------------------
+  // Header
+  // -----------------------------------------------------------------
   out.push(`# Eval Harness Report — ${basename(agg.dir)}`);
   out.push("");
-  out.push(`Generated at \`${reportTs}\` by \`bin/report.mjs\`.`);
-  out.push("");
-  out.push(`Source: \`${agg.dir}\``);
+  out.push(
+    `Generated \`${reportTs}\` by \`packages/eval-harness/bin/report.mjs\`. Source: \`${agg.dir}\`.`,
+  );
   out.push("");
 
+  // Stamp: in-flight vs complete (best effort — partial run if any sample
+  // file lacks a summary line)
+  const samplesWithoutSummary = agg.samples.filter(
+    (s) => !agg.summaries.some((su) => su.runId === s.runId),
+  ).length;
+  const inFlight = samplesWithoutSummary > 0;
+  if (inFlight) {
+    out.push(
+      `> **In-flight:** ${samplesWithoutSummary} sample(s) seen without a matching summary line — vitest may still be writing. Re-run \`bin/report.mjs\` to refresh.`,
+    );
+    out.push("");
+  }
+
+  // -----------------------------------------------------------------
+  // TOC
+  // -----------------------------------------------------------------
+  out.push("## Contents");
+  out.push("");
+  out.push("- [Run context](#run-context)");
+  out.push("- [Top-line totals](#top-line-totals)");
+  out.push("- [Suite breakdown](#suite-breakdown)");
+  for (const suite of SUITES) {
+    const b = bySuite.get(suite);
+    if (b.total === 0) continue;
+    out.push(`  - [${suite}](#suite-${slug(suite)})`);
+  }
+  out.push("- [Performance highlights](#performance-highlights)");
+  out.push("- [Failures](#failures)");
+  out.push("- [LLM-judge scores](#llm-judge-scores)");
+  out.push("- [Prompt-testing variants](#prompt-testing-variants)");
+  out.push("- [How to read this](#how-to-read-this)");
+  out.push("- [What to do next](#what-to-do-next)");
+  out.push("");
+
+  // -----------------------------------------------------------------
+  // Run context
+  // -----------------------------------------------------------------
+  out.push('<a id="run-context"></a>');
+  out.push("## Run context");
+  out.push("");
+  out.push("| Setting | Value |");
+  out.push("|---|---|");
+  out.push(`| Wall clock (run window) | ${wallMs ? fmtDur(wallMs) : "in progress / unknown"} |`);
+  if (agg.earliestRun)
+    out.push(`| Earliest run start | \`${new Date(agg.earliestRun).toISOString()}\` |`);
+  if (agg.latestSummary)
+    out.push(`| Latest summary write | \`${new Date(agg.latestSummary).toISOString()}\` |`);
+  out.push(`| Tasks (jsonl files seen) | ${agg.summaries.length} |`);
+  out.push(`| Samples observed | ${agg.samples.length} |`);
+  out.push("");
+  out.push("**Suite gates** (env at report-generation time — empty if `bin/report.mjs` was invoked outside `bin/run-live.sh`):");
+  out.push("");
+  out.push("| Gate | Value |");
+  out.push("|---|---|");
+  for (const k of [
+    "LIVE",
+    "LIVE_JUDGE",
+    "PERF_HEAVY",
+    "PERF_HEAVY_N8",
+    "PERF_DURABILITY",
+    "PG_STAT_STATEMENTS_ENABLED",
+    "PROMPT_TESTING",
+    "PS_EVAL_FILE_PARALLELISM",
+  ]) {
+    out.push(`| ${k} | ${env[k] ?? "—"} |`);
+  }
+  out.push("");
+  out.push("**Models / credentials** (presence-only for secrets):");
+  out.push("");
+  out.push("| Var | Value |");
+  out.push("|---|---|");
+  for (const k of [
+    "LIVE_JUDGE_MODEL",
+    "LIVE_JUDGE_MODEL_A",
+    "LIVE_JUDGE_MODEL_B",
+    "LIVE_MATRIX_MODELS",
+    "LIVE_ABLATION_MODELS",
+    "PROMPT_TESTING_MODELS",
+    "DATABASE_HOST",
+    "GITHUB_TOKEN_PRESENT",
+    "OPENAI_API_KEY_PRESENT",
+    "PS_MODEL_PROVIDERS_PATH",
+  ]) {
+    out.push(`| ${k} | ${env[k] ?? "—"} |`);
+  }
+  out.push("");
+
+  // -----------------------------------------------------------------
+  // Top-line totals
+  // -----------------------------------------------------------------
+  out.push('<a id="top-line-totals"></a>');
   out.push("## Top-line totals");
+  out.push("");
+  const passRate = pctNum(totals.passed, totals.total);
+  out.push("```");
+  out.push(
+    `Pass rate  ${bar(totals.passed, totals.total, 32)}  ${passRate.toFixed(1)}%   (${totals.passed}/${totals.total})`,
+  );
+  out.push(
+    `Quality    fail=${totals.failed}    Infra err=${totals.errored}    Wall=${
+      wallMs ? fmtDur(wallMs) : "—"
+    }`,
+  );
+  out.push("```");
   out.push("");
   out.push("| metric | value |");
   out.push("|---|---:|");
-  out.push(`| Tasks (jsonl files) | ${agg.summaries.length} |`);
   out.push(`| Total cases | ${totals.total} |`);
   out.push(`| Passed | ${totals.passed} |`);
   out.push(`| Failed (quality) | ${totals.failed} |`);
   out.push(`| Errored (infra) | ${totals.errored} |`);
   out.push(`| Pass rate | ${pct(totals.passed, totals.total)} |`);
   out.push(`| Infra error rate | ${pct(totals.errored, totals.total)} |`);
-  out.push(`| Wall clock (run window) | ${wall} |`);
-  if (agg.earliestRun) {
+  out.push("");
+
+  // -----------------------------------------------------------------
+  // Suite breakdown
+  // -----------------------------------------------------------------
+  out.push('<a id="suite-breakdown"></a>');
+  out.push("## Suite breakdown");
+  out.push("");
+  out.push("| Suite | Cases | Pass | Fail | Err | Pass rate | Bar | p50 | p95 |");
+  out.push("|---|---:|---:|---:|---:|---:|---|---:|---:|");
+  for (const suite of SUITES) {
+    const b = bySuite.get(suite);
+    if (b.total === 0) continue;
     out.push(
-      `| Earliest run start | \`${new Date(agg.earliestRun).toISOString()}\` |`,
-    );
-  }
-  if (agg.latestSummary) {
-    out.push(
-      `| Latest summary write | \`${new Date(agg.latestSummary).toISOString()}\` |`,
+      `| [${suite}](#suite-${slug(suite)}) | ${b.total} | ${b.passed} | ${b.failed} | ${b.errored} | ${pct(b.passed, b.total)} | \`${bar(b.passed, b.total, 12)}\` | ${fmtDur(b.p50)} | ${fmtDur(b.p95)} |`,
     );
   }
   out.push("");
 
-  out.push("## Per-task aggregate");
-  out.push("");
-  out.push(
-    "| Task | Runs | Total | Pass | Fail | Errored | Pass rate | Latency p50 | Latency p95 |",
-  );
-  out.push(
-    "|------|-----:|------:|-----:|-----:|--------:|----------:|------------:|------------:|",
-  );
-  for (const t of agg.byTask) {
+  for (const suite of SUITES) {
+    const b = bySuite.get(suite);
+    if (b.total === 0) continue;
+    out.push(`<a id="suite-${slug(suite)}"></a>`);
+    out.push(`### ${suite}`);
+    out.push("");
     out.push(
-      `| ${escapeCell(t.taskId)} | ${t.runs} | ${t.total} | ${t.passed} | ${t.failed} | ${t.errored} | ${pct(t.passed, t.total)} | ${fmtDur(t.p50)} | ${fmtDur(t.p95)} |`,
+      `\`${bar(b.passed, b.total, 24)}\` ${pct(b.passed, b.total)}  (${b.passed}/${b.total} pass, ${b.failed} fail, ${b.errored} infra-err)`,
+    );
+    out.push("");
+    if (suite === "PROMPT-TESTING") {
+      // Collapsed roll-up — full detail in the Prompt-testing variants section
+      out.push(
+        `_Per-cell detail in [Prompt-testing variants](#prompt-testing-variants). ${b.cases.size} variant cell(s) across ${b.runIds.size} run(s)._`,
+      );
+      out.push("");
+      continue;
+    }
+    out.push("| Case | Runs | Pass | Fail | Err | Pass rate | p50 | p95 |");
+    out.push("|---|---:|---:|---:|---:|---:|---:|---:|");
+    const sortedCases = [...b.cases.values()].sort((a, b) =>
+      String(a.caseId).localeCompare(String(b.caseId)),
+    );
+    for (const c of sortedCases) {
+      out.push(
+        `| ${escapeCell(c.caseId)} | ${c.runs} | ${c.passed} | ${c.failed} | ${c.errored} | ${pct(c.passed, c.runs)} | ${fmtDur(c.p50)} | ${fmtDur(c.p95)} |`,
+      );
+    }
+    out.push("");
+  }
+
+  // -----------------------------------------------------------------
+  // Performance highlights
+  // -----------------------------------------------------------------
+  out.push('<a id="performance-highlights"></a>');
+  out.push("## Performance highlights");
+  out.push("");
+  out.push("**Latency percentiles by suite** (across all sample latencies):");
+  out.push("");
+  out.push("| Suite | n | p50 | p95 | p99 |");
+  out.push("|---|---:|---:|---:|---:|");
+  for (const suite of SUITES) {
+    const b = bySuite.get(suite);
+    if (!b.latencies.length) continue;
+    out.push(
+      `| ${suite} | ${b.latencies.length} | ${fmtDur(b.p50)} | ${fmtDur(b.p95)} | ${fmtDur(b.p99)} |`,
     );
   }
   out.push("");
 
+  // Top-N slowest
+  const slowest = [...agg.samples]
+    .filter((s) => typeof s.latencyMs === "number")
+    .sort((a, b) => (b.latencyMs ?? 0) - (a.latencyMs ?? 0))
+    .slice(0, 10);
+  if (slowest.length > 0) {
+    out.push("**Top-10 slowest cases:**");
+    out.push("");
+    out.push("| # | Suite | Case | Latency | Pass |");
+    out.push("|---:|---|---|---:|:---:|");
+    slowest.forEach((s, i) => {
+      out.push(
+        `| ${i + 1} | ${s.suite} | ${escapeCell(s.caseId)} | ${fmtDur(s.latencyMs)} | ${s.errored || s.infraErrorMessage ? "ERR" : s.pass ? "✓" : "✗"} |`,
+      );
+    });
+    out.push("");
+  }
+
+  // Most-failing cases (by caseId across runs)
+  const failuresByCase = new Map();
+  for (const s of agg.samples) {
+    if (s.pass === false || s.errored) {
+      const k = `${s.suite}::${s.caseId}`;
+      if (!failuresByCase.has(k)) {
+        failuresByCase.set(k, { suite: s.suite, caseId: s.caseId, count: 0 });
+      }
+      failuresByCase.get(k).count += 1;
+    }
+  }
+  const topFailing = [...failuresByCase.values()]
+    .filter((x) => x.count > 0)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10);
+  if (topFailing.length > 0) {
+    out.push("**Top-10 most-failing cases:**");
+    out.push("");
+    out.push("| # | Suite | Case | Failures |");
+    out.push("|---:|---|---|---:|");
+    topFailing.forEach((f, i) => {
+      out.push(`| ${i + 1} | ${f.suite} | ${escapeCell(f.caseId)} | ${f.count} |`);
+    });
+    out.push("");
+  }
+
+  // Cost aggregate (only render if any sample carries it)
+  const costed = agg.samples
+    .map((s) => s.observed?.actualCostUsd)
+    .filter((x) => typeof x === "number" && Number.isFinite(x));
+  if (costed.length > 0) {
+    const total = costed.reduce((a, b) => a + b, 0);
+    out.push(`**Total observed cost:** \`$${total.toFixed(4)}\` across ${costed.length} sample(s).`);
+    out.push("");
+  } else {
+    out.push(
+      "_Cost aggregate: n/a — no sample carried `observed.actualCostUsd`. Live judge runs would surface this via `JudgeCost.estimatedCostUsd`; deterministic samples would need a cost tracker wired through `EvalRunner`._",
+    );
+    out.push("");
+  }
+
+  out.push(
+    "_DB-budget signal (peakConnections, dbQueries) is not written through `EvalRunner` to the jsonl stream; check the vitest console log directly for `LatencyTracker` / `DbTracker` / `PgActivityPoller` output during `--pg-stat` runs._",
+  );
+  out.push("");
+
+  // -----------------------------------------------------------------
   // Failures
-  out.push("## Failures");
+  // -----------------------------------------------------------------
+  const fails = agg.samples.filter((s) => s.pass === false || s.errored);
+  out.push('<a id="failures"></a>');
+  out.push(`## Failures (${fails.length})`);
   out.push("");
-  if (agg.allFails.length === 0) {
+  if (fails.length === 0) {
     out.push("_No failures recorded._");
     out.push("");
   } else {
     const byCat = new Map();
-    for (const f of agg.allFails) {
-      if (!byCat.has(f.category)) byCat.set(f.category, []);
-      byCat.get(f.category).push(f);
+    for (const f of fails) {
+      const cat = classifyFailure(f);
+      if (!byCat.has(cat)) byCat.set(cat, []);
+      byCat.get(cat).push(f);
     }
-    for (const [cat, items] of [...byCat.entries()].sort()) {
+    const order = [
+      "infra",
+      "sdk-perf",
+      "model-quality (deterministic grader)",
+      "model-quality (judge-graded)",
+    ];
+    const seenCats = [...byCat.keys()].sort((a, b) => {
+      const ai = order.indexOf(a);
+      const bi = order.indexOf(b);
+      return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+    });
+    for (const cat of seenCats) {
+      const items = byCat.get(cat);
       out.push(`### ${cat} (${items.length})`);
       out.push("");
       for (const f of items) {
-        out.push(
-          `- **${escapeCell(f.taskId)} / ${escapeCell(f.caseId)}** (${fmtDur(f.durationMs)})`,
-        );
-        for (const r of f.reasons) {
-          out.push(`  - ${escapeCell(r)}`);
+        const failingScores = (f.scores ?? []).filter((sc) => sc.pass === false);
+        const grouped = new Map();
+        for (const sc of failingScores) {
+          const baseName = String(sc.name).split(":")[0]; // collapse `tool-args:test_add` → `tool-args`
+          if (!grouped.has(baseName)) grouped.set(baseName, []);
+          grouped.get(baseName).push(sc);
         }
-        if (f.observedResponse) {
+        const header =
+          `**[${f.suite}] ${escapeCell(f.caseId)}** ` +
+          `(${fmtDur(f.durationMs)} dur, ${fmtDur(f.latencyMs)} latency, run \`${f.runId}\`)`;
+        out.push(`- ${header}`);
+        if (f.infraErrorMessage) {
           out.push(
-            `  - _observed response (truncated):_ \`${escapeCell(f.observedResponse)}\``,
+            `  - **infraError:** ${escapeCell(truncate(f.infraErrorMessage, 240))}`,
           );
         }
+        for (const [name, scs] of grouped) {
+          if (scs.length === 1) {
+            out.push(`  - **${name}**: ${escapeCell(scs[0].reason ?? "(no reason)")}`);
+          } else {
+            out.push(`  - **${name}** (${scs.length} variant(s)):`);
+            for (const sc of scs) {
+              out.push(
+                `    - \`${sc.name}\`: ${escapeCell(sc.reason ?? "(no reason)")}`,
+              );
+            }
+          }
+        }
+        const resp = f.observed?.finalResponse;
+        if (typeof resp === "string" && resp.length > 0) {
+          out.push(
+            `  - _observed response (${resp.length} chars, truncated):_ ${"`"}${escapeCell(truncate(resp, 240))}${"`"}`,
+          );
+        }
+        // Tool-call summary (compact, complements cmsEvents)
+        const tcalls = f.observed?.toolCalls;
+        if (Array.isArray(tcalls) && tcalls.length > 0) {
+          const summary = tcalls
+            .slice(0, 5)
+            .map(
+              (t) =>
+                `${t.name ?? "?"}(${
+                  t.args ? truncate(JSON.stringify(t.args), 60) : ""
+                })`,
+            )
+            .join(", ");
+          const more = tcalls.length > 5 ? ` +${tcalls.length - 5} more` : "";
+          out.push(`  - _tool calls (${tcalls.length}):_ ${summary}${more}`);
+        }
+        // Key CMS events
+        const evts = summariseCmsEvents(f.observed?.cmsEvents);
+        if (evts.length > 0) {
+          out.push(`  - _key CMS events:_`);
+          for (const ev of evts) {
+            out.push(`    - seq=${ev.seq} ${fmtCmsEvent(ev)}`);
+          }
+        }
+        if (f.failDetail) {
+          out.push(`  - _raw artifact:_ \`${f.failDetail}\``);
+        }
+        out.push("");
       }
-      out.push("");
     }
   }
 
-  // Judge details
-  if (agg.judgeScores.length > 0) {
-    out.push("## LLM-judge scores");
-    out.push("");
+  // -----------------------------------------------------------------
+  // LLM-judge scores
+  // -----------------------------------------------------------------
+  const judgeScores = [];
+  for (const s of agg.samples) {
+    for (const sc of s.scores ?? []) {
+      if (typeof sc.name === "string" && sc.name.startsWith("judge/")) {
+        judgeScores.push({
+          suite: s.suite,
+          taskId: s.taskId,
+          caseId: s.caseId,
+          criterion: sc.name.replace(/^judge\//, ""),
+          value: sc.value,
+          pass: sc.pass,
+          infraError: sc.infraError === true,
+          reason: sc.reason ?? "",
+          metadata: sc.metadata ?? null,
+        });
+      }
+    }
+  }
+  out.push('<a id="llm-judge-scores"></a>');
+  out.push("## LLM-judge scores");
+  out.push("");
+  if (judgeScores.length === 0) {
     out.push(
-      `${agg.judgeScores.length} judge score(s) recorded across ${
-        new Set(agg.judgeScores.map((j) => j.criterion)).size
-      } criterion(a).`,
+      "_No `judge/*` scores in this run. LLM-judge tests require `LIVE_JUDGE=1` and credentials; see [SUITES.md](../../docs/SUITES.md#llm-judge)._",
     );
     out.push("");
-    // Per-criterion aggregate
+  } else {
     const byCrit = new Map();
-    for (const j of agg.judgeScores) {
+    for (const j of judgeScores) {
       if (!byCrit.has(j.criterion))
         byCrit.set(j.criterion, { total: 0, pass: 0, infra: 0, sumValue: 0, n: 0 });
       const c = byCrit.get(j.criterion);
@@ -383,24 +953,91 @@ function renderMarkdown(agg) {
       );
     }
     out.push("");
-
-    // Show non-pass / infra judge cases for inspection
-    const interesting = agg.judgeScores.filter(
-      (j) => !j.pass || j.infraError,
-    );
+    const interesting = judgeScores.filter((j) => !j.pass || j.infraError);
     if (interesting.length > 0) {
       out.push("### Non-pass / infra judge calls");
       out.push("");
       for (const j of interesting) {
         const tag = j.infraError ? "infra-error" : "fail";
+        const value =
+          typeof j.value === "number" ? j.value.toFixed(3) : "—";
         out.push(
-          `- _[${tag}]_ **${escapeCell(j.taskId)} / ${escapeCell(j.caseId)} / ${escapeCell(j.criterion)}** (value=${typeof j.value === "number" ? j.value.toFixed(3) : "—"}): ${escapeCell(j.reason).slice(0, 280)}`,
+          `- _[${tag}]_ **[${j.suite}] ${escapeCell(j.caseId)} / ${escapeCell(j.criterion)}** (value=${value})`,
         );
+        out.push(`  - **reason:** ${escapeCell(truncate(j.reason, 400))}`);
+        if (j.metadata?.prompt_excerpt) {
+          out.push(
+            `  - **prompt_excerpt:** ${escapeCell(truncate(String(j.metadata.prompt_excerpt), 200))}`,
+          );
+        }
       }
       out.push("");
     }
   }
 
+  // -----------------------------------------------------------------
+  // Prompt-testing variants
+  // -----------------------------------------------------------------
+  out.push('<a id="prompt-testing-variants"></a>');
+  out.push("## Prompt-testing variants");
+  out.push("");
+  const ptSamples = agg.samples.filter((s) => s.suite === "PROMPT-TESTING");
+  if (ptSamples.length === 0) {
+    out.push("_No `pt-cell-*` samples in this run._");
+    out.push("");
+  } else {
+    // Parse cell key out of taskId: `pt-cell-<base>::<variant>::<model>`
+    const cells = new Map();
+    for (const s of ptSamples) {
+      const tid = String(s.taskId);
+      const stripped = tid.startsWith("pt-cell-") ? tid.slice("pt-cell-".length) : tid;
+      const [base, variant = "?", model = "?"] = stripped.split("::");
+      const key = `${base}::${variant}::${model}`;
+      if (!cells.has(key)) {
+        cells.set(key, {
+          base,
+          variant,
+          model,
+          total: 0,
+          passed: 0,
+          failed: 0,
+          errored: 0,
+          latencies: [],
+        });
+      }
+      const c = cells.get(key);
+      c.total += 1;
+      if (s.errored) c.errored += 1;
+      else if (s.pass) c.passed += 1;
+      else c.failed += 1;
+      if (typeof s.latencyMs === "number") c.latencies.push(s.latencyMs);
+    }
+    out.push("| Base case | Variant | Model | Trials | Pass | Pass rate | p50 |");
+    out.push("|---|---|---|---:|---:|---:|---:|");
+    const sortedCells = [...cells.values()].sort(
+      (a, b) =>
+        a.base.localeCompare(b.base) ||
+        a.variant.localeCompare(b.variant) ||
+        a.model.localeCompare(b.model),
+    );
+    for (const c of sortedCells) {
+      const sorted = [...c.latencies].sort((a, b) => a - b);
+      const p50 = percentile(sorted, 0.5);
+      out.push(
+        `| ${escapeCell(c.base)} | ${escapeCell(c.variant)} | ${escapeCell(c.model)} | ${c.total} | ${c.passed} | ${pct(c.passed, c.total)} | ${fmtDur(p50)} |`,
+      );
+    }
+    out.push("");
+    out.push(
+      "_To compute variant-vs-baseline delta directly, see `computeAblationDelta` in `src/prompt-testing/index.ts`._",
+    );
+    out.push("");
+  }
+
+  // -----------------------------------------------------------------
+  // How to read this
+  // -----------------------------------------------------------------
+  out.push('<a id="how-to-read-this"></a>');
   out.push("## How to read this");
   out.push("");
   out.push(
@@ -417,6 +1054,51 @@ function renderMarkdown(agg) {
   );
   out.push("");
   out.push(
+    "Suites map by case-id prefix: `live.functional.*`/`live.subagent.*` → FUNCTIONAL, `perf.*` → PERFORMANCE, `ablation.*` → ABLATIONS, `direct.*`/`indirect.*`/`output.*`/`tool-abuse.*`/`subjective.*` → SAFETY, `*::*::*` (or `pt-cell-*` task) → PROMPT-TESTING. See [`docs/SUITES.md`](../../docs/SUITES.md) for the canonical list.",
+  );
+  out.push("");
+
+  // -----------------------------------------------------------------
+  // What to do next
+  // -----------------------------------------------------------------
+  out.push('<a id="what-to-do-next"></a>');
+  out.push("## What to do next");
+  out.push("");
+  // Build action list off observed failure categories
+  const haveCats = new Set(fails.map((f) => classifyFailure(f)));
+  if (haveCats.has("infra")) {
+    out.push(
+      "- **Infra failures present.** Don't chase prompts yet. Inspect the failing case's raw artifact JSON in this dir, then re-run the single suite — `bin/run-live.sh -- test/<file>-live.test.ts -t '<test name>'`. See `docs/TROUBLESHOOTING.md`.",
+    );
+  }
+  if (haveCats.has("sdk-perf")) {
+    out.push(
+      "- **SDK perf budget overrun.** Profile PilotSwarm directly with `--pg-stat --heavy` and inspect `LatencyTracker` / `DbTracker` console output. The jsonl doesn't carry the budget delta — re-run with vitest's reporter visible.",
+    );
+  }
+  if (haveCats.has("model-quality (deterministic grader)")) {
+    out.push(
+      "- **Deterministic grader fails (tool-call / response containment).** Most often: prompt iteration. Edit `packages/sdk/plugins/system/agents/default.agent.md`, then `bin/run-live.sh --prompt-testing -- test/prompt-testing-live.test.ts -t '<test name>'` to confirm. Use ablations (`bin/run-live.sh -- test/ablations-live.test.ts`) to identify which section of the prompt is load-bearing.",
+    );
+  }
+  if (haveCats.has("model-quality (judge-graded)")) {
+    out.push(
+      "- **Judge-graded fails.** Re-run with the judge sub-suite: `bin/run-live.sh --judge -- test/llm-judge-live.test.ts -t '<test name>'`. If the judge reasoning looks miscalibrated, swap `LIVE_JUDGE_MODEL` and re-run for cross-judge agreement.",
+    );
+  }
+  if (fails.length === 0) {
+    out.push(
+      "- **All green.** If this was a smoke / single-trial pass, bump `PROMPT_TESTING_TRIALS=5` (or run `bin/run-live.sh --all`) before treating it as conclusive — single LIVE trials are stochastic.",
+    );
+  }
+  out.push(
+    "- **Drill into a failing case:** every failure entry above includes a relative `<runId>/<caseId>.json` pointer with full `scores`, `observed.toolCalls`, and the complete `cmsEvents` log.",
+  );
+  out.push(
+    "- **Compare across runs:** there is no automatic baseline diff in this report — compare two `REPORT-*.md` outputs side-by-side, or roll up the jsonl across dirs (recipe in `docs/PROMPT-ITERATION.md` § Reading the LIVE reports).",
+  );
+  out.push("");
+  out.push(
     "Raw artifacts live alongside this report: one `<runId>.jsonl` per task plus `<runId>/<caseId>.json` for any failing case. Re-run `bin/report.mjs` against the same dir to refresh after additional jsonl writes.",
   );
   out.push("");
@@ -424,11 +1106,13 @@ function renderMarkdown(agg) {
   return out.join("\n");
 }
 
+// -------------------------------------------------------------------
+// Main
+// -------------------------------------------------------------------
+
 function main() {
   const opts = parseArgs(process.argv.slice(2));
-  let dir = opts.dir
-    ? resolve(opts.dir)
-    : findLatestReportsDir();
+  let dir = opts.dir ? resolve(opts.dir) : findLatestReportsDir();
   if (!dir) {
     console.error(
       "no reports dir found — pass an explicit path or run vitest with EVAL_REPORTS_DIR set.",
@@ -452,10 +1136,12 @@ function main() {
     process.stdout.write(md);
     return;
   }
-  const ts = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
-  const outPath = opts.out
-    ? resolve(opts.out)
-    : join(dir, `REPORT-${ts}.md`);
+  const ts = new Date()
+    .toISOString()
+    .replace(/[:.]/g, "-")
+    .replace("T", "_")
+    .slice(0, 19);
+  const outPath = opts.out ? resolve(opts.out) : join(dir, `REPORT-${ts}.md`);
   writeFileSync(outPath, md, "utf8");
   console.log(outPath);
 }
