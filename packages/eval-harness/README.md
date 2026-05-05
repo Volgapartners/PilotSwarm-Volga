@@ -4,7 +4,17 @@ Evaluation harness for PilotSwarm agents. The deterministic fixture runner, stat
 
 The harness is organized into six capability suites — see [`docs/SUITES.md`](./docs/SUITES.md) for the full catalog and gating matrix.
 
-Iterating on PilotSwarm's actual system prompt (`packages/sdk/plugins/system/agents/default.agent.md`)? See [`docs/PROMPT-ITERATION.md`](./docs/PROMPT-ITERATION.md) for the inner-loop / single-suite-LIVE / full-LIVE workflow.
+**How-to docs by topic:**
+
+- [`docs/PROMPT-ITERATION.md`](./docs/PROMPT-ITERATION.md) — iterating on `packages/sdk/plugins/system/agents/default.agent.md` (inner / single-suite-LIVE / full-LIVE)
+- [`docs/DRIVERS.md`](./docs/DRIVERS.md) — driver matrix, contracts, custom-driver pattern
+- [`docs/PERF.md`](./docs/PERF.md) — latency / cost / DB / connection / durability / concurrency trackers
+- [`docs/CI-INTEGRATION.md`](./docs/CI-INTEGRATION.md) — Baseline / RegressionDetector / CIGate / PR comment recipe
+- [`docs/JUDGE-CLIENTS.md`](./docs/JUDGE-CLIENTS.md) — OpenAI vs PilotSwarm vs Fake judge selection
+- [`docs/CONTRIBUTING.md`](./docs/CONTRIBUTING.md) — adding a grader / driver / suite / mutator / reporter
+- [`docs/TROUBLESHOOTING.md`](./docs/TROUBLESHOOTING.md) — real failure modes (PG saturation, judge crash, parallel pollution, …) and the fix
+- [`docs/INVARIANT-COVERAGE.md`](./docs/INVARIANT-COVERAGE.md) — invariant families → enforcement points + regression tests
+- [`docs/PROMPT-TESTING-SPEC-DRIFT.md`](./docs/PROMPT-TESTING-SPEC-DRIFT.md) — implementation vs spec drift
 
 | Suite        | File                                      | LIVE tests | Gating                                  |
 |--------------|-------------------------------------------|-----------:|-----------------------------------------|
