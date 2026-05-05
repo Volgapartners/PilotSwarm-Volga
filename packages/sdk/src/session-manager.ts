@@ -284,6 +284,7 @@ export class SessionManager {
                 ...(token ? { githubToken: token } : {}),
                 logLevel: "error",
             });
+            await this.client.start();
         }
         return this.client;
     }
