@@ -175,7 +175,10 @@ export class SessionManager {
             const resolved = registry.resolve(normalized);
             if (!resolved) return undefined;
             return {
-                modelName: resolved.modelName,
+                // GitHub Copilot SDK sessions need the qualified provider:model ref.
+                // Other providers still use the raw deployment/model name together
+                // with an explicit provider payload.
+                modelName: resolved.type === "github" ? normalized : resolved.modelName,
                 ...(resolved.sdkProvider ? { sdkProvider: resolved.sdkProvider } : {}),
                 ...(resolved.githubToken ? { githubToken: resolved.githubToken } : {}),
             };
@@ -412,15 +415,19 @@ export class SessionManager {
         const systemMessage = this._buildSystemMessage(sessionId, config);
 
         // Resolve model: config.model may be qualified (provider:model) or bare.
-        // The SDK needs the bare model name; the provider config is separate.
+        // GitHub Copilot-backed sessions keep the qualified provider:model ref,
+        // while other providers still use the raw deployment/model name plus a
+        // provider payload.
         // Fall back to registry default if no model specified.
         const registry = this.workerDefaults.modelProviders;
         const effectiveModel = this.normalizeModelRef(config.model) || "";
         const resolvedProviderConfig = this._resolveProviderConfig(effectiveModel);
         let sdkModelName = effectiveModel;
         if (registry && effectiveModel) {
-            const desc = registry.getDescriptor(effectiveModel);
-            if (desc) sdkModelName = desc.modelName;
+            const resolved = registry.resolve(effectiveModel);
+            if (resolved && resolved.type !== "github") {
+                sdkModelName = resolved.modelName;
+            }
         }
 
         const sessionConfig: any = {
