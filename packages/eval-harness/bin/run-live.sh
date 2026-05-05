@@ -219,6 +219,71 @@ fi
 
 cd "${PKG_DIR}"
 
+# Write a run-meta sidecar so `bin/report.mjs` can render the suite
+# gates / judge model / DB host even when it's invoked AFTER vitest has
+# exited (env at that point no longer carries LIVE / LIVE_JUDGE / etc.).
+# We capture only the gate vars and presence-only flags for secrets — no
+# secret values, no full env dump.
+write_run_meta() {
+  local target="$1"
+  [[ -d "${target}" ]] || mkdir -p "${target}" 2>/dev/null || return 0
+  local meta="${target}/RUN-META.json"
+  local started_at
+  started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local db_host=""
+  if [[ -n "${DATABASE_URL:-}" ]]; then
+    # Extract host:port portion only — never the password
+    db_host="$(printf '%s' "${DATABASE_URL}" | sed -E 's,.*@([^/?]+).*,\1,' | head -c 100)"
+  fi
+  cat > "${meta}" <<JSON
+{
+  "schemaVersion": 1,
+  "startedAt": "${started_at}",
+  "wrapper": "bin/run-live.sh",
+  "pkgDir": "${PKG_DIR}",
+  "reportsDir": "${target}",
+  "gates": {
+    "LIVE": "${LIVE}",
+    "LIVE_JUDGE": "${LIVE_JUDGE}",
+    "PERF_HEAVY": "${PERF_HEAVY}",
+    "PERF_HEAVY_N8": "${PERF_HEAVY_N8}",
+    "PERF_DURABILITY": "${PERF_DURABILITY}",
+    "PG_STAT_STATEMENTS_ENABLED": "${PG_STAT_STATEMENTS_ENABLED}",
+    "PROMPT_TESTING": "${PROMPT_TESTING}",
+    "PS_EVAL_FILE_PARALLELISM": "${PS_EVAL_FILE_PARALLELISM}",
+    "KEEP_DURABILITY_ENV": "${KEEP_DURABILITY_ENV}",
+    "EVAL_VERBOSE_TEARDOWN": "${EVAL_VERBOSE_TEARDOWN}"
+  },
+  "models": {
+    "LIVE_JUDGE_MODEL": "${LIVE_JUDGE_MODEL:-}",
+    "LIVE_JUDGE_MODEL_A": "${LIVE_JUDGE_MODEL_A:-}",
+    "LIVE_JUDGE_MODEL_B": "${LIVE_JUDGE_MODEL_B:-}",
+    "LIVE_MATRIX_MODELS": "${LIVE_MATRIX_MODELS:-}",
+    "LIVE_ABLATION_MODELS": "${LIVE_ABLATION_MODELS:-}",
+    "PROMPT_TESTING_MODELS": "${PROMPT_TESTING_MODELS:-}"
+  },
+  "infra": {
+    "DATABASE_HOST": "${db_host}",
+    "GITHUB_TOKEN_PRESENT": "$([[ -n "${GITHUB_TOKEN:-}" ]] && echo yes || echo no)",
+    "OPENAI_API_KEY_PRESENT": "$([[ -n "${OPENAI_API_KEY:-}" ]] && echo yes || echo no)",
+    "PS_MODEL_PROVIDERS_PATH": "${PS_MODEL_PROVIDERS_PATH:-}"
+  }
+}
+JSON
+}
+
+if (( NO_REPORTS == 0 )); then
+  RESOLVED_REPORTS_DIR=""
+  if [[ -n "${REPORTS_DIR}" ]]; then
+    if [[ "${REPORTS_DIR}" = /* ]]; then
+      RESOLVED_REPORTS_DIR="${REPORTS_DIR}"
+    else
+      RESOLVED_REPORTS_DIR="${PKG_DIR}/${REPORTS_DIR}"
+    fi
+    write_run_meta "${RESOLVED_REPORTS_DIR}"
+  fi
+fi
+
 # Ensure dist/ is fresh — `npx vitest run` skips the npm `pretest` hook,
 # so without this a stale dist/ can mask source changes (the package
 # exposes `dist/index.js` via the `.` export). Skip with EVAL_SKIP_BUILD=1

@@ -309,27 +309,55 @@ function dbHost(url) {
   }
 }
 
-function envFingerprint() {
+// Try to read RUN-META.json (written by bin/run-live.sh before vitest)
+// from the reports dir. Falls back to empty meta if not present.
+function readRunMeta(reportsDir) {
+  try {
+    const raw = readFileSync(join(reportsDir, "RUN-META.json"), "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function envFingerprint(reportsDir) {
+  const meta = reportsDir ? readRunMeta(reportsDir) : null;
   const e = process.env;
+  // Precedence per field: meta value if non-empty, else process.env, else
+  // null. RUN-META.json is the authoritative record of what gates were
+  // active for the actual vitest run; process.env at report-generation
+  // time may be stale (post-vitest) or missing (running report.mjs from
+  // a fresh shell).
+  const pick = (metaVal, envVal) => {
+    if (metaVal !== undefined && metaVal !== null && metaVal !== "") return metaVal;
+    if (envVal !== undefined && envVal !== null && envVal !== "") return envVal;
+    return null;
+  };
+  const g = meta?.gates ?? {};
+  const m = meta?.models ?? {};
+  const i = meta?.infra ?? {};
   return {
-    LIVE: e.LIVE ?? null,
-    LIVE_JUDGE: e.LIVE_JUDGE ?? null,
-    PERF_HEAVY: e.PERF_HEAVY ?? null,
-    PERF_HEAVY_N8: e.PERF_HEAVY_N8 ?? null,
-    PERF_DURABILITY: e.PERF_DURABILITY ?? null,
-    PG_STAT_STATEMENTS_ENABLED: e.PG_STAT_STATEMENTS_ENABLED ?? null,
-    PROMPT_TESTING: e.PROMPT_TESTING ?? null,
-    PS_EVAL_FILE_PARALLELISM: e.PS_EVAL_FILE_PARALLELISM ?? null,
-    LIVE_JUDGE_MODEL: e.LIVE_JUDGE_MODEL ?? null,
-    LIVE_JUDGE_MODEL_A: e.LIVE_JUDGE_MODEL_A ?? null,
-    LIVE_JUDGE_MODEL_B: e.LIVE_JUDGE_MODEL_B ?? null,
-    LIVE_MATRIX_MODELS: e.LIVE_MATRIX_MODELS ?? null,
-    LIVE_ABLATION_MODELS: e.LIVE_ABLATION_MODELS ?? null,
-    PROMPT_TESTING_MODELS: e.PROMPT_TESTING_MODELS ?? null,
-    DATABASE_HOST: dbHost(e.DATABASE_URL),
-    GITHUB_TOKEN_PRESENT: e.GITHUB_TOKEN ? "yes" : "no",
-    OPENAI_API_KEY_PRESENT: e.OPENAI_API_KEY ? "yes" : "no",
-    PS_MODEL_PROVIDERS_PATH: e.PS_MODEL_PROVIDERS_PATH ?? null,
+    LIVE: pick(g.LIVE, e.LIVE),
+    LIVE_JUDGE: pick(g.LIVE_JUDGE, e.LIVE_JUDGE),
+    PERF_HEAVY: pick(g.PERF_HEAVY, e.PERF_HEAVY),
+    PERF_HEAVY_N8: pick(g.PERF_HEAVY_N8, e.PERF_HEAVY_N8),
+    PERF_DURABILITY: pick(g.PERF_DURABILITY, e.PERF_DURABILITY),
+    PG_STAT_STATEMENTS_ENABLED: pick(g.PG_STAT_STATEMENTS_ENABLED, e.PG_STAT_STATEMENTS_ENABLED),
+    PROMPT_TESTING: pick(g.PROMPT_TESTING, e.PROMPT_TESTING),
+    PS_EVAL_FILE_PARALLELISM: pick(g.PS_EVAL_FILE_PARALLELISM, e.PS_EVAL_FILE_PARALLELISM),
+    LIVE_JUDGE_MODEL: pick(m.LIVE_JUDGE_MODEL, e.LIVE_JUDGE_MODEL),
+    LIVE_JUDGE_MODEL_A: pick(m.LIVE_JUDGE_MODEL_A, e.LIVE_JUDGE_MODEL_A),
+    LIVE_JUDGE_MODEL_B: pick(m.LIVE_JUDGE_MODEL_B, e.LIVE_JUDGE_MODEL_B),
+    LIVE_MATRIX_MODELS: pick(m.LIVE_MATRIX_MODELS, e.LIVE_MATRIX_MODELS),
+    LIVE_ABLATION_MODELS: pick(m.LIVE_ABLATION_MODELS, e.LIVE_ABLATION_MODELS),
+    PROMPT_TESTING_MODELS: pick(m.PROMPT_TESTING_MODELS, e.PROMPT_TESTING_MODELS),
+    DATABASE_HOST: pick(i.DATABASE_HOST, dbHost(e.DATABASE_URL)),
+    GITHUB_TOKEN_PRESENT:
+      i.GITHUB_TOKEN_PRESENT ?? (e.GITHUB_TOKEN ? "yes" : "no"),
+    OPENAI_API_KEY_PRESENT:
+      i.OPENAI_API_KEY_PRESENT ?? (e.OPENAI_API_KEY ? "yes" : "no"),
+    PS_MODEL_PROVIDERS_PATH: pick(i.PS_MODEL_PROVIDERS_PATH, e.PS_MODEL_PROVIDERS_PATH),
+    _metaSource: meta ? "RUN-META.json" : "process.env (no RUN-META.json found)",
   };
 }
 
@@ -597,7 +625,7 @@ function renderMarkdown(agg) {
       ? agg.latestSummary - agg.earliestRun
       : null;
   const reportTs = new Date().toISOString();
-  const env = envFingerprint();
+  const env = envFingerprint(agg.dir);
   const bySuite = summariseSuites(agg.samples, agg.summaries);
 
   // -----------------------------------------------------------------
@@ -662,7 +690,7 @@ function renderMarkdown(agg) {
   out.push(`| Tasks (jsonl files seen) | ${agg.summaries.length} |`);
   out.push(`| Samples observed | ${agg.samples.length} |`);
   out.push("");
-  out.push("**Suite gates** (env at report-generation time — empty if `bin/report.mjs` was invoked outside `bin/run-live.sh`):");
+  out.push(`**Suite gates** (source: ${env._metaSource}):`);
   out.push("");
   out.push("| Gate | Value |");
   out.push("|---|---|");
