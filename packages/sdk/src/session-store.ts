@@ -25,6 +25,27 @@ export interface SessionStateStore {
     delete(sessionId: string): Promise<void>;
 }
 
+export type ArtifactEncoding = "utf-8" | "base64";
+export type ArtifactSource = "agent" | "user" | "system";
+
+export interface ArtifactUploadOptions {
+    encoding?: ArtifactEncoding;
+    source?: ArtifactSource;
+}
+
+export interface ArtifactMetadata {
+    filename: string;
+    sizeBytes: number;
+    contentType: string;
+    isBinary: boolean;
+    uploadedAt: string;
+    source: ArtifactSource;
+}
+
+export interface ArtifactDownloadResult extends ArtifactMetadata {
+    body: Buffer;
+}
+
 function tarFileName(sessionId: string): string {
     return `${sessionId}.tar.gz`;
 }
@@ -40,6 +61,59 @@ function buildMetadata(tarPath: string, sessionId: string, meta?: Record<string,
         worker: os.hostname(),
         sizeBytes: fs.statSync(tarPath).size,
         ...meta,
+    };
+}
+
+const MAX_ARTIFACT_SIZE = 1_048_576; // 1MB
+const DEFAULT_TEXT_ARTIFACT_CONTENT_TYPE = "text/markdown";
+const DEFAULT_BINARY_ARTIFACT_CONTENT_TYPE = "application/octet-stream";
+
+export function normalizeArtifactContentType(contentType?: string): string {
+    const normalized = String(contentType || "").trim().toLowerCase();
+    if (!normalized) return DEFAULT_TEXT_ARTIFACT_CONTENT_TYPE;
+    return normalized;
+}
+
+export function isBinaryArtifactContentType(contentType?: string): boolean {
+    const normalized = normalizeArtifactContentType(contentType);
+    if (normalized.startsWith("text/")) return false;
+    if (normalized === "application/json") return false;
+    if (normalized === "application/xml") return false;
+    if (normalized === "application/javascript") return false;
+    if (normalized === "image/svg+xml") return false;
+    return true;
+}
+
+export async function resolveArtifactUpload(
+    content: string | Buffer,
+    contentType?: string,
+    opts: ArtifactUploadOptions = {},
+): Promise<{ body: Buffer; metadata: Omit<ArtifactMetadata, "filename" | "uploadedAt"> }> {
+    const encoding = opts.encoding ?? "utf-8";
+    const body = Buffer.isBuffer(content)
+        ? content
+        : encoding === "base64"
+            ? Buffer.from(content, "base64")
+            : Buffer.from(content, "utf8");
+
+    if (body.length > MAX_ARTIFACT_SIZE) {
+        throw new Error(`Artifact too large: ${body.length} bytes (max ${MAX_ARTIFACT_SIZE})`);
+    }
+
+    const normalizedContentType = contentType
+        ? normalizeArtifactContentType(contentType)
+        : encoding === "base64"
+            ? DEFAULT_BINARY_ARTIFACT_CONTENT_TYPE
+            : DEFAULT_TEXT_ARTIFACT_CONTENT_TYPE;
+
+    return {
+        body,
+        metadata: {
+            sizeBytes: body.length,
+            contentType: normalizedContentType,
+            isBinary: isBinaryArtifactContentType(normalizedContentType),
+            source: opts.source ?? "agent",
+        },
     };
 }
 
@@ -269,10 +343,19 @@ export class FilesystemSessionStore implements SessionStateStore {
  * Implemented by both SessionBlobStore (Azure Blob) and FilesystemArtifactStore (local disk).
  */
 export interface ArtifactStore {
-    uploadArtifact(sessionId: string, filename: string, content: string, contentType?: string): Promise<string>;
-    downloadArtifact(sessionId: string, filename: string): Promise<string>;
-    listArtifacts(sessionId: string): Promise<string[]>;
+    uploadArtifact(
+        sessionId: string,
+        filename: string,
+        content: string | Buffer,
+        contentType?: string,
+        opts?: ArtifactUploadOptions,
+    ): Promise<ArtifactMetadata>;
+    downloadArtifact(sessionId: string, filename: string): Promise<ArtifactDownloadResult>;
+    downloadArtifactText(sessionId: string, filename: string): Promise<string>;
+    listArtifacts(sessionId: string): Promise<ArtifactMetadata[]>;
     artifactExists(sessionId: string, filename: string): Promise<boolean>;
+    deleteArtifact?(sessionId: string, filename: string): Promise<boolean>;
+    deleteArtifacts?(sessionId: string): Promise<number>;
 }
 
 const DEFAULT_ARTIFACT_DIR = path.join(os.homedir(), ".copilot", "artifacts");
@@ -295,38 +378,118 @@ export class FilesystemArtifactStore implements ArtifactStore {
         return path.join(this.artifactDir, sessionId, safe);
     }
 
+    private metadataPath(sessionId: string, filename: string): string {
+        return `${this.safePath(sessionId, filename)}.meta.json`;
+    }
+
+    private readMetadata(sessionId: string, filename: string): ArtifactMetadata | null {
+        const metadataPath = this.metadataPath(sessionId, filename);
+        if (!fs.existsSync(metadataPath)) return null;
+        try {
+            const parsed = JSON.parse(fs.readFileSync(metadataPath, "utf-8"));
+            return {
+                filename: path.basename(filename),
+                sizeBytes: Number(parsed?.sizeBytes) || 0,
+                contentType: normalizeArtifactContentType(parsed?.contentType),
+                isBinary: parsed?.isBinary === true,
+                uploadedAt: typeof parsed?.uploadedAt === "string" ? parsed.uploadedAt : "",
+                source: parsed?.source === "user" || parsed?.source === "system" ? parsed.source : "agent",
+            };
+        } catch {
+            return null;
+        }
+    }
+
     async uploadArtifact(
         sessionId: string,
         filename: string,
-        content: string,
-        _contentType = "text/markdown",
-    ): Promise<string> {
-        const MAX_SIZE = 1_048_576; // 1MB
-        if (content.length > MAX_SIZE) {
-            throw new Error(`Artifact too large: ${content.length} bytes (max ${MAX_SIZE})`);
-        }
+        content: string | Buffer,
+        contentType?: string,
+        opts: ArtifactUploadOptions = {},
+    ): Promise<ArtifactMetadata> {
+        const safeFilename = path.basename(String(filename || "").trim());
+        const { body, metadata } = await resolveArtifactUpload(content, contentType, opts);
         const filePath = this.safePath(sessionId, filename);
+        const uploadedAt = new Date().toISOString();
         fs.mkdirSync(path.dirname(filePath), { recursive: true });
-        fs.writeFileSync(filePath, content, "utf-8");
-        return filePath;
+        fs.writeFileSync(filePath, body);
+        fs.writeFileSync(this.metadataPath(sessionId, filename), JSON.stringify({
+            ...metadata,
+            uploadedAt,
+        }), "utf-8");
+        return {
+            filename: safeFilename,
+            uploadedAt,
+            ...metadata,
+        };
     }
 
-    async downloadArtifact(sessionId: string, filename: string): Promise<string> {
+    async downloadArtifact(sessionId: string, filename: string): Promise<ArtifactDownloadResult> {
         const filePath = this.safePath(sessionId, filename);
         if (!fs.existsSync(filePath)) {
             throw new Error(`Artifact not found: ${filename} in session ${sessionId}`);
         }
-        return fs.readFileSync(filePath, "utf-8");
+        const body = fs.readFileSync(filePath);
+        const existingMetadata = this.readMetadata(sessionId, filename);
+        const stat = fs.statSync(filePath);
+        const contentType = existingMetadata?.contentType || normalizeArtifactContentType(undefined);
+        return {
+            filename: path.basename(filename),
+            sizeBytes: body.length,
+            contentType,
+            isBinary: existingMetadata?.isBinary ?? isBinaryArtifactContentType(contentType),
+            uploadedAt: existingMetadata?.uploadedAt || stat.mtime.toISOString(),
+            source: existingMetadata?.source || "agent",
+            body,
+        };
     }
 
-    async listArtifacts(sessionId: string): Promise<string[]> {
+    async downloadArtifactText(sessionId: string, filename: string): Promise<string> {
+        const result = await this.downloadArtifact(sessionId, filename);
+        if (result.isBinary) {
+            const error = new Error(`Artifact '${filename}' is binary and cannot be read as text.`) as Error & Record<string, unknown>;
+            error.code = "ARTIFACT_IS_BINARY";
+            error.contentType = result.contentType;
+            error.sizeBytes = result.sizeBytes;
+            throw error;
+        }
+        return result.body.toString("utf8");
+    }
+
+    async listArtifacts(sessionId: string): Promise<ArtifactMetadata[]> {
         const dir = path.join(this.artifactDir, sessionId);
         if (!fs.existsSync(dir)) return [];
-        return fs.readdirSync(dir).filter(f => !f.startsWith("."));
+        return fs.readdirSync(dir)
+            .filter((filename) => !filename.startsWith(".") && !filename.endsWith(".meta.json"))
+            .map((filename) => this.readMetadata(sessionId, filename) || {
+                filename,
+                sizeBytes: fs.statSync(this.safePath(sessionId, filename)).size,
+                contentType: DEFAULT_TEXT_ARTIFACT_CONTENT_TYPE,
+                isBinary: false,
+                uploadedAt: fs.statSync(this.safePath(sessionId, filename)).mtime.toISOString(),
+                source: "agent" as const,
+            });
     }
 
     async artifactExists(sessionId: string, filename: string): Promise<boolean> {
         return fs.existsSync(this.safePath(sessionId, filename));
+    }
+
+    async deleteArtifact(sessionId: string, filename: string): Promise<boolean> {
+        const filePath = this.safePath(sessionId, filename);
+        const metadataPath = this.metadataPath(sessionId, filename);
+        const existed = fs.existsSync(filePath);
+        try { fs.unlinkSync(filePath); } catch {}
+        try { fs.unlinkSync(metadataPath); } catch {}
+        return existed;
+    }
+
+    async deleteArtifacts(sessionId: string): Promise<number> {
+        const dir = path.join(this.artifactDir, sessionId);
+        if (!fs.existsSync(dir)) return 0;
+        const files = fs.readdirSync(dir).filter((filename) => !filename.endsWith(".meta.json"));
+        fs.rmSync(dir, { recursive: true, force: true });
+        return files.length;
     }
 }
 

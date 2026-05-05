@@ -1570,6 +1570,53 @@ export function selectStatusBar(state) {
     };
 }
 
+export function selectAdminConsole(state) {
+    const principal = state.auth?.principal || null;
+    const admin = state.admin || {};
+    const ghcpKey = admin.ghcpKey || {};
+    return {
+        principal,
+        loading: admin.loading === true,
+        loadError: admin.loadError || null,
+        ghcpKey: {
+            configured: Boolean(admin.profile?.githubCopilotKeySet),
+            editing: ghcpKey.editing === true,
+            saving: ghcpKey.saving === true,
+            error: ghcpKey.error || null,
+            statusText: ghcpKey.editing
+                ? "Editing local override for this signed-in user."
+                : admin.profile?.githubCopilotKeySet
+                    ? "A per-user key is stored in CMS."
+                    : "No per-user key saved. The worker falls back to env GITHUB_TOKEN.",
+        },
+    };
+}
+
+export function selectAdminGhcpKeyEditorModal(state, maxWidth = 72) {
+    const ghcpKey = state.admin?.ghcpKey || {};
+    if (!ghcpKey.editing) return null;
+    const draft = String(ghcpKey.draft || "");
+    return {
+        title: "GitHub Copilot Key",
+        detailsLines: [
+            [{ text: "Set a per-user GitHub Copilot token override.", color: "white" }],
+            [{ text: "The raw key is masked while you type.", color: "gray" }],
+        ],
+        helpTitle: "Help",
+        helpLines: [
+            [{ text: "Enter", color: "green", bold: true }, { text: " save the key", color: "gray" }],
+            [{ text: "Esc", color: "red", bold: true }, { text: " cancel editing", color: "gray" }],
+            [{ text: "Leave empty to clear the stored override.", color: "gray" }],
+        ],
+        displayValue: draft ? "*".repeat(draft.length) : "",
+        cursorIndex: Math.max(0, Number(ghcpKey.cursorIndex) || 0),
+        placeholder: "ghu_... or paste token",
+        saving: ghcpKey.saving === true,
+        error: ghcpKey.error || null,
+        idealWidth: maxWidth,
+    };
+}
+
 function flattenRunsLength(runs) {
     return (runs || []).reduce((sum, run) => sum + String(run?.text || "").length, 0);
 }
@@ -2365,6 +2412,62 @@ export function selectModelPickerModal(state, maxWidth = 72) {
     };
 }
 
+export function selectReasoningEffortPickerModal(state, maxWidth = 64) {
+    const modal = state.ui.modal;
+    if (!modal || modal.type !== "reasoningEffortPicker") return null;
+
+    const items = Array.isArray(modal.items) ? modal.items : [];
+    const selectedIndex = Math.max(0, Number(modal.selectedIndex) || 0);
+    const contentWidth = Math.max(24, maxWidth - 4);
+    const rows = items.map((item, index) => {
+        const isSelected = index === selectedIndex;
+        const label = item?.label || item?.title || item?.effort || item?.id || "Reasoning effort";
+        const labelRuns = fitRuns([
+            { text: "· ", color: "gray" },
+            { text: label, color: "white", bold: true },
+            ...(item?.isDefault ? [{ text: " ← default", color: "gray" }] : []),
+        ], contentWidth);
+        return isSelected
+            ? buildActiveHighlightLine(labelRuns.map((run) => run.text).join("").padEnd(contentWidth, " "))
+            : labelRuns;
+    });
+
+    const selectedItem = items[selectedIndex] || null;
+    const detailsLines = selectedItem
+        ? [
+            [{
+                text: selectedItem.label || selectedItem.title || selectedItem.effort || selectedItem.id || "Reasoning effort",
+                color: "white",
+                bold: true,
+            }],
+            ...(selectedItem?.modelName ? [[{ text: `Model: ${selectedItem.modelName}`, color: "gray" }]] : []),
+            [{ text: "", color: "gray" }],
+            [{
+                text: selectedItem.description || "No description available for this reasoning effort.",
+                color: selectedItem.description ? "white" : "gray",
+            }],
+        ]
+        : [[{ text: "No reasoning effort selected.", color: "gray" }]];
+
+    return {
+        title: modal.title || "Select reasoning effort",
+        rows,
+        selectedRowIndex: selectedIndex,
+        detailsTitle: "Reasoning Details",
+        detailsLines,
+        idealWidth: Math.min(
+            Math.max(
+                46,
+                rows.reduce((max, row) => {
+                    if (Array.isArray(row)) return Math.max(max, flattenRunsLength(row));
+                    return Math.max(max, String(row?.text || "").length);
+                }, 0) + 4,
+            ),
+            maxWidth,
+        ),
+    };
+}
+
 export function selectSessionAgentPickerModal(state, maxWidth = 76) {
     const modal = state.ui.modal;
     if (!modal || modal.type !== "sessionAgentPicker") return null;
@@ -2427,6 +2530,81 @@ export function selectSessionAgentPickerModal(state, maxWidth = 76) {
         idealWidth: Math.min(
             Math.max(
                 52,
+                rows.reduce((max, row) => {
+                    if (Array.isArray(row)) return Math.max(max, flattenRunsLength(row));
+                    return Math.max(max, String(row?.text || "").length);
+                }, 0) + 4,
+            ),
+            maxWidth,
+        ),
+    };
+}
+
+export function selectSessionOwnerFilterModal(state, maxWidth = 76) {
+    const modal = state.ui.modal;
+    if (!modal || modal.type !== "sessionOwnerFilter") return null;
+
+    const currentFilter = state.sessions?.ownerFilter || {};
+    const principal = state.auth?.principal || null;
+    const items = [
+        {
+            id: "all",
+            title: "All sessions",
+            description: "Show user, unowned, and system sessions together.",
+            active: currentFilter.all === true,
+        },
+        {
+            id: "me",
+            title: "My sessions",
+            description: principal?.email
+                ? `Show sessions owned by ${principal.email}.`
+                : "Show sessions owned by the authenticated user.",
+            active: currentFilter.includeMe === true,
+        },
+        {
+            id: "unowned",
+            title: "Unowned sessions",
+            description: "Show sessions that do not have an authenticated owner.",
+            active: currentFilter.includeUnowned === true,
+        },
+        {
+            id: "system",
+            title: "System sessions",
+            description: "Show worker-managed system sessions such as maintenance agents.",
+            active: currentFilter.includeSystem === true,
+        },
+    ];
+    const selectedIndex = Math.max(0, Number(modal.selectedIndex) || 0);
+    const contentWidth = Math.max(26, maxWidth - 4);
+    const rows = items.map((item, index) => {
+        const isSelected = index === selectedIndex;
+        const marker = item.active ? "● " : "○ ";
+        const labelRuns = fitRuns([
+            { text: marker, color: item.active ? "cyan" : "gray" },
+            { text: item.title, color: "white", bold: item.active },
+        ], contentWidth);
+        return isSelected
+            ? buildActiveHighlightLine(labelRuns.map((run) => run.text).join("").padEnd(contentWidth, " "))
+            : labelRuns;
+    });
+
+    const selectedItem = items[selectedIndex] || items[0];
+    const detailsLines = [
+        [{ text: selectedItem.title, color: "white", bold: true }],
+        [{ text: selectedItem.active ? "Enabled" : "Disabled", color: selectedItem.active ? "cyan" : "gray" }],
+        [{ text: "", color: "gray" }],
+        [{ text: selectedItem.description, color: "white" }],
+    ];
+
+    return {
+        title: modal.title || "Filter sessions by owner",
+        rows,
+        selectedRowIndex: selectedIndex,
+        detailsTitle: "Session Filter",
+        detailsLines,
+        idealWidth: Math.min(
+            Math.max(
+                54,
                 rows.reduce((max, row) => {
                     if (Array.isArray(row)) return Math.max(max, flattenRunsLength(row));
                     return Math.max(max, String(row?.text || "").length);

@@ -402,8 +402,8 @@ export function createSessionManagerProxy(ctx: any) {
             return ctx.scheduleActivity("getOrchestrationStats", { sessionId });
         },
         /** List all sessions via the PilotSwarmClient SDK. */
-        listSessions() {
-            return ctx.scheduleActivity("listSessions", {});
+        listSessions(args?: { includeSystem?: boolean; ownerQuery?: string; ownerKind?: string }) {
+            return ctx.scheduleActivity("listSessions", args ?? {});
         },
         /** List direct child sessions of a session. */
         listChildSessions(parentSessionId: string) {
@@ -997,17 +997,46 @@ export function registerActivities(
                 const running = children.filter(child => child.status === "running").map(child => child.orchId);
                 return running.length > 0 ? running : children.map(child => child.orchId);
             },
-            listSessions: async () => {
+            listSessions: async (args?: {
+                include_system?: boolean;
+                owner_query?: string;
+                owner_kind?: string;
+            }) => {
                 try {
                     const sdkClient = await getInlineClient();
                     const sessions = await sdkClient.listSessions();
-                    const lines = sessions.map((s: any) =>
+                    const includeSystem = args?.include_system === true;
+                    const ownerQuery = String(args?.owner_query || "").trim().toLowerCase();
+                    const ownerKind = String(args?.owner_kind || "").trim().toLowerCase();
+                    const filtered = sessions.filter((session: any) => {
+                        if (!includeSystem && session.isSystem) return false;
+                        if (ownerKind) {
+                            const sessionOwnerKind = session.isSystem ? "system" : (session.owner ? "user" : "unowned");
+                            if (sessionOwnerKind !== ownerKind) return false;
+                        }
+                        if (ownerQuery) {
+                            const haystack = [
+                                session.title,
+                                session.sessionId,
+                                session.owner?.displayName,
+                                session.owner?.email,
+                                session.owner?.provider,
+                                session.owner?.subject,
+                            ]
+                                .filter(Boolean)
+                                .join(" ")
+                                .toLowerCase();
+                            if (!haystack.includes(ownerQuery)) return false;
+                        }
+                        return true;
+                    });
+                    const lines = filtered.map((s: any) =>
                         `  - ${s.sessionId}${s.sessionId === input.sessionId ? " (this session)" : ""}\n` +
                         `    Title: ${s.title ?? "(untitled)"}\n` +
                         `    Status: ${s.status}, Iterations: ${s.iterations ?? 0}\n` +
                         `    Parent: ${s.parentSessionId ?? "none"}`
                     );
-                    return `[SYSTEM: Active sessions (${sessions.length}):\n${lines.join("\n")}]`;
+                    return `[SYSTEM: Active sessions (${filtered.length}):\n${lines.join("\n")}]`;
                 } catch (err: any) {
                     return `[SYSTEM: list_sessions failed: ${err?.message || String(err)}]`;
                 }
@@ -2197,7 +2226,11 @@ export function registerActivities(
     // Lists all sessions via the PilotSwarmClient SDK.
     runtime.registerActivity("listSessions", async (
         activityCtx: any,
-        _input: {},
+        input: {
+            includeSystem?: boolean;
+            ownerQuery?: string;
+            ownerKind?: string;
+        },
     ): Promise<string> => {
         activityCtx.traceInfo(`[listSessions]`);
         if (!storeUrl) throw new Error("No storeUrl — cannot create PilotSwarmClient");
@@ -2210,15 +2243,42 @@ export function registerActivities(
         });
         try {
             await sdkClient.start();
-            const sessions = await sdkClient.listSessions();
-            return JSON.stringify(sessions.map(s => ({
-                sessionId: s.sessionId,
-                title: s.title,
-                status: s.status,
-                iterations: s.iterations,
-                parentSessionId: s.parentSessionId,
-                error: s.error,
-            })));
+            const rows = await (sdkClient as any)._catalog.listSessions();
+            const includeSystem = input?.includeSystem === true;
+            const ownerQuery = String(input?.ownerQuery || "").trim().toLowerCase();
+            const ownerKind = String(input?.ownerKind || "").trim().toLowerCase();
+            const sessions = rows
+                .filter((row: any) => {
+                    if (!includeSystem && row.isSystem) return false;
+                    const rowOwnerKind = row.isSystem ? "system" : (row.owner ? "user" : "unowned");
+                    if (ownerKind && rowOwnerKind !== ownerKind) return false;
+                    if (ownerQuery) {
+                        const haystack = [
+                            row.title,
+                            row.sessionId,
+                            row.owner?.displayName,
+                            row.owner?.email,
+                            row.owner?.provider,
+                            row.owner?.subject,
+                        ]
+                            .filter(Boolean)
+                            .join(" ")
+                            .toLowerCase();
+                        if (!haystack.includes(ownerQuery)) return false;
+                    }
+                    return true;
+                })
+                .map((row: any) => ({
+                    sessionId: row.sessionId,
+                    title: row.title,
+                    status: row.state,
+                    iterations: row.currentIteration,
+                    parentSessionId: row.parentSessionId,
+                    error: row.lastError,
+                    ownerKind: row.isSystem ? "system" : (row.owner ? "user" : "unowned"),
+                    owner: row.owner,
+                }));
+            return JSON.stringify(sessions);
         } finally {
             await sdkClient.stop();
         }

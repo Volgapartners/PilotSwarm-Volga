@@ -41,6 +41,11 @@ else
     ENV_FILE=".env.remote"
 fi
 
+if [[ "$ENV_FILE" == ".env.remote" && ! -f "$ENV_FILE" && -f ".env" ]]; then
+  echo "[portal] .env.remote not found; falling back to .env"
+  ENV_FILE=".env"
+fi
+
 # Determine TUI mode
 TUI_MODE="$MODE"
 

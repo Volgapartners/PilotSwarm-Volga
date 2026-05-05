@@ -26,7 +26,15 @@ import {
     HeadObjectCommand,
     ListObjectsV2Command,
 } from "@aws-sdk/client-s3";
-import type { ArtifactStore } from "./session-store.js";
+import {
+    type ArtifactDownloadResult,
+    type ArtifactMetadata,
+    type ArtifactStore,
+    type ArtifactUploadOptions,
+    isBinaryArtifactContentType,
+    normalizeArtifactContentType,
+    resolveArtifactUpload,
+} from "./session-store.js";
 
 export interface S3ArtifactStoreOptions {
     /** S3 bucket name. */
@@ -60,23 +68,28 @@ export class S3ArtifactStore implements ArtifactStore {
     async uploadArtifact(
         sessionId: string,
         filename: string,
-        content: string,
-        contentType = "text/plain",
-    ): Promise<string> {
-        if (content.length > MAX_ARTIFACT_SIZE) {
-            throw new Error(`Artifact too large: ${content.length} bytes (max ${MAX_ARTIFACT_SIZE})`);
-        }
+        content: string | Buffer,
+        contentType?: string,
+        opts: ArtifactUploadOptions = {},
+    ): Promise<ArtifactMetadata> {
         const key = this.objectKey(sessionId, filename);
+        const safeFilename = filename.replace(/[/\\]/g, "_");
+        const { body, metadata } = await resolveArtifactUpload(content, contentType, opts);
+        const uploadedAt = new Date().toISOString();
         await this.client.send(new PutObjectCommand({
             Bucket: this.bucket,
             Key: key,
-            Body: content,
-            ContentType: contentType,
+            Body: body,
+            ContentType: metadata.contentType,
         }));
-        return `s3://${this.bucket}/${key}`;
+        return {
+            filename: safeFilename,
+            uploadedAt,
+            ...metadata,
+        };
     }
 
-    async downloadArtifact(sessionId: string, filename: string): Promise<string> {
+    async downloadArtifact(sessionId: string, filename: string): Promise<ArtifactDownloadResult> {
         const key = this.objectKey(sessionId, filename);
         const response = await this.client.send(new GetObjectCommand({
             Bucket: this.bucket,
@@ -90,10 +103,32 @@ export class S3ArtifactStore implements ArtifactStore {
         for await (const chunk of response.Body as AsyncIterable<Uint8Array>) {
             chunks.push(Buffer.from(chunk));
         }
-        return Buffer.concat(chunks).toString("utf-8");
+        const body = Buffer.concat(chunks);
+        const contentType = normalizeArtifactContentType(response.ContentType || undefined);
+        return {
+            filename: filename.replace(/[/\\]/g, "_"),
+            sizeBytes: Number(response.ContentLength) || body.length,
+            contentType,
+            isBinary: isBinaryArtifactContentType(contentType),
+            uploadedAt: new Date().toISOString(),
+            source: "agent",
+            body,
+        };
     }
 
-    async listArtifacts(sessionId: string): Promise<string[]> {
+    async downloadArtifactText(sessionId: string, filename: string): Promise<string> {
+        const result = await this.downloadArtifact(sessionId, filename);
+        if (result.isBinary) {
+            const error = new Error(`Artifact '${filename}' is binary and cannot be read as text.`) as Error & Record<string, unknown>;
+            error.code = "ARTIFACT_IS_BINARY";
+            error.contentType = result.contentType;
+            error.sizeBytes = result.sizeBytes;
+            throw error;
+        }
+        return result.body.toString("utf8");
+    }
+
+    async listArtifacts(sessionId: string): Promise<ArtifactMetadata[]> {
         const prefix = `${this.keyPrefix}/${sessionId}/`;
         const response = await this.client.send(new ListObjectsV2Command({
             Bucket: this.bucket,
@@ -103,7 +138,15 @@ export class S3ArtifactStore implements ArtifactStore {
             .map(obj => obj.Key ?? "")
             .filter(key => key.startsWith(prefix))
             .map(key => key.slice(prefix.length))
-            .filter(name => name.length > 0);
+            .filter(name => name.length > 0)
+            .map((name) => ({
+                filename: name,
+                sizeBytes: 0,
+                contentType: "application/octet-stream",
+                isBinary: true,
+                uploadedAt: "",
+                source: "agent" as const,
+            }));
     }
 
     async artifactExists(sessionId: string, filename: string): Promise<boolean> {
@@ -120,5 +163,9 @@ export class S3ArtifactStore implements ArtifactStore {
             }
             throw err;
         }
+    }
+
+    async deleteArtifact(_sessionId: string, _filename: string): Promise<boolean> {
+        return false;
     }
 }
