@@ -1037,6 +1037,8 @@ function renderMarkdown(agg) {
           suite: s.suite,
           taskId: s.taskId,
           caseId: s.caseId,
+          runId: s.runId,
+          jsonlFile: s.jsonlFile,
           criterion: sc.name.replace(/^judge\//, ""),
           value: sc.value,
           pass: sc.pass,
@@ -1050,9 +1052,20 @@ function renderMarkdown(agg) {
   out.push('<a id="llm-judge-scores"></a>');
   out.push("## LLM-judge scores");
   out.push("");
+  // Always show the judge-source paths so the user can debug judge
+  // behavior independently of whether this run produced any scores.
+  const judgeClientOpenAI = pkgPath("src/graders/openai-judge-client.ts");
+  const judgeClientPS = pkgPath("src/graders/pilotswarm-judge-client.ts");
+  const judgeClientsDoc = pkgPath("docs/JUDGE-CLIENTS.md");
+  out.push("**Judge source paths:**");
+  out.push("");
+  out.push(`- OpenAI judge client: ${renderPath(judgeClientOpenAI, { mustExist: true })}`);
+  out.push(`- PilotSwarm judge client: ${renderPath(judgeClientPS, { mustExist: true })}`);
+  out.push(`- Selection precedence + cost-rate contract: ${renderPath(judgeClientsDoc, { mustExist: true })}`);
+  out.push("");
   if (judgeScores.length === 0) {
     out.push(
-      "_No `judge/*` scores in this run. LLM-judge tests require `LIVE_JUDGE=1` and credentials; see [SUITES.md](../../docs/SUITES.md#llm-judge)._",
+      `_No \`judge/*\` scores in this run. LLM-judge tests require \`LIVE_JUDGE=1\` and credentials; see ${renderPath(pkgPath("docs/SUITES.md"), { mustExist: true })} § LLM-JUDGE._`,
     );
     out.push("");
   } else {
@@ -1095,6 +1108,12 @@ function renderMarkdown(agg) {
             `  - **prompt_excerpt:** ${escapeCell(truncate(String(j.metadata.prompt_excerpt), 200))}`,
           );
         }
+        if (j.jsonlFile) {
+          out.push(
+            `  - _raw jsonl:_ ${renderPath(join(agg.dir, j.jsonlFile), { mustExist: true })}`,
+          );
+        }
+        out.push(`  - _reports dir:_ ${renderPath(agg.dir, { mustExist: true })}`);
       }
       out.push("");
     }
