@@ -138,12 +138,46 @@ bin/run-live.sh --all --prompt-testing --report-out /tmp/my-eval-report.md
 bin/run-live.sh --all --prompt-testing --no-report
 ```
 
-The report (`REPORT-<ts>.md`) lives inside the reports dir and contains:
-top-line totals, per-task pass-rate / latency p50–p95 table, failures
-grouped by category (infra / sdk-perf / model-quality deterministic /
-model-quality judge-graded), LLM-judge per-criterion aggregates, and a
-"how to read this" key. Idempotent — re-run anytime to refresh from new
-jsonl writes. Works on partial / mid-flight runs.
+The report (`REPORT-<ts>.md`) lives inside the reports dir. Sections (in
+order, with a Markdown TOC at the top):
+
+1. **Run context** — wall clock, sample / task counts, suite gate env
+   (`LIVE`, `LIVE_JUDGE`, `PERF_HEAVY`, …), judge / matrix model ids,
+   and presence-only flags for `GITHUB_TOKEN` / `OPENAI_API_KEY` /
+   `DATABASE_URL` host.
+2. **Top-line totals** — ASCII pass-rate bar plus the standard counts.
+3. **Suite breakdown** — capability suites (FUNCTIONAL / DURABILITY /
+   ABLATIONS / LLM-JUDGE / PERFORMANCE / SAFETY / PROMPT-TESTING) each
+   with their own per-case table and pass-rate bar. Suite mapping is by
+   case-id prefix (`live.functional.*` → FUNCTIONAL, `perf.*` →
+   PERFORMANCE, `ablation.*` → ABLATIONS, `direct.*`/`indirect.*`/
+   `output.*`/`tool-abuse.*`/`subjective.*` → SAFETY, `*::*::*` →
+   PROMPT-TESTING).
+4. **Performance highlights** — latency p50/p95/p99 by suite, top-10
+   slowest cases, top-10 most-failing cases, cost aggregate when
+   present (graceful `n/a` otherwise — see notes about DB-budget signal
+   not flowing through `EvalRunner`).
+5. **Failures** — grouped by category (infra / sdk-perf /
+   model-quality deterministic / model-quality judge-graded). Each
+   failure shows: failing scores collapsed by score-name family, the
+   truncated `observed.finalResponse`, a compact tool-call summary, a
+   filtered list of key CMS events (`user.message`, `tool.*`,
+   `guardrail.decision`, `session.turn_*`), and a relative pointer to
+   the raw `<runId>/<caseId>.json` artifact.
+6. **LLM-judge scores** — per-criterion aggregate plus full reasoning
+   (truncated to ~400 chars) for any non-pass / infra-error judge
+   call. Renders an explanatory `n/a` line when no `judge/*` scores
+   were captured.
+7. **Prompt-testing variants** — `pt-cell-*` task ids collapsed into a
+   `base / variant / model` matrix so the per-task table doesn't get
+   noisy.
+8. **How to read this** + **What to do next** — actionable follow-up
+   commands per failure category (which `bin/run-live.sh` flag, which
+   prompt source to edit, which suite test to filter).
+
+Idempotent — re-run anytime to refresh from new jsonl writes. Works on
+partial / mid-flight runs (renders an explicit "in-flight" banner if
+samples without summaries are detected).
 
 Aggregate across runs:
 
