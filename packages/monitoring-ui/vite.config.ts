@@ -14,6 +14,10 @@ export default defineConfig({
             },
         },
     },
+    preview: {
+        port: 5174,
+        allowedHosts: ["api.algovity.ai"],
+    },
     build: {
         outDir: "dist",
     },
