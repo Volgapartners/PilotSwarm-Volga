@@ -1,5 +1,23 @@
 import type { DurabilityExpected, DurabilityObservation, Score } from "../types.js";
 
+/**
+ * Score a `DurabilityObservation` against `DurabilityExpected`.
+ *
+ * IMPORTANT: This grader does NOT verify that crashes / recovery actually
+ * happened — it scores the values in `observed` as supplied. Producers of
+ * `DurabilityObservation` decide truthfulness:
+ *   - `DurabilityFixtureDriver` derives values from a JSON script; passing
+ *     scores measure script structure, not real recovery (see that class's
+ *     docstring for the production-vs-fixture distinction).
+ *   - `ChaosDriver` + `LiveDriver` with real `beforeRunHook` worker.kill()
+ *     produce real observations from observed runtime + CMS events.
+ *
+ * For production crash-recovery evidence, gate on the LIVE durability suite
+ * (`test/durability-live.test.ts`) which reads CMS event log directly via
+ * `session.getMessages()` and asserts distinct `workerNodeId` values across
+ * cross-worker handoff. Do NOT rely on this grader against fixture-only
+ * drivers as proof of durability in production.
+ */
 export function gradeDurability(
   observed: DurabilityObservation | undefined,
   expected: DurabilityExpected | undefined,

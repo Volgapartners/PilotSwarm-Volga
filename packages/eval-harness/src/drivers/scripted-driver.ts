@@ -33,10 +33,30 @@ export type ScriptedScenario = DurabilityFixtureScenario;
 /**
  * Fixture-based illustrative durability driver.
  *
+ * ⚠️ NOT FOR PRODUCTION DURABILITY EVALUATION ⚠️
+ *
  * This driver does not crash a real worker, replay orchestration history, or
- * verify hydration/handoff. Durability observations are derived from the
- * fixture script supplied by the test author, then passed to durability graders.
- * Use it for grader examples only, not as proof of production crash recovery.
+ * verify hydration / handoff. Durability observations are derived entirely from
+ * the JSON script supplied by the test author, then passed to `gradeDurability`.
+ * The grader is therefore evaluating its own input — passing scores prove only
+ * that the grader reads the fixture correctly, NOT that PilotSwarm survives
+ * real worker crashes.
+ *
+ * Use this driver for:
+ *   - Unit-testing `gradeDurability` score outputs on synthetic inputs.
+ *   - Documenting expected `DurabilityObservation` shapes.
+ *
+ * Do NOT use this driver for:
+ *   - Production durability eval baselines (CIGate / RegressionDetector).
+ *   - Demonstrating PilotSwarm crash-recovery to maintainers / customers.
+ *
+ * For real durability evidence, see:
+ *   - `test/durability-live.test.ts` — real worker kill + CMS event proof.
+ *   - `ChaosDriver` wrapping `LiveDriver` with `beforeRunHook` that calls
+ *     `worker.kill()` mid-`runTurn` against a live PilotSwarm SDK harness.
+ *
+ * @see ChaosDriver
+ * @see LiveDriver
  */
 export class DurabilityFixtureDriver implements Driver {
   private scenarios: Map<string, DurabilityFixtureScenario>;
@@ -47,6 +67,20 @@ export class DurabilityFixtureDriver implements Driver {
     this.crashOnly = new Map();
     for (const s of scenarios) {
       this.scenarios.set(s.sampleId, s);
+    }
+    if (
+      process.env.NODE_ENV !== "test" &&
+      process.env.VITEST !== "true" &&
+      process.env.EVAL_HARNESS_SUPPRESS_FIXTURE_WARN !== "1"
+    ) {
+      // Surface the tautology to anyone who instantiates this outside of test
+      // contexts. Vitest sets VITEST=true and NODE_ENV=test so existing grader
+      // unit tests stay quiet.
+      console.warn(
+        "[eval-harness] DurabilityFixtureDriver is fixture-only and does NOT prove crash recovery. " +
+          "For production durability eval, use ChaosDriver + LiveDriver with a real worker.kill() hook " +
+          "or run test/durability-live.test.ts. Set EVAL_HARNESS_SUPPRESS_FIXTURE_WARN=1 to silence.",
+      );
     }
   }
 
