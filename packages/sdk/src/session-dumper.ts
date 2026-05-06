@@ -49,7 +49,10 @@ export class SessionDumper {
      * Dump a single session and all its descendants to Markdown.
      */
     async dump(sessionId: string): Promise<string> {
-        const tree = await this._buildTree(sessionId);
+        const sessions = await this.catalog.listSessions();
+        const sessionsById = new Map(sessions.map(session => [session.sessionId, session] as const));
+        const childrenByParent = this._groupChildrenByParent(sessions);
+        const tree = await this._buildTree(sessionId, sessionsById, childrenByParent);
         if (!tree) {
             return `# Session Dump\n\n> Session \`${sessionId}\` not found.\n`;
         }
@@ -78,6 +81,8 @@ export class SessionDumper {
      */
     async dumpAll(): Promise<string> {
         const sessions = await this.catalog.listSessions();
+        const sessionsById = new Map(sessions.map(session => [session.sessionId, session] as const));
+        const childrenByParent = this._groupChildrenByParent(sessions);
         // Find root sessions (no parent)
         const roots = sessions.filter(s => !s.parentSessionId);
 
@@ -89,7 +94,7 @@ export class SessionDumper {
         lines.push(``);
 
         for (const root of roots) {
-            const tree = await this._buildTree(root.sessionId);
+            const tree = await this._buildTree(root.sessionId, sessionsById, childrenByParent);
             if (!tree) continue;
 
             lines.push(`---`);
@@ -112,22 +117,21 @@ export class SessionDumper {
 
     // ─── Private: tree building ──────────────────────────────
 
-    private async _buildTree(sessionId: string): Promise<SessionNode | null> {
-        const row = await this.catalog.getSession(sessionId);
+    private async _buildTree(
+        sessionId: string,
+        sessionsById: Map<string, SessionRow>,
+        childrenByParent: Map<string, SessionRow[]>,
+    ): Promise<SessionNode | null> {
+        const row = sessionsById.get(sessionId) ?? null;
         if (!row) return null;
 
-        const events = await this.catalog.getSessionEvents(sessionId);
-
-        // Find direct children
-        const allDescendants = await this.catalog.getDescendantSessionIds(sessionId);
-        const allSessions = await this.catalog.listSessions();
-        const directChildren = allSessions.filter(
-            s => s.parentSessionId === sessionId && allDescendants.includes(s.sessionId)
-        );
+        // Keep dumper payload bounded; callers can add specialized paths for larger forensic dumps.
+        const events = await this.catalog.getSessionEvents(sessionId, undefined, 200);
+        const directChildren = childrenByParent.get(sessionId) ?? [];
 
         const children: SessionNode[] = [];
         for (const child of directChildren) {
-            const childNode = await this._buildTree(child.sessionId);
+            const childNode = await this._buildTree(child.sessionId, sessionsById, childrenByParent);
             if (childNode) children.push(childNode);
         }
 
@@ -135,6 +139,20 @@ export class SessionDumper {
         children.sort((a, b) => a.row.createdAt.getTime() - b.row.createdAt.getTime());
 
         return { row, events, children };
+    }
+
+    private _groupChildrenByParent(sessions: SessionRow[]): Map<string, SessionRow[]> {
+        const childrenByParent = new Map<string, SessionRow[]>();
+        for (const session of sessions) {
+            if (!session.parentSessionId) continue;
+            const existing = childrenByParent.get(session.parentSessionId);
+            if (existing) {
+                existing.push(session);
+                continue;
+            }
+            childrenByParent.set(session.parentSessionId, [session]);
+        }
+        return childrenByParent;
     }
 
     // ─── Private: ASCII tree rendering ───────────────────────

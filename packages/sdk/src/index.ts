@@ -27,15 +27,22 @@ export type {
     SessionStatusChange,
     SessionOrchestrationStats,
     ExecutionHistoryEvent,
+    SessionListPage,
     PilotSwarmManagementClientOptions,
+    EnrichedFleetAgentRow,
+    EnrichedFleetStats,
 } from "./management-client.js";
 export { SessionManager } from "./session-manager.js";
 export { ManagedSession } from "./managed-session.js";
 export { SessionBlobStore } from "./blob-store.js";
 export { FilesystemSessionStore, FilesystemArtifactStore } from "./session-store.js";
 export { PgFactStore, createFactStoreForUrl } from "./facts-store.js";
-export { PgSessionCatalogProvider, computeCacheHitRatio } from "./cms.js";
-export type { SessionCatalogProvider, SessionRow, SessionRowUpdates, SessionEvent, SessionMetricSummary, SessionMetricSummaryUpsert, FleetStats, UserStats, UserStatsBucket, UserStatsModelBucket, UserStatsOwnerKind, SessionTreeStats, SkillKind, SkillUsageRow, SessionTreeSkillUsage, FleetSkillUsageRow, FleetSkillUsage, UserProfile, UserPrincipal } from "./cms.js";
+export { PgSessionCatalogProvider, computeCacheHitRatio, buildPgGuardrailConfig } from "./cms.js";
+export type { SessionCatalogProvider, SessionRow, SessionPageCursor, SessionPage, SessionRowUpdates, SessionEvent, SessionMetricSummary, SessionMetricSummaryUpsert, FleetStats, SessionTreeStats, SkillKind, SkillUsageRow, SessionTreeSkillUsage, FleetSkillUsageRow, FleetSkillUsage, InsertTurnMetricInput, TurnMetricRow, FleetTurnAnalyticsRow, HourlyTokenBucketRow, DbCallMetricBucketInput, FleetDbCallMetricRow, TopEventEmitterRow } from "./cms.js";
+export { globalDbMetrics } from "./db-metrics.js";
+export type { DbMetricsSnapshot } from "./db-metrics.js";
+export { estimateCostUsd, MODEL_PRICING } from "./model-pricing.js";
+export type { ModelPricing } from "./model-pricing.js";
 export type {
     FactStore,
     FactRecord,
@@ -45,23 +52,13 @@ export type {
     FactsStatsRow,
     FactsNamespace,
 } from "./facts-store.js";
-export type {
-    SessionStateStore,
-    SessionMetadata,
-    ArtifactStore,
-    ArtifactMetadata,
-    ArtifactDownloadResult,
-    ArtifactUploadOptions,
-    ArtifactEncoding,
-    ArtifactSource,
-} from "./session-store.js";
+export type { SessionStateStore, SessionMetadata, ArtifactStore } from "./session-store.js";
 export type {
     PilotSwarmClientOptions,
     PilotSwarmWorkerOptions,
     ManagedSessionConfig,
     PilotSwarmSessionStatus,
     PilotSwarmSessionInfo,
-    SessionOwnerInfo,
     SessionContextUsage,
     SessionCompactionSnapshot,
     TurnAction,
@@ -75,15 +72,30 @@ export type {
     OrchestrationInput,
     SubAgentEntry,
     SessionPolicy,
+    PromptSource,
+    PromptGuardrailAction,
+    PromptGuardrailVerdict,
+    PromptGuardrailDecision,
+    PromptGuardrailConfig,
 } from "./types.js";
+
+export {
+    buildGuardedTurnPrompt,
+    buildPromptGuardrailRefusal,
+    containsUnsafeAuthorityClaim,
+    evaluatePromptGuardrails,
+    isHighRiskTurnResult,
+    normalizePromptGuardrailConfig,
+    shouldRunPromptGuardrailDetector,
+    wrapToolOutputForModel,
+    wrapUntrustedContentBlock,
+} from "./prompt-guardrails.js";
 
 // Skills loader
 export { loadSkills } from "./skills.js";
 export { loadAgentFiles, systemAgentUUID, systemChildAgentUUID } from "./agent-loader.js";
 export { loadMcpConfig } from "./mcp-loader.js";
 export type { Skill } from "./skills.js";
-// Local-mode user principal constant (Admin Console / per-user GitHub Copilot key)
-export { LOCAL_DEFAULT_USER_PRINCIPAL } from "./session-owner-utils.js";
 // Sweeper Agent tools
 export { createSweeperTools } from "./sweeper-tools.js";
 // Fact tools
@@ -94,7 +106,7 @@ export { createInspectTools } from "./inspect-tools.js";
 export { createResourceManagerTools } from "./resourcemgr-tools.js";
 // Model providers
 export { loadModelProviders, ModelProviderRegistry } from "./model-providers.js";
-export type { ModelEntry, ModelDescriptor, ModelProviderConfig, ModelProvidersFile, ResolvedProvider, ReasoningEffort } from "./model-providers.js";
+export type { ModelEntry, ModelDescriptor, ModelProviderConfig, ModelProvidersFile, ResolvedProvider } from "./model-providers.js";
 export { composeSystemPrompt, extractPromptContent, mergePromptSections } from "./prompt-layering.js";
 export type { PromptLayeringKind } from "./prompt-layering.js";
 
