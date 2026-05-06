@@ -129,7 +129,7 @@ describe("DurabilityObservation types", () => {
   });
 });
 
-describe("DurabilityFixtureDriver", () => {
+describe("DurabilityFixtureDriver (synthetic fixtures — NOT a durability proof)", () => {
   it("returns scripted result for known sampleId", async () => {
     const driver = new DurabilityFixtureDriver([
       {
@@ -456,7 +456,7 @@ describe("ChaosDriver", () => {
   });
 });
 
-describe("gradeDurability", () => {
+describe("gradeDurability (scoring synthetic observations — production proof lives in test/durability-live.test.ts)", () => {
   it("returns empty array when no durability expected", () => {
     expect(gradeDurability(undefined, undefined)).toEqual([]);
     expect(gradeDurability(makeObservation(), undefined)).toEqual([]);
