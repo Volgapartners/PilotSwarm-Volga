@@ -4,6 +4,7 @@ export default defineConfig({
     // Keep this scaffold minimal and stable in this monorepo environment.
     // React plugin is intentionally omitted to avoid dev-time refresh wrapper
     // issues seen here; TSX still compiles via Vite/esbuild.
+    base: "/monitoring/",
     plugins: [],
     server: {
         port: 5174,
