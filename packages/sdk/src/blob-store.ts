@@ -52,6 +52,8 @@ import {
     isBinaryArtifactContentType,
     normalizeArtifactContentType,
     resolveArtifactUpload,
+    resolveContainedSessionDir,
+    validateSessionId,
     waitForSessionSnapshot,
 } from "./session-store.js";
 
@@ -182,7 +184,11 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
      * Frees the worker slot for another session.
      */
     async dehydrate(sessionId: string, meta?: Record<string, unknown>): Promise<void> {
-        const sessionDir = path.join(this.sessionStateDir, sessionId);
+        // Validate BEFORE any log call, path construction, temp file
+        // name, blob client lookup, or fs mutation. A malformed id
+        // (`../victim`, absolute, cross-separator, empty, `.`, `..`)
+        // must have ZERO local or Azure side effects.
+        const sessionDir = resolveContainedSessionDir(this.sessionStateDir, sessionId);
         logBlobStore("info", sessionId, "dehydrate start", {
             container: this.containerName,
             dir: sessionDir,
@@ -249,7 +255,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
      * No-op if local session files already exist.
      */
     async hydrate(sessionId: string): Promise<void> {
-        const sessionDir = path.join(this.sessionStateDir, sessionId);
+        const sessionDir = resolveContainedSessionDir(this.sessionStateDir, sessionId);
         logBlobStore("info", sessionId, "hydrate start", {
             container: this.containerName,
             dir: sessionDir,
@@ -291,7 +297,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
      * Used for crash resilience — the session stays warm in memory.
      */
     async checkpoint(sessionId: string): Promise<void> {
-        const sessionDir = path.join(this.sessionStateDir, sessionId);
+        const sessionDir = resolveContainedSessionDir(this.sessionStateDir, sessionId);
         if (!fs.existsSync(sessionDir)) {
             logBlobStore("info", sessionId, "checkpoint skipped", {
                 container: this.containerName,
@@ -335,6 +341,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
     }
 
     async getSnapshotSizeBytes(sessionId: string): Promise<number | undefined> {
+        validateSessionId(sessionId);
         const cached = this.snapshotSizeBySession.get(sessionId);
         if (Number.isFinite(cached)) return cached;
 
@@ -367,6 +374,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
 
     /** Check if a dehydrated session exists in blob storage. */
     async exists(sessionId: string): Promise<boolean> {
+        validateSessionId(sessionId);
         const tarBlob = this.containerClient.getBlockBlobClient(`${sessionId}.tar.gz`);
         try {
             const exists = await tarBlob.exists();
@@ -388,6 +396,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
 
     /** Delete a dehydrated session from blob storage. */
     async delete(sessionId: string): Promise<void> {
+        validateSessionId(sessionId);
         logBlobStore("info", sessionId, "delete start", {
             container: this.containerName,
         });
@@ -425,6 +434,9 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
         contentType?: string,
         opts: ArtifactUploadOptions = {},
     ): Promise<ArtifactMetadata> {
+        // Validate the session id first. Artifact filename sanitation
+        // is a separate concern handled by `artifactBlobPath`.
+        validateSessionId(sessionId);
         const safeFilename = path.basename(String(filename || "").trim());
         const { body, metadata } = await resolveArtifactUpload(content, contentType, opts);
         const blobPath = this.artifactBlobPath(sessionId, filename);
@@ -449,6 +461,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
      * Returns the file content as a string.
      */
     async downloadArtifact(sessionId: string, filename: string): Promise<ArtifactDownloadResult> {
+        validateSessionId(sessionId);
         const blobPath = this.artifactBlobPath(sessionId, filename);
         const blob = this.containerClient.getBlockBlobClient(blobPath);
         const response = await blob.download(0);
@@ -470,6 +483,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
     }
 
     async downloadArtifactText(sessionId: string, filename: string): Promise<string> {
+        validateSessionId(sessionId);
         const result = await this.downloadArtifact(sessionId, filename);
         if (result.isBinary) {
             const error = new Error(`Artifact '${filename}' is binary and cannot be read as text.`) as Error & Record<string, unknown>;
@@ -486,6 +500,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
      * Returns filenames (not full blob paths).
      */
     async listArtifacts(sessionId: string): Promise<ArtifactMetadata[]> {
+        validateSessionId(sessionId);
         const prefix = `artifacts/${sessionId}/`;
         const files: ArtifactMetadata[] = [];
         for await (const blob of this.containerClient.listBlobsFlat({ prefix })) {
@@ -506,6 +521,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
     }
 
     async deleteArtifact(sessionId: string, filename: string): Promise<boolean> {
+        validateSessionId(sessionId);
         const blobPath = this.artifactBlobPath(sessionId, filename);
         const result = await this.containerClient.getBlockBlobClient(blobPath).deleteIfExists();
         return result.succeeded === true;
@@ -515,6 +531,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
      * Check if an artifact exists.
      */
     async artifactExists(sessionId: string, filename: string): Promise<boolean> {
+        validateSessionId(sessionId);
         const blobPath = this.artifactBlobPath(sessionId, filename);
         return this.containerClient.getBlockBlobClient(blobPath).exists();
     }
@@ -533,6 +550,12 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
         filename: string,
         expiryMinutes = 1,
     ): string {
+        // Validate the session id BEFORE the managed-identity check so
+        // malformed ids never reach `artifactBlobPath`, blob client
+        // lookup, or SAS parameter generation. `validateSessionId`
+        // shares its message with every other rejection path so
+        // operators can grep a single string.
+        validateSessionId(sessionId);
         if (!this.credential) {
             // Managed-identity mode: there is no shared key on this
             // instance, so we cannot mint a shared-key SAS. We
@@ -575,6 +598,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
      * Delete all artifacts for a session.
      */
     async deleteArtifacts(sessionId: string): Promise<number> {
+        validateSessionId(sessionId);
         const prefix = `artifacts/${sessionId}/`;
         let count = 0;
         for await (const blob of this.containerClient.listBlobsFlat({ prefix })) {

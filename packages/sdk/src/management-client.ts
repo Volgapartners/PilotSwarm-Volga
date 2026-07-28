@@ -1802,7 +1802,14 @@ export class PilotSwarmManagementClient {
             providerType: descriptor.providerType,
             credentialAvailable: resolved.type === "github"
                 ? Boolean(resolved.githubToken)
-                : Boolean(resolved.sdkProvider?.apiKey),
+                : resolved.type === "codex"
+                    // Subscription-mode Codex: credential availability is delegated to the
+                    // runtime probe (auth.json inside CODEX_HOME). The registry only asks
+                    // "is this model wired up?" — which for Codex is always true if the
+                    // provider is present. The runtime rejects unauthenticated sessions
+                    // when they are actually created.
+                    ? true
+                    : Boolean(resolved.sdkProvider?.apiKey),
         };
     }
 
