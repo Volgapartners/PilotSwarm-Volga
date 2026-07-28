@@ -134,6 +134,13 @@ export interface SerializableSessionConfig {
      */
     toolNames?: string[];
     /**
+     * Optional reasoning-effort hint for models that support tunable
+     * reasoning depth (e.g. Codex `codex-*` models: "low" | "medium" |
+     * "high" | "xhigh" | "max" | "ultra"). Serializable — travels through
+     * duroxide and is forwarded to the Codex runtime.
+     */
+    reasoningEffort?: string;
+    /**
      * Internal: identity of the bound agent for namespace access control.
      * Set from the agent definition's `id` field. Used by fact tool handlers
      * to enforce knowledge pipeline namespace restrictions.

@@ -1,5 +1,6 @@
 import { defineTool, type Tool, type CopilotSession } from "@github/copilot-sdk";
 import type { TurnAction, TurnResult, TurnOptions, ManagedSessionConfig, CapturedEvent } from "./types.js";
+import type { RuntimeSessionHandle, RuntimeKind } from "./runtime.js";
 
 /**
  * Mutable state shared between the wait tool handler and runTurn().
@@ -8,7 +9,7 @@ import type { TurnAction, TurnResult, TurnOptions, ManagedSessionConfig, Capture
 interface TurnState {
     pendingActions: TurnAction[];
     queuedActions: TurnAction[];
-    session: CopilotSession | null;
+    session: RuntimeSessionHandle | null;
     waitThreshold: number;
 }
 
@@ -49,17 +50,21 @@ function isBenignPostCompletionQueryError(eventData: any): boolean {
  */
 export class ManagedSession {
     readonly sessionId: string;
-    private copilotSession: CopilotSession;
+    /** Which backend runtime hosts this session (copilot | codex). */
+    readonly runtimeKind: RuntimeKind;
+    private copilotSession: RuntimeSessionHandle;
     private config: ManagedSessionConfig;
 
     constructor(
         sessionId: string,
-        copilotSession: CopilotSession,
+        copilotSession: RuntimeSessionHandle | CopilotSession,
         config: ManagedSessionConfig,
+        options?: { runtimeKind?: RuntimeKind },
     ) {
         this.sessionId = sessionId;
-        this.copilotSession = copilotSession;
+        this.copilotSession = copilotSession as RuntimeSessionHandle;
         this.config = config;
+        this.runtimeKind = options?.runtimeKind ?? "copilot";
     }
 
     /**
@@ -1095,7 +1100,7 @@ export class ManagedSession {
                 try { this.copilotSession.abort(); } catch {}
                 return {
                     type: "error",
-                    message: "Copilot was taking too long to process and was killed.",
+                    message: `${this.runtimeKind === "codex" ? "Codex" : "Copilot"} runtime was taking too long to process and was aborted.`,
                 };
             }
             // Other send() errors — check if any handler aborted first
@@ -1166,6 +1171,22 @@ export class ManagedSession {
     }
 
     /**
+     * Filesystem-only snapshot hook invoked by SessionManager before it
+     * archives the session directory (either during warm `checkpoint()`
+     * or the pre-destroy safety checkpoint in `dehydrate()`). Runtimes
+     * that keep durable state outside the session directory (currently
+     * Codex) implement `snapshot()` on their session handle; Copilot's
+     * session state already lives inside the directory so this is a
+     * no-op there.
+     */
+    snapshotForCheckpoint(): void {
+        const handle = this.copilotSession as RuntimeSessionHandle;
+        if (typeof handle?.snapshot === "function") {
+            try { handle.snapshot(); } catch {}
+        }
+    }
+
+    /**
      * Abort the current in-flight message.
      * Session remains alive for future runTurn() calls.
      */
@@ -1198,8 +1219,13 @@ export class ManagedSession {
         if (config.waitThreshold !== undefined) this.config.waitThreshold = config.waitThreshold;
     }
 
-    /** Get the underlying CopilotSession (for direct access when needed). */
+    /** Get the underlying runtime session handle (for direct access when needed). */
     getCopilotSession(): CopilotSession {
+        return this.copilotSession as unknown as CopilotSession;
+    }
+
+    /** Get the underlying runtime session handle, typed to the runtime contract. */
+    getRuntimeSession(): RuntimeSessionHandle {
         return this.copilotSession;
     }
 }

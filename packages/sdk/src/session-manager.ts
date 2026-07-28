@@ -1,14 +1,16 @@
 import { CopilotClient, type CopilotSession, type SectionOverride, type SystemMessageConfig, type Tool } from "@github/copilot-sdk";
 import { ManagedSession } from "./managed-session.js";
 import type { SessionStateStore } from "./session-store.js";
+import { validateSessionId, resolveContainedSessionDir } from "./session-store.js";
 import { SESSION_STATE_MISSING_PREFIX, type ManagedSessionConfig, type SerializableSessionConfig } from "./types.js";
 import type { ModelProviderRegistry } from "./model-providers.js";
+import { CodexRuntimeClient, type CodexTransport } from "./codex-runtime.js";
 import { createFactTools } from "./facts-tools.js";
 import { createInspectTools } from "./inspect-tools.js";
 import type { SessionCatalogProvider } from "./cms.js";
 import type { FactStore } from "./facts-store.js";
 import { buildKnowledgePromptBlocks, loadKnowledgeIndexFromFactStore } from "./knowledge-index.js";
-import { composeStructuredSystemMessage, extractPromptContent, mergePromptSections } from "./prompt-layering.js";
+import { composeStructuredSystemMessage, composeSystemPrompt, extractPromptContent, mergePromptSections } from "./prompt-layering.js";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -48,6 +50,19 @@ function emitSessionManagerTrace(
 function isMissingDehydrateSnapshotError(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error ?? "");
     return /Session state directory not ready during dehydrate/i.test(message);
+}
+
+// Stubs for the legacy prompt-layers subsystem that shipped in a fork
+// but was removed on main. The Codex runtime path calls into these
+// helpers only to emit an optional `session.prompt_layers` telemetry
+// event; returning an empty layer set here is a safe no-op that keeps
+// the Codex branch buildable without dragging the whole subsystem in.
+type PromptLayerDescriptor = unknown;
+function buildEffectivePromptLayers(_defaults: WorkerDefaults, _config: ManagedSessionConfig): PromptLayerDescriptor[] {
+    return [];
+}
+function buildPromptLayersEventPayload(layers: PromptLayerDescriptor[]): Record<string, unknown> {
+    return { layers };
 }
 
 /** Worker-level defaults — applied to every session. */
@@ -98,6 +113,20 @@ export interface WorkerDefaults {
 export class SessionManager {
     private client: CopilotClient | null = null;
     private sessions = new Map<string, ManagedSession>();
+    /** Codex runtime clients, keyed by CODEX_HOME. */
+    private codexClients = new Map<string, CodexRuntimeClient>();
+    /** Test-only transport factory for the Codex runtime. Never used in prod. */
+    private _codexTransportFactoryForTests: (() => any) | undefined = undefined;
+    /**
+     * Records which CopilotClient each warm session is bound to (keyed by
+     * the GitHub Copilot token). When the resolved token for a session
+     * changes (for example the owner edited their per-user key in the
+     * Admin Console), the warm session is destroyed at the start of the
+     * next `getOrCreate` call so the next resume binds to the right
+     * client. Sessions never appear in this map until they are actually
+     * created/resumed in `_getOrCreateUnlocked`.
+     */
+    private sessionClientKeys = new Map<string, string>();
     private sessionStore: SessionStateStore | null = null;
     /** In-memory configs with non-serializable fields (tools, hooks). */
     private sessionConfigs = new Map<string, ManagedSessionConfig>();
@@ -230,6 +259,36 @@ export class SessionManager {
     }
 
     /**
+     * Test-only: inject a fake Codex transport factory so `getOrCreate`
+     * with a codex-typed model can be exercised without spawning the
+     * real `codex app-server` process. Not part of the public API.
+     * @internal
+     */
+    _setCodexTransportFactoryForTests(factory: () => CodexTransport): void {
+        this._codexTransportFactoryForTests = factory;
+        // Wipe any cached client so the next getOrCreate picks up the
+        // injected transport.
+        for (const [, client] of this.codexClients) {
+            void client.stop();
+        }
+        this.codexClients.clear();
+    }
+
+    /** Get-or-create a CodexRuntimeClient for the given CODEX_HOME. */
+    private _ensureCodexClient(codexHome: string, codexBinaryPath?: string): CodexRuntimeClient {
+        const cached = this.codexClients.get(codexHome);
+        if (cached) return cached;
+        const client = new CodexRuntimeClient({
+            codexHome,
+            codexBinaryPath,
+            sessionStateDir: this.sessionStateDir,
+            transportFactory: this._codexTransportFactoryForTests,
+        });
+        this.codexClients.set(codexHome, client);
+        return client;
+    }
+
+    /**
      * Resolve the default model's SDK provider config.
      * Used by activities (e.g. summarizeSession) that need a lightweight LLM
      * without requiring a GitHub token.
@@ -275,6 +334,13 @@ export class SessionManager {
     }
 
     private async _resetSessionState(sessionId: string): Promise<void> {
+        // Validate the session id at the FIRST statement so a malformed
+        // `../victim` id can never reach the map, the CopilotClient,
+        // the sessionStore, or the recursive `fs.rmSync` below. Using
+        // `resolveContainedSessionDir` both validates AND returns the
+        // safe absolute session directory used by the rm at the end,
+        // so we compute the containment guarantee exactly once.
+        const sessionDir = resolveContainedSessionDir(this.sessionStateDir, sessionId);
         const existing = this.sessions.get(sessionId);
         if (existing) {
             try {
@@ -288,7 +354,11 @@ export class SessionManager {
             await client.deleteSession(sessionId);
         } catch {}
 
-        const sessionDir = path.join(this.sessionStateDir, sessionId);
+        // After we drop the session state we no longer remember which
+        // CopilotClient (= which token) it was bound to; the next
+        // getOrCreate will re-resolve.
+        this.sessionClientKeys.delete(sessionId);
+
         if (fs.existsSync(sessionDir)) {
             fs.rmSync(sessionDir, { recursive: true, force: true });
         }
@@ -309,6 +379,15 @@ export class SessionManager {
         serializableConfig: SerializableSessionConfig,
         options?: { turnIndex?: number; trace?: SessionTraceWriter },
     ): Promise<ManagedSession> {
+        // Validate the session id at the outermost public entry point
+        // — before the session-lock table interaction and before any
+        // Copilot/Codex branch runs. The Codex branch has its own
+        // first-line validator too (see rounds R3/R4) so both remain
+        // independently safe; this guard is what prevents a malformed
+        // id from reaching the Copilot turn0 stale-reset path
+        // (`_resetSessionState` → `fs.rmSync(sessionDir, { recursive })`)
+        // even when `sessionStore.exists()` throws for the same id.
+        validateSessionId(sessionId);
         const turnIndex = options?.turnIndex;
         const trace = options?.trace;
         const inheritedToolNames = Array.from(new Set([
@@ -386,20 +465,179 @@ export class SessionManager {
         ];
         config.tools = persistentSessionTools;
 
-        // Build system message: worker base + client override
+        // Build system message once so both Copilot and Codex branches see
+        // the same effective prompt. Copilot takes the structured
+        // SystemMessageConfig; Codex takes the flat-text equivalent via
+        // `developerInstructions`. Content must be identical.
         const systemMessage = this._buildSystemMessage(sessionId, config);
+        const developerInstructionsText = this._buildFlatSystemPrompt(sessionId, config);
 
-        // Resolve model: config.model may be qualified (provider:model) or bare.
-        // The SDK needs the bare model name; the provider config is separate.
-        // Fall back to registry default if no model specified.
+        // Resolve model & provider up-front. Both the Codex and Copilot
+        // branches need this — Codex branches on `resolvedProvider.type`,
+        // Copilot needs `sdkModelName` and `resolvedProviderConfig`.
         const registry = this.workerDefaults.modelProviders;
         const effectiveModel = this.normalizeModelRef(config.model) || "";
-        const resolvedProviderConfig = this._resolveProviderConfig(effectiveModel);
+        const resolvedProvider = registry?.resolve(effectiveModel);
         let sdkModelName = effectiveModel;
         if (registry && effectiveModel) {
             const desc = registry.getDescriptor(effectiveModel);
             if (desc) sdkModelName = desc.modelName;
         }
+
+        // ── Codex runtime routing ─────────────────────────
+        // Codex subscription sessions do NOT use the Copilot SDK client
+        // at all — they talk to a locally running `codex app-server`
+        // through the CodexRuntimeClient. We branch here (after the
+        // shared tool assembly and system-prompt build) so ManagedSession
+        // still receives the same tool set and prompt layers, and we
+        // skip every Copilot-specific piece of session config below.
+        if (resolvedProvider?.type === "codex") {
+            // Validate the session id BEFORE any FS probe, sessionStore
+            // call, or Codex runtime call. Without this, a malformed
+            // `../victim` id could reach `sessionStore.exists()` /
+            // `.delete()` / `.hydrate()` and escape the store /
+            // sessionStateDir roots before the Codex runtime's own
+            // validation ever ran.
+            validateSessionId(sessionId);
+            const runtime = resolvedProvider.codexRuntime;
+            if (!runtime?.codexHome) {
+                throw new Error(
+                    `Codex provider "${resolvedProvider.providerId}" is missing a resolved CODEX_HOME. ` +
+                    `Set codexHome in the provider config.`,
+                );
+            }
+            const codexClient = this._ensureCodexClient(runtime.codexHome, runtime.codexBinaryPath);
+
+            const warmCodex = this.sessions.get(sessionId);
+            if (warmCodex) {
+                if (turnIndex === 0) {
+                    try { await warmCodex.destroy(); } catch {}
+                    this.sessions.delete(sessionId);
+                    try { await codexClient.deleteSession(sessionId); } catch {}
+                } else {
+                    warmCodex.updateConfig(config);
+                    return warmCodex;
+                }
+            }
+
+            const codexStateFile = path.join(this.sessionStateDir, sessionId, "codex-thread.json");
+            const codexLocalExists = fs.existsSync(codexStateFile);
+            let codexStoredExists = false;
+            if (this.sessionStore) {
+                try {
+                    codexStoredExists = await this.sessionStore.exists(sessionId);
+                } catch (error: unknown) {
+                    emitSessionManagerTrace(
+                        sessionId,
+                        `codex session-store exists probe failed turnIndex=${turnIndex ?? "unknown"} error=${normalizeError(error).message}`,
+                        { trace, level: "warn" },
+                    );
+                    codexStoredExists = false;
+                }
+            }
+            emitSessionManagerTrace(
+                sessionId,
+                `codex resume probe turnIndex=${turnIndex ?? "unknown"} localExists=${codexLocalExists} storedExists=${codexStoredExists}`,
+                { trace },
+            );
+
+            const codexCreateConfig = {
+                sessionId,
+                model: sdkModelName || undefined,
+                cwd: config.workingDirectory || undefined,
+                developerInstructions: developerInstructionsText || undefined,
+                reasoningEffort: config.reasoningEffort || undefined,
+                tools: allTools,
+            };
+
+            /** Verifies hydration actually restored a usable codex-thread.json marker. */
+            const ensureCodexMarker = () => {
+                if (fs.existsSync(codexStateFile)) return;
+                throw this._missingSessionStateError(
+                    sessionId, turnIndex ?? 0,
+                    ` Hydration completed but ${codexStateFile} is still missing.`,
+                );
+            };
+
+            let codexSessionHandle;
+            if (turnIndex === 0) {
+                if (codexLocalExists || codexStoredExists) {
+                    // Fresh turn 0 — discard stale local + stored state so
+                    // we begin a genuinely fresh Codex thread.
+                    try { await codexClient.deleteSession(sessionId); } catch {}
+                    if (this.sessionStore && codexStoredExists) {
+                        try { await this.sessionStore.delete(sessionId); } catch {}
+                    }
+                }
+                codexSessionHandle = await codexClient.createSession(codexCreateConfig);
+            } else if (turnIndex != null && turnIndex > 0) {
+                if (codexLocalExists) {
+                    emitSessionManagerTrace(sessionId, "codex turn>0 resuming from local session directory", { trace });
+                    codexSessionHandle = await codexClient.resumeSession(sessionId, codexCreateConfig);
+                } else if (this.sessionStore && codexStoredExists) {
+                    emitSessionManagerTrace(sessionId, "codex turn>0 hydrating from session store before resume", { trace });
+                    try {
+                        await this.sessionStore.hydrate(sessionId);
+                    } catch (error: unknown) {
+                        emitSessionManagerTrace(
+                            sessionId,
+                            `codex turn>0 hydrate before resume failed error=${normalizeError(error).message}`,
+                            { trace, level: "warn" },
+                        );
+                        throw error;
+                    }
+                    ensureCodexMarker();
+                    emitSessionManagerTrace(sessionId, "codex turn>0 hydrate restored session directory; resuming session", { trace });
+                    codexSessionHandle = await codexClient.resumeSession(sessionId, codexCreateConfig);
+                } else {
+                    emitSessionManagerTrace(
+                        sessionId,
+                        `codex turn>0 missing resumable state localExists=${codexLocalExists} storedExists=${codexStoredExists}`,
+                        { trace, level: "warn" },
+                    );
+                    throw this._missingSessionStateError(
+                        sessionId, turnIndex,
+                        ` No persisted Codex thread mapping was found at ${codexStateFile}.`,
+                    );
+                }
+            } else {
+                // Backward-compatible permissive path.
+                if (codexLocalExists) {
+                    codexSessionHandle = await codexClient.resumeSession(sessionId, codexCreateConfig);
+                } else if (this.sessionStore && codexStoredExists) {
+                    try {
+                        await this.sessionStore.hydrate(sessionId);
+                        if (fs.existsSync(codexStateFile)) {
+                            codexSessionHandle = await codexClient.resumeSession(sessionId, codexCreateConfig);
+                        } else {
+                            codexSessionHandle = await codexClient.createSession(codexCreateConfig);
+                        }
+                    } catch {
+                        codexSessionHandle = await codexClient.createSession(codexCreateConfig);
+                    }
+                } else {
+                    codexSessionHandle = await codexClient.createSession(codexCreateConfig);
+                }
+            }
+
+            if (allTools.length) codexSessionHandle.registerTools(allTools as any);
+
+            const managedCodex = new ManagedSession(sessionId, codexSessionHandle as any, config, { runtimeKind: "codex" });
+            this.sessions.set(sessionId, managedCodex);
+            const codexPromptLayers = buildEffectivePromptLayers(this.workerDefaults, config);
+            if (codexPromptLayers.length > 0 && this.sessionCatalog) {
+                void this.sessionCatalog.recordEvents(sessionId, [{
+                    eventType: "session.prompt_layers",
+                    data: buildPromptLayersEventPayload(codexPromptLayers),
+                }]).catch(() => {});
+            }
+            return managedCodex;
+        }
+
+        // Resolve model: config.model may be qualified (provider:model) or bare.
+        // The SDK needs the bare model name; the provider config is separate.
+        // (Model + provider already resolved above; only need provider-config here.)
+        const resolvedProviderConfig = this._resolveProviderConfig(effectiveModel);
 
         const sessionConfig: any = {
             sessionId,
@@ -552,6 +790,11 @@ export class SessionManager {
      * recover before we bubble a terminal error back to the orchestration.
      */
     async dehydrate(sessionId: string, reason: string, options?: { trace?: SessionTraceWriter }): Promise<void> {
+        // Validate BEFORE the destroy/rm/store pipeline. `sessionDir`
+        // is computed from the same id and later used in
+        // `fs.rmSync(sessionDir, { recursive })` — a traversal here
+        // would follow through to the outer filesystem.
+        validateSessionId(sessionId);
         const DESTROY_MAX_RETRIES = 3;
         const trace = options?.trace;
         let lastDestroyError: Error | undefined;
@@ -561,6 +804,13 @@ export class SessionManager {
         emitSessionManagerTrace(sessionId, `dehydrate start reason=${reason}`, { trace });
 
         if (this.sessionStore && fs.existsSync(sessionDir)) {
+            // Give runtime backends (Codex) a chance to copy their
+            // durable state into the session directory before we
+            // snapshot it. No-op for Copilot.
+            const warmForCheckpoint = this.sessions.get(sessionId);
+            if (warmForCheckpoint) {
+                try { warmForCheckpoint.snapshotForCheckpoint(); } catch {}
+            }
             try {
                 emitSessionManagerTrace(sessionId, "pre-dehydrate checkpoint start", { trace });
                 await this.sessionStore.checkpoint(sessionId);
@@ -797,14 +1047,30 @@ export class SessionManager {
      * runtime must recreate a fresh Copilot session for lossy replay.
      */
     async resetSessionState(sessionId: string): Promise<void> {
+        // Validate BEFORE _resetSessionState touches session state.
+        validateSessionId(sessionId);
         await this._resetSessionState(sessionId);
     }
 
     /**
      * Checkpoint session state without destroying the session or
      * releasing affinity. Used for crash resilience — session stays warm.
+     *
+     * For runtimes that keep durable state outside the PilotSwarm
+     * session directory (currently Codex), we first invoke the runtime
+     * session's `snapshot()` hook so that state lands inside the
+     * session directory before the store archives it.
      */
     async checkpoint(sessionId: string): Promise<void> {
+        const warm = this.sessions.get(sessionId);
+        if (warm) {
+            try {
+                warm.snapshotForCheckpoint();
+            } catch {
+                // Snapshot is best-effort — never block the checkpoint
+                // itself on a filesystem hiccup.
+            }
+        }
         if (this.sessionStore) {
             await this.sessionStore.checkpoint(sessionId);
         }
@@ -815,7 +1081,7 @@ export class SessionManager {
         return [...this.sessions.keys()];
     }
 
-    /** Shutdown: destroy all sessions, stop CopilotClient. */
+    /** Shutdown: destroy all sessions, stop every runtime client. */
     async shutdown(): Promise<void> {
         for (const [_, session] of this.sessions) {
             try { await session.destroy(); } catch {}
@@ -825,6 +1091,22 @@ export class SessionManager {
             await this.client.stop();
             this.client = null;
         }
+        // Codex runtime clients keep long-lived `codex app-server`
+        // subprocesses (one per CODEX_HOME). Leaking them would keep
+        // the worker process alive after `shutdown()` returned.
+        for (const [, client] of this.codexClients) {
+            try { await client.stop(); } catch {}
+        }
+        this.codexClients.clear();
+    }
+
+    /**
+     * Test-only accessor for the number of cached Codex runtime clients.
+     * Not part of the public API.
+     * @internal
+     */
+    getCachedCodexClientCountForTests(): number {
+        return this.codexClients.size;
     }
 
     /**
@@ -955,6 +1237,36 @@ export class SessionManager {
                 ? undefined
                 : this.workerDefaults.appDefaultPrompt,
             additionalSections,
+        });
+    }
+
+    /**
+     * Flat-text equivalent of the structured system message, used by
+     * runtimes (currently Codex) whose protocol takes a plain
+     * `developerInstructions` string instead of the Copilot SDK's
+     * structured SystemMessageConfig. Composed via the same helper so
+     * layer ordering and headers stay in sync.
+     */
+    private _buildFlatSystemPrompt(
+        sessionId: string,
+        config: SerializableSessionConfig,
+    ): string | undefined {
+        const frameworkBase = this.workerDefaults.frameworkBasePrompt ?? this.workerDefaults.systemMessage;
+        const boundAgentName = config.boundAgentName;
+        const layerKind = config.promptLayering?.kind ?? (boundAgentName ? "app-agent" : undefined);
+        const isPilotSwarmSystemAgent = layerKind === "pilotswarm-system-agent";
+        const activeAgentPrompt = boundAgentName
+            ? this.workerDefaults.agentPromptLookup?.[boundAgentName]?.prompt
+            : undefined;
+        const runtimeContext = mergePromptSections([
+            extractPromptContent(config.systemMessage),
+            config.turnSystemPrompt,
+        ]);
+        return composeSystemPrompt({
+            frameworkBase,
+            appDefault: isPilotSwarmSystemAgent ? undefined : this.workerDefaults.appDefaultPrompt,
+            activeAgentPrompt,
+            runtimeContext,
         });
     }
 }

@@ -101,6 +101,25 @@
                     "cost": "medium"
                 }
             ]
+        },
+        {
+            "_comment": "Codex subscription-mode runtime. Talks to a local `codex app-server` process over stdio; no apiKey. Auth lives in CODEX_HOME/auth.json (managed by `codex login`); PilotSwarm never reads it. Trusted single-operator use only. Model names must match a real Codex model — query `codex mcp` / `model/list` on the target machine (defaults verified with codex-cli 0.145.0 subscription).",
+            "id": "codex-subscription",
+            "type": "codex",
+            "codexHome": "env:CODEX_HOME",
+            "codexBinaryPath": "env:CODEX_BINARY_PATH",
+            "models": [
+                {
+                    "name": "gpt-5.6-sol",
+                    "description": "Codex subscription default (gpt-5.6-sol). Backed by ChatGPT/Codex login.",
+                    "cost": "medium"
+                },
+                {
+                    "name": "gpt-5.5",
+                    "description": "Codex gpt-5.5 (available via subscription).",
+                    "cost": "medium"
+                }
+            ]
         }
     ],
     "_defaultModel_opus46": "anthropic:claude-opus-4-6",

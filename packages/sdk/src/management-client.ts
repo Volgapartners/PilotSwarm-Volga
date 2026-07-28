@@ -175,6 +175,14 @@ export interface ModelSummary {
     cost?: string;
 }
 
+/** Credential availability for a configured model provider. */
+export interface ModelCredentialStatus {
+    qualifiedName?: string;
+    providerId?: string;
+    providerType?: string;
+    credentialAvailable: boolean;
+}
+
 /** Status change result from watchSessionStatus. */
 export interface SessionStatusChange {
     customStatus: SessionStatusSignal | any;
@@ -1240,6 +1248,41 @@ export class PilotSwarmManagementClient {
      */
     normalizeModel(ref?: string): string | undefined {
         return this._modelProviders?.normalize(ref);
+    }
+
+    /**
+     * Return whether the model's provider has a process/env credential
+     * available. For GitHub providers this intentionally does not include
+     * per-user CMS keys; callers that create user-owned sessions should OR
+     * this with the relevant profile's githubCopilotKeySet flag.
+     */
+    getModelCredentialStatus(ref?: string): ModelCredentialStatus {
+        const normalized = this._modelProviders?.normalize(ref);
+        if (!this._modelProviders || !normalized) {
+            return { qualifiedName: normalized, credentialAvailable: false };
+        }
+
+        const descriptor = this._modelProviders.getDescriptor(normalized);
+        const resolved = this._modelProviders.resolve(normalized);
+        if (!descriptor || !resolved) {
+            return { qualifiedName: normalized, credentialAvailable: false };
+        }
+
+        return {
+            qualifiedName: descriptor.qualifiedName,
+            providerId: descriptor.providerId,
+            providerType: descriptor.providerType,
+            credentialAvailable: resolved.type === "github"
+                ? Boolean(resolved.githubToken)
+                : resolved.type === "codex"
+                    // Subscription-mode Codex: credential availability is delegated to the
+                    // runtime probe (auth.json inside CODEX_HOME). The registry only asks
+                    // "is this model wired up?" — which for Codex is always true if the
+                    // provider is present. The runtime rejects unauthenticated sessions
+                    // when they are actually created.
+                    ? true
+                    : Boolean(resolved.sdkProvider?.apiKey),
+        };
     }
 
     // ─── Session Dump ────────────────────────────────────────
