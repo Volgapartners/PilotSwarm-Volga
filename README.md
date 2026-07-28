@@ -4,7 +4,7 @@
 
 > **Latest release: v0.1.35** — Hotfix: `pilotswarm-sdk` now declares `@opentelemetry/api` as a direct dependency (it was hard-imported by `session-proxy.ts` in v0.1.33+ but not listed in `package.json`, so standalone installs crashed at import time). No behavior change. v0.1.34 release notes remain accurate for portal authz behavior.
 
-A durable execution runtime for [GitHub Copilot SDK](https://github.com/github/copilot-sdk) agents. Crash recovery, durable timers, session dehydration, and multi-node scaling — powered by [duroxide](https://github.com/microsoft/duroxide). Just add a connection string.
+A durable execution runtime for [GitHub Copilot SDK](https://github.com/github/copilot-sdk) and Codex-backed agents. Crash recovery, durable timers, session dehydration, and multi-node scaling — powered by [duroxide](https://github.com/microsoft/duroxide). Just add a connection string.
 
 For the fastest first run, start with the [Docker Quickstart Guide](docs/getting-started-docker-appliance.md).
 
@@ -169,6 +169,7 @@ Common entry points:
 - [Example Applications](docs/examples.md) — includes the DevOps Command Center sample for layered apps
 - [Getting Started](docs/getting-started.md) — install, PostgreSQL, `.env`, and first run
 - [Configuration](docs/configuration.md) — environment variables, blob storage, worker/client options
+- [Codex Runtime](docs/codex-runtime.md) — subscription authentication, model selection, tools, durability, and VM operation
 - [Deploying to AKS](docs/deploying-to-aks.md) — Kubernetes deployment, scaling, and rolling updates
 - [Architecture](docs/architecture.md) — internal design and runtime flow
 
@@ -176,7 +177,7 @@ Common entry points:
 
 - Node.js >= 24
 - PostgreSQL
-- GitHub Copilot access token (worker-side only)
+- LLM access through GitHub Copilot, Codex subscription authentication, or a configured BYOK provider
 - Azure Blob Storage (optional, for session dehydration across nodes)
 
 ## License

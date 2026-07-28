@@ -125,6 +125,19 @@ Your worker can also contribute defaults to every session through:
 - `mcpServers`
 - `systemMessage`
 
+Model IDs are provider-qualified. The prefix selects the runtime as well as
+the provider:
+
+```text
+github-copilot:<model>
+codex-subscription:gpt-5.6-sol
+azure-openai:<deployment>
+```
+
+The client API and tool registration pattern stay unchanged when a session
+uses Codex. The worker running that session must have an installed,
+authenticated Codex CLI. See [Codex Runtime](../codex-runtime.md).
+
 `default.agent.md` in your app plugin is layered underneath the embedded PilotSwarm framework base prompt. It extends the app-wide instructions for your sessions; it does not replace PilotSwarm's framework rules.
 
 If the same plugin also powers the shipped UI packages, `plugin.json` may additionally define:
