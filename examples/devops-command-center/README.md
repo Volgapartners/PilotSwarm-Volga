@@ -44,7 +44,8 @@ Allowlist mode — only `investigator`, `deployer`, `reporter`, and `builder` ca
 ## Prerequisites
 
 - PostgreSQL running locally (or `DATABASE_URL` pointing to one)
-- `GITHUB_TOKEN` with Copilot access
+- LLM access through `GITHUB_TOKEN`, a configured BYOK provider, or an
+  authenticated Codex CLI provider
 - PilotSwarm installed (`npm install` from repo root)
 
 Create a `.env` file in the repo root:
@@ -53,6 +54,11 @@ Create a `.env` file in the repo root:
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pilotswarm
 GITHUB_TOKEN=your-token-here
 ```
+
+The sample does not depend on a specific runtime. If the worker is configured
+for Codex, choose a qualified model such as
+`codex-subscription:gpt-5.6-sol` from the model selector. See
+[Codex Runtime](../../docs/codex-runtime.md).
 
 ## Running with the TUI
 

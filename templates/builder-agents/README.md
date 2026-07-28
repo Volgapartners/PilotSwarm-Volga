@@ -38,6 +38,12 @@ and that PilotSwarm's built-in framework and management plugins are embedded in 
 
 If the target app needs a custom model catalog, check in `.model_providers.example.json`, create a local gitignored `.model_providers.json` from it, and keep actual credentials in `.env` / `.env.remote`. Runnable scaffolds should copy and adapt PilotSwarm's own example files, set up both `.env` and `.model_providers.json` from those corresponding examples, and add the real files to `.gitignore`.
 
+Model IDs are provider-qualified. Builders may use Copilot, BYOK, or Codex
+models without changing the PilotSwarm client API. A Codex-backed scaffold must
+also document worker-side Codex CLI installation, private `CODEX_HOME`
+authentication, and the trusted-single-operator limitation; use
+`docs/codex-runtime.md` as the canonical reference.
+
 PilotSwarm includes built-in facts tools (`store_fact`, `read_facts`, `delete_fact`) on workers, and they are available to every agent session by default, including system agents. Use them for durable structured memory and shared cross-agent state instead of inventing an app-specific facts table unless the app truly needs one.
 
 The CLI builder template also assumes runnable scaffolds should:

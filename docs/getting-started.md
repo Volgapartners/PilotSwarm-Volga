@@ -1,7 +1,7 @@
 # Getting Started — From Zero to Running
 
 This guide walks through setting up a fully working PilotSwarm environment
-from scratch — the durable execution runtime for GitHub Copilot SDK agents.
+from scratch — the durable execution runtime for Copilot SDK and Codex-backed agents.
 
 If you want the fastest possible first-run path, start with the
 [Starter Docker Quickstart](./getting-started-docker-appliance.md) and come
@@ -10,7 +10,7 @@ back here when you want the full source-based setup.
 By the end you'll have:
 
 - A PostgreSQL database (local or Azure)
-- LLM access via model providers (GitHub Copilot, Azure OpenAI, or any OpenAI-compatible endpoint)
+- LLM access via model providers (GitHub Copilot, Codex subscription, Azure OpenAI, or any OpenAI-compatible endpoint)
 - A working `.env` and local `.model_providers.json` copied from `.model_providers.example.json`
 - The TUI running with embedded workers (local mode)
 - Optionally: AKS workers + Azure Blob Storage for production
@@ -167,6 +167,9 @@ PilotSwarm uses the local `.model_providers.json` for LLM configuration and `.en
 
 > **Easiest way to get started:** Set `GITHUB_TOKEN` — this gives you access to all models available through GitHub Copilot (Claude, GPT-4.1, etc.) with no additional setup. You can add BYOK providers later.
 
+Codex subscription users can instead install and authenticate the Codex CLI on
+the worker. See [Codex Runtime](./codex-runtime.md).
+
 ### For local PostgreSQL
 
 Copy the example files:
@@ -192,7 +195,26 @@ AZURE_OPENAI_KEY=your-azure-openai-key
 # Add more provider keys as needed — see .model_providers.json
 ```
 
-> **Note:** You only need credentials for the providers you want to use. Providers without valid API keys are automatically hidden from the model picker and agent tools.
+> **Note:** You only need credentials for the providers you want to use.
+> API-key providers without valid keys are hidden from the model picker and
+> agent tools. Codex uses worker-side CLI login instead; a configured model may
+> be visible before login, but turns fail until the worker is authenticated.
+
+### Option C: Codex subscription
+
+Codex authentication is managed by the Codex CLI rather than `.env`:
+
+```bash
+npm install -g @openai/codex@0.145.0
+codex login                    # workstation
+# codex login --device-auth    # headless worker
+chmod 700 ~/.codex
+```
+
+Keep the `codex-subscription` block from `.model_providers.example.json`, set
+`CODEX_HOME` and `CODEX_BINARY_PATH`, then select a qualified model such as
+`codex-subscription:gpt-5.6-sol`. See
+[Codex Runtime](./codex-runtime.md) for production and VM guidance.
 
 ### For Azure PostgreSQL
 

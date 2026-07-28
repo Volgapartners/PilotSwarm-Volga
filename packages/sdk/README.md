@@ -21,6 +21,7 @@ Common docs:
 - SDK apps: `https://github.com/affandar/PilotSwarm/blob/main/docs/sdk/building-apps.md`
 - SDK agents: `https://github.com/affandar/PilotSwarm/blob/main/docs/sdk/building-agents.md`
 - Configuration: `https://github.com/affandar/PilotSwarm/blob/main/docs/configuration.md`
+- Codex runtime: `https://github.com/affandar/PilotSwarm/blob/main/docs/codex-runtime.md`
 - Architecture: `https://github.com/affandar/PilotSwarm/blob/main/docs/architecture.md`
 
 If you want the shipped terminal UI, install `pilotswarm-cli`.

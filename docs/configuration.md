@@ -9,6 +9,7 @@
 - **LLM provider credentials** — at least one of:
   - `GITHUB_TOKEN` (easiest — gives access to Claude, GPT, etc. via GitHub Copilot)
   - Azure OpenAI, Azure AI Services, or any OpenAI-compatible API key
+  - an authenticated Codex CLI subscription on the worker
 
 Optional:
 - **Azure Blob Storage** — for session dehydration/hydration across nodes
@@ -299,6 +300,79 @@ gh auth token
 ```
 
 The token is only needed on the **worker** side. Clients don't need it.
+
+### Codex Subscription Provider (`type: "codex"`)
+
+For the complete setup, security, durability, VM, and troubleshooting guide,
+see [Codex Runtime](./codex-runtime.md).
+
+The `codex` provider type points at a locally installed
+[`codex` CLI](https://github.com/openai/codex) and reuses that
+operator's ChatGPT/Codex subscription — no API key. Add a block like
+this to `.model_providers.json`:
+
+```json
+{
+    "id": "codex-subscription",
+    "type": "codex",
+    "codexHome": "env:CODEX_HOME",
+    "codexBinaryPath": "env:CODEX_BINARY_PATH",
+    "models": [
+        { "name": "gpt-5.6-sol", "description": "Codex subscription", "cost": "medium" }
+    ]
+}
+```
+
+Requirements:
+
+- The `codex` binary must be on `PATH`, or `codexBinaryPath` must point
+  at it. Homebrew (`brew install --cask codex`) and npm
+  (`npm i -g @openai/codex`) are both supported.
+- Log in once with `codex login` on a workstation, or
+  `codex login --device-auth` on a headless worker. That command
+  writes `auth.json` inside `CODEX_HOME` (defaults to `~/.codex`).
+  PilotSwarm never reads, copies, or logs that file.
+- `CODEX_HOME` must exist with mode `0700` before the worker starts;
+  the runtime refuses to spin up otherwise.
+- Trusted single-operator use only. Multi-user Plus/Pro subscription
+  sharing is out of scope for v1.
+
+Selecting a codex model:
+
+```ts
+const session = await client.createSession({
+    model: "codex-subscription:gpt-5.6-sol",
+});
+```
+
+The same qualified model IDs appear in the existing TUI and portal model
+selector after the worker reloads the provider catalog. The provider prefix
+selects the runtime; the suffix selects the model within Codex.
+
+Codex sessions run through the `codex app-server` stdio JSON-RPC
+protocol and reuse the same `PilotSwarmSession` API and durable
+orchestration behavior as Copilot-backed sessions. PilotSwarm:
+
+- Declares the full PilotSwarm tool set (including durable primitives
+  like `wait`, `ask_user`, and `spawn_agent`) to Codex via
+  `thread/start.dynamicTools`, so the model can call them.
+- Persists the Codex `threadId` under
+  `<sessionStateDir>/<sessionId>/codex-thread.json` so worker restarts
+  can resume with `thread/resume`.
+- On disconnect/checkpoint, copies the Codex rollout JSONL out of
+  `CODEX_HOME/sessions/…` into
+  `<sessionStateDir>/<sessionId>/codex-rollout.jsonl` so the standard
+  `FilesystemSessionStore` snapshot can archive it. `auth.json` is
+  never inspected, copied, or archived.
+- On cross-worker hydrate, calls `thread/resume` with `path` pointing
+  at the restored rollout snapshot so Codex can rebuild the thread
+  without needing the original `CODEX_HOME/sessions` layout.
+
+Model names must be real Codex model ids. The app-server `model/list`
+response is authoritative — for codex-cli 0.145.0 the
+subscription-side defaults are `gpt-5.6-sol`, `gpt-5.6-terra`,
+`gpt-5.6-luna`, `gpt-5.5`, and `gpt-5.4`. Legacy Codex ids like
+`gpt-5-codex` are NOT valid against the current app-server.
 
 ## npm Scripts
 
