@@ -95,4 +95,13 @@ describe("package API", () => {
         "a clean `npm install` would fail with ERESOLVE without --legacy-peer-deps",
     ).toBe(true);
   });
+
+  it("builds the SDK before workspaces that import its declarations", async () => {
+    const rootPkg = JSON.parse(await readFile("../../package.json", "utf8")) as {
+      scripts?: Record<string, string>;
+    };
+    expect(rootPkg.scripts?.build).toMatch(
+      /^npm run build --workspace=pilotswarm-sdk && /,
+    );
+  });
 });

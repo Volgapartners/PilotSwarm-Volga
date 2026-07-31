@@ -7,7 +7,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspaces",
+    "build": "npm run build --workspace=pilotswarm-sdk && npm run build --workspaces --if-present",
     "dev": "npm run dev --workspace=packages/sdk",
     "test": "npm test --workspace=packages/sdk",
     "test:local": "npm run test:local --workspace=packages/sdk",
