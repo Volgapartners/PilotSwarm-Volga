@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import { FilesystemSessionStore, waitForSessionSnapshot } from "../../src/session-store.ts";
 
@@ -10,6 +11,46 @@ function makeTempDir(prefix) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
     cleanupDirs.add(dir);
     return dir;
+}
+
+function writeTarString(header, offset, length, value) {
+    Buffer.from(value).copy(header, offset, 0, length);
+}
+
+function writeTarOctal(header, offset, length, value) {
+    writeTarString(header, offset, length, `${value.toString(8).padStart(length - 1, "0")}\0`);
+}
+
+function writeTarGz(archivePath, entries) {
+    const blocks = [];
+    for (const entry of entries) {
+        const data = Buffer.from(entry.content ?? "");
+        const type = entry.type ?? "0";
+        const header = Buffer.alloc(512);
+        writeTarString(header, 0, 100, entry.name);
+        writeTarOctal(header, 100, 8, type === "5" ? 0o755 : 0o600);
+        writeTarOctal(header, 108, 8, 0);
+        writeTarOctal(header, 116, 8, 0);
+        writeTarOctal(header, 124, 12, type === "0" ? data.length : 0);
+        writeTarOctal(header, 136, 12, 0);
+        header.fill(0x20, 148, 156);
+        header[156] = type.charCodeAt(0);
+        if (entry.linkname) writeTarString(header, 157, 100, entry.linkname);
+        writeTarString(header, 257, 6, "ustar\0");
+        writeTarString(header, 263, 2, "00");
+        writeTarString(header, 265, 32, "pilotswarm");
+        writeTarString(header, 297, 32, "pilotswarm");
+        const checksum = header.reduce((sum, byte) => sum + byte, 0);
+        writeTarString(header, 148, 8, `${checksum.toString(8).padStart(6, "0")}\0 `);
+        blocks.push(header);
+        if (type === "0" && data.length > 0) {
+            blocks.push(data);
+            const padding = (512 - (data.length % 512)) % 512;
+            if (padding) blocks.push(Buffer.alloc(padding));
+        }
+    }
+    blocks.push(Buffer.alloc(1024));
+    fs.writeFileSync(archivePath, zlib.gzipSync(Buffer.concat(blocks)));
 }
 
 afterEach(() => {
@@ -229,6 +270,101 @@ describe("(R4-D2) session-store tar helpers must not use the shell", () => {
         await store.dehydrate(sid, { reason: "r4-d2" });
         expect(fs.existsSync(path.join(storeDir, `${sid}.tar.gz`))).toBe(true);
         expect(fs.existsSync(shellSentinel)).toBe(false);
+    });
+});
+
+describe("session-store archive extraction safety", () => {
+    it("rejects an archive with a sibling top-level root without overwriting either live directory", async () => {
+        const baseDir = makeTempDir("pilotswarm-archive-roots-");
+        const stateDir = path.join(baseDir, "state");
+        const storeDir = path.join(baseDir, "store");
+        const sid = "attacker";
+        const victimDir = path.join(stateDir, "victim");
+        const attackerDir = path.join(stateDir, sid);
+        fs.mkdirSync(victimDir, { recursive: true });
+        fs.mkdirSync(attackerDir, { recursive: true });
+        fs.writeFileSync(path.join(victimDir, "state"), "VICTIM-KEEP");
+        fs.writeFileSync(path.join(attackerDir, "state"), "ATTACKER-OLD-KEEP");
+        fs.mkdirSync(storeDir, { recursive: true });
+        writeTarGz(path.join(storeDir, `${sid}.tar.gz`), [
+            { name: `${sid}/`, type: "5" },
+            { name: `${sid}/state`, content: "ATTACKER-NEW" },
+            { name: "victim/", type: "5" },
+            { name: "victim/state", content: "VICTIM-PWNED" },
+        ]);
+        const store = new FilesystemSessionStore(storeDir, stateDir);
+
+        await expect(store.hydrate(sid)).rejects.toThrow(/archive|root|entry/i);
+
+        expect(fs.readFileSync(path.join(victimDir, "state"), "utf-8")).toBe("VICTIM-KEEP");
+        expect(fs.readFileSync(path.join(attackerDir, "state"), "utf-8")).toBe("ATTACKER-OLD-KEEP");
+        expect(fs.readdirSync(stateDir).filter((name) => name.startsWith(".hydrate-"))).toEqual([]);
+    });
+
+    for (const attack of [
+        {
+            name: "path traversal",
+            entries: (sid) => [
+                { name: `${sid}/`, type: "5" },
+                { name: `${sid}/../victim-state`, content: "PWNED" },
+            ],
+        },
+        {
+            name: "symbolic link",
+            entries: (sid) => [
+                { name: `${sid}/`, type: "5" },
+                { name: `${sid}/link`, type: "2", linkname: "../victim-state" },
+            ],
+        },
+        {
+            name: "hard link",
+            entries: (sid) => [
+                { name: `${sid}/`, type: "5" },
+                { name: `${sid}/data`, content: "safe" },
+                { name: `${sid}/copy`, type: "1", linkname: `${sid}/data` },
+            ],
+        },
+    ]) {
+        it(`rejects ${attack.name} entries and leaves no staging residue`, async () => {
+            const baseDir = makeTempDir(`pilotswarm-archive-${attack.name.replace(/\s+/g, "-")}-`);
+            const stateDir = path.join(baseDir, "state");
+            const storeDir = path.join(baseDir, "store");
+            const sid = "safe-session";
+            fs.mkdirSync(storeDir, { recursive: true });
+            fs.mkdirSync(path.join(stateDir, sid), { recursive: true });
+            fs.writeFileSync(path.join(stateDir, sid, "state"), "OLD-KEEP");
+            fs.writeFileSync(path.join(stateDir, "victim-state"), "VICTIM-KEEP");
+            writeTarGz(path.join(storeDir, `${sid}.tar.gz`), attack.entries(sid));
+            const store = new FilesystemSessionStore(storeDir, stateDir);
+
+            await expect(store.hydrate(sid)).rejects.toThrow(/archive|traversal|link|entry/i);
+
+            expect(fs.readFileSync(path.join(stateDir, sid, "state"), "utf-8")).toBe("OLD-KEEP");
+            expect(fs.readFileSync(path.join(stateDir, "victim-state"), "utf-8")).toBe("VICTIM-KEEP");
+            expect(fs.readdirSync(stateDir).filter((name) => name.startsWith(".hydrate-"))).toEqual([]);
+        });
+    }
+
+    it("hydrates a valid single-root archive through the staged replacement path", async () => {
+        const baseDir = makeTempDir("pilotswarm-archive-valid-");
+        const stateDir = path.join(baseDir, "state");
+        const storeDir = path.join(baseDir, "store");
+        const sid = "valid-session";
+        fs.mkdirSync(storeDir, { recursive: true });
+        fs.mkdirSync(path.join(stateDir, sid), { recursive: true });
+        fs.writeFileSync(path.join(stateDir, sid, "old"), "OLD");
+        writeTarGz(path.join(storeDir, `${sid}.tar.gz`), [
+            { name: `${sid}/`, type: "5" },
+            { name: `${sid}/codex-thread.json`, content: '{"codexThreadId":"thread-valid"}' },
+        ]);
+        const store = new FilesystemSessionStore(storeDir, stateDir);
+
+        await store.hydrate(sid);
+
+        expect(fs.existsSync(path.join(stateDir, sid, "old"))).toBe(false);
+        expect(JSON.parse(fs.readFileSync(path.join(stateDir, sid, "codex-thread.json"), "utf-8")))
+            .toEqual({ codexThreadId: "thread-valid" });
+        expect(fs.readdirSync(stateDir).filter((name) => name.startsWith(".hydrate-"))).toEqual([]);
     });
 });
 

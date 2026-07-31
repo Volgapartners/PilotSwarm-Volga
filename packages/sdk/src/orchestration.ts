@@ -202,7 +202,7 @@ function updateContextUsageFromEvents(
 }
 
 /**
- * Flat event loop durable session orchestration (v1.0.43).
+ * Flat event loop durable session orchestration (v1.0.44).
  *
  * Replaces the nested while loops of v1.0.31 with a single
  * drain → decide → process loop backed by a KV FIFO work buffer.
@@ -211,7 +211,7 @@ function updateContextUsageFromEvents(
  */
 export const CURRENT_ORCHESTRATION_VERSION = DURABLE_SESSION_LATEST_VERSION;
 
-export function* durableSessionOrchestration_1_0_43(
+export function* durableSessionOrchestration_1_0_44(
     ctx: any,
     input: OrchestrationInput,
 ): Generator<any, string, any> {
@@ -2268,6 +2268,9 @@ export function* durableSessionOrchestration_1_0_43(
                 let agentSystemMessage = result.systemMessage;
                 let agentToolNames = result.toolNames;
                 let agentModel = result.model;
+                const agentReasoningEffort = typeof result.reasoningEffort === "string" && result.reasoningEffort.trim()
+                    ? result.reasoningEffort.trim()
+                    : undefined;
                 let agentIsSystem = false;
                 const explicitAgentTitle = typeof result.title === "string" && result.title.trim() ? result.title.trim() : undefined;
                 let agentTitle: string | undefined = explicitAgentTitle;
@@ -2353,11 +2356,21 @@ export function* durableSessionOrchestration_1_0_43(
                 const {
                     boundAgentName: _parentBoundAgentName,
                     promptLayering: _parentPromptLayering,
-                    ...parentConfig
+                    reasoningEffort: parentReasoningEffort,
+                    ...parentConfigWithoutEffort
                 } = config;
+                // Reasoning effort is model-scoped: a value that is valid on
+                // the parent's model may be unsupported (or mean something
+                // different) on an overridden child model. Inherit the
+                // parent's effort ONLY when the child stays on the parent's
+                // model and did not pick one explicitly.
+                const inheritsParentModel = !agentModel || agentModel === config.model;
+                const effectiveChildReasoningEffort = agentReasoningEffort
+                    ?? (inheritsParentModel ? parentReasoningEffort : undefined);
                 const childConfig: SerializableSessionConfig = {
-                    ...parentConfig,
+                    ...parentConfigWithoutEffort,
                     ...(agentModel ? { model: agentModel } : {}),
+                    ...(effectiveChildReasoningEffort ? { reasoningEffort: effectiveChildReasoningEffort } : {}),
                     ...(agentSystemMessage ? { systemMessage: agentSystemMessage } : {}),
                     ...(boundAgentName ? { boundAgentName } : {}),
                     ...(promptLayeringKind ? { promptLayering: { kind: promptLayeringKind } } : {}),

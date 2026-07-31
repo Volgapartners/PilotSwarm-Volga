@@ -27,7 +27,11 @@ function createFakeChildProcess() {
     proc.stdin = stdin;
     proc.stdout = stdout;
     proc.stderr = stderr;
-    proc.kill = () => true;
+    proc.killSignals = [];
+    proc.kill = (signal) => {
+        proc.killSignals.push(signal);
+        return true;
+    };
     return proc;
 }
 
@@ -116,5 +120,46 @@ describe("SpawnedCodexAppServerTransport", () => {
         expect(err.message).toMatch(/auth\.json missing|exit(ed)? 1|codex login/);
 
         await transport.close();
+    }, 3_000);
+
+    it("handles asynchronous stdin EPIPE, rejects pending requests, and emits close exactly once", async () => {
+        const proc = createFakeChildProcess();
+        const transport = new SpawnedCodexAppServerTransport(proc);
+        let closeCount = 0;
+        transport.on("close", () => { closeCount += 1; });
+
+        const pending = transport.request("thread/start", {});
+        const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+        proc.stdin.destroy(epipe);
+
+        await expect(pending).rejects.toThrow(/EPIPE|transport closed/i);
+
+        // Child-process teardown can fan out through stdin error, stdout
+        // close, and process exit. Consumers must see one terminal event.
+        proc.stdout.emit("close");
+        proc.emit("exit", 1, null);
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(closeCount).toBe(1);
+    }, 3_000);
+
+    it("close rejects pending requests before returning even when the child ignores SIGTERM", async () => {
+        const proc = createFakeChildProcess();
+        const transport = new SpawnedCodexAppServerTransport(proc);
+        let rejection;
+        let closeCount = 0;
+        transport.on("close", () => { closeCount += 1; });
+
+        const pending = transport.request("initialize", {}).catch((error) => {
+            rejection = error;
+        });
+
+        await transport.close();
+        await Promise.resolve();
+
+        expect(rejection).toBeInstanceOf(Error);
+        expect(rejection.message).toMatch(/closed/i);
+        expect(proc.killSignals).toEqual(["SIGTERM"]);
+        expect(closeCount).toBe(1);
+        await pending;
     }, 3_000);
 });

@@ -1,5 +1,8 @@
 # Quickstart
 
+v0 is source/workspace-only. It is not published to the npm registry, so run
+these commands from a PilotSwarm source checkout.
+
 ## Build
 
 ```bash
@@ -19,6 +22,12 @@ Required environment:
 - `GITHUB_TOKEN`
 - `DATABASE_URL`
 - reachable PostgreSQL
+
+The v0 live runner creates sessions without an explicit model, so PilotSwarm
+uses its configured default, but the runner still requires and passes the
+existing GitHub token path. Bundled runs are validated on GitHub/Copilot.
+Codex is not yet a selectable eval target; validate it with the focused
+[Codex Runtime runbook](../../../docs/codex-runtime.md#validation).
 
 ## Run The Minimal Gate
 

@@ -54,6 +54,18 @@ describe("run-eval CLI", () => {
     expect(result.stderr).toContain("Choose only one scenario selector");
   });
 
+  it("rejects an unmatched scenario glob with exit code 2", async () => {
+    const result = await runCli([
+      `--require=${FAKE_PLUGIN}`,
+      "--scenarios=scenarios/no-such-group/**/*.scenario.json",
+      "--driver=fake",
+    ]);
+
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain("No scenarios matched the requested selector or filters.");
+    expect(result.stdout).not.toContain("schema validation passed: 0");
+  });
+
   it("prints discovered v0 scenarios and execution cell count", async () => {
     const dir = await mkdtemp(join(tmpdir(), "eval-cli-cells-"));
     const scenarioPath = join(dir, "single.scenario.json");

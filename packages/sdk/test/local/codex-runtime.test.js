@@ -444,6 +444,46 @@ describe("Codex runtime adapter (fake transport)", () => {
 
         resolveFirstCompletion();
         await client.stop();
+        await client.stop();
+    }, 3_000);
+    it("stop settles a held active turn while listeners are live and releases the shared turn queue", async () => {
+        const { codexHome, sessionStateDir } = mkTmpHomes();
+        const transport = createFakeCodexTransport({
+            thread: { id: "codex-thread-stop-held" },
+            turnId: "turn-stop-held",
+            turnScript: [
+                {
+                    emit: "notification",
+                    method: "turn/started",
+                    params: { threadId: "codex-thread-stop-held", turn: { id: "turn-stop-held" } },
+                },
+                { emit: "hold" },
+            ],
+        });
+        const client = new CodexRuntimeClient({ codexHome, sessionStateDir, transportFactory: () => transport });
+        const active = await client.createSession({ sessionId: "ps-stop-held-active" });
+        const queued = await client.createSession({ sessionId: "ps-stop-held-queued" });
+
+        const activeEvents = [];
+        const queuedEvents = [];
+        active.on((event) => activeEvents.push(event));
+        queued.on((event) => queuedEvents.push(event));
+        await active.send({ prompt: "hold this turn" });
+
+        const queuedSend = queued.send({ prompt: "must not wedge behind shutdown" }).then(
+            () => "resolved",
+            () => "rejected",
+        );
+
+        await client.stop();
+        const queuedOutcome = await queuedSend;
+
+        expect(activeEvents.some((event) => event.type === "session.idle")).toBe(true);
+        expect(queuedOutcome).toBe("rejected");
+        expect(queuedEvents.filter((event) => event.type === "session.idle")).toHaveLength(1);
+        expect(client["sessions"].size).toBe(0);
+        expect(client["turnQueue"]).toBeInstanceOf(Promise);
+        await expect(client["turnQueue"]).resolves.toBeUndefined();
     }, 3_000);
 
     it("send() returns synchronously enough that ManagedSession can await it before racing its own timeout", async () => {
@@ -472,6 +512,92 @@ describe("Codex runtime adapter (fake transport)", () => {
 
         await client.stop();
     }, 3_000);
+
+    it("second-turn abort before the queued lambda starts still emits exactly one new idle", async () => {
+        // Regression: `send()` resets the per-turn suppression flags
+        // (`turnEndFired`) only AFTER the queued lambda has cleared the
+        // abort short-circuit. On a SECOND turn, `turnEndFired` is still
+        // `true` from the first turn's `turn/completed`, so the abort
+        // short-circuit's `_markTurnTerminal({ emitIdle: true })` was
+        // suppressed as a duplicate. `send()` resolved via `ackResolve()`
+        // but no `session.idle` ever arrived, so `ManagedSession.runTurn()`
+        // hung on its idle race until the turn timeout.
+        const { codexHome, sessionStateDir } = mkTmpHomes();
+
+        // A blocker session holds the client-wide turn queue so the second
+        // turn on the session under test is aborted BEFORE its queued
+        // lambda begins.
+        let releaseBlocker;
+        const blockerDone = new Promise((r) => { releaseBlocker = r; });
+        const transport = createFakeCodexTransport({ thread: { id: "codex-thread-second-abort" } });
+        const origRequest = transport.request.bind(transport);
+        let startSeq = 0;
+        transport.request = async function (method, params) {
+            if (method === "turn/start") {
+                startSeq += 1;
+                transport.recordedRequests.push({ kind: "request", method, params });
+                const id = `sa-turn-${startSeq}`;
+                const threadId = params?.threadId;
+                if (startSeq === 1) {
+                    // Turn 1 on the session under test completes normally.
+                    queueMicrotask(() => transport.emit("notification", {
+                        method: "turn/completed",
+                        params: { threadId, turn: { id, status: "completed" } },
+                    }));
+                } else {
+                    // The blocker's turn hangs until we release it.
+                    blockerDone.then(() => transport.emit("notification", {
+                        method: "turn/completed",
+                        params: { threadId, turn: { id, status: "completed" } },
+                    }));
+                }
+                return { turn: { id } };
+            }
+            return origRequest(method, params);
+        };
+
+        const client = new CodexRuntimeClient({ codexHome, sessionStateDir, transportFactory: () => transport });
+        const session = await client.createSession({ sessionId: "ps-second-abort" });
+        const blocker = await client.createSession({ sessionId: "ps-second-abort-blocker" });
+        blocker.on(() => {});
+
+        const idleEvents = [];
+        const turnEndEvents = [];
+        session.on("session.idle", (e) => idleEvents.push(e));
+        session.on("assistant.turn_end", (e) => turnEndEvents.push(e));
+
+        // ── Turn 1: normal completion ────────────────────────────
+        await session.send({ prompt: "first turn" });
+        await new Promise((r) => setTimeout(r, 20));
+        expect(idleEvents).toHaveLength(1);
+        expect(turnEndEvents).toHaveLength(1);
+
+        // ── Blocker occupies the queue ───────────────────────────
+        await blocker.send({ prompt: "hold the queue" });
+
+        // ── Turn 2: aborted while still queued ───────────────────
+        const secondSend = session.send({ prompt: "second turn" });
+        session.abort();
+
+        releaseBlocker();
+        await secondSend; // must resolve, not hang
+        await new Promise((r) => setTimeout(r, 20));
+
+        // Exactly one NEW terminal signal for the aborted second turn.
+        expect(idleEvents).toHaveLength(2);
+        // The aborted-before-start path never ran the model, so it must
+        // not synthesize a second assistant.turn_end.
+        expect(turnEndEvents).toHaveLength(1);
+
+        // The aborted turn never consumed a Codex turn: only turn 1 and
+        // the blocker's turn reached turn/start.
+        const starts = transport.recordedRequests.filter((r) => r.method === "turn/start");
+        expect(starts).toHaveLength(2);
+        const interrupts = transport.recordedRequests.filter((r) => r.method === "turn/interrupt");
+        expect(interrupts).toHaveLength(0);
+
+        await client.stop();
+    }, 5_000);
 
     it("abort while queued behind another session prevents turn/start entirely", async () => {
         const { codexHome, sessionStateDir } = mkTmpHomes();

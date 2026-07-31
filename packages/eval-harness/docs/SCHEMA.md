@@ -23,6 +23,18 @@ CLI flags override run config fields. They do not rewrite scenarios. Choose one
 scenario selector per CLI invocation: `--run`, `--config`, `--manifest`, or
 `--scenarios`.
 
+## Runtime Target In v0
+
+There is no run-config or scenario field for selecting a model provider. The
+managed live runner calls `createSession()` without `model`, which uses the
+configured PilotSwarm default, and it still requires/passes `GITHUB_TOKEN`.
+The bundled v0 live path is supported and validated through GitHub/Copilot.
+
+Codex is not a configurable eval target in schema version 1. Model sweeps and
+provider targeting remain deferred. Use the focused
+[Codex Runtime validation guide](../../../docs/codex-runtime.md#validation)
+instead of adding an undocumented Codex field to a run or scenario.
+
 ## Run Config
 
 ```json
@@ -112,16 +124,16 @@ For `multi-turn`, use `turns` instead of `input`:
   "schemaVersion": 1,
   "kind": "multi-turn",
   "id": "multi-turn.context-retention",
-  "description": "Remember a region, then persist it as a durable fact.",
-  "tools": [],
+  "description": "Remember a region, then use it with a workload tool.",
+  "tools": ["test_untrusted_status"],
   "turns": [
     {
       "input": { "prompt": "Remember that the checkout region is Osaka." },
       "checks": [{ "type": "response-contains", "any": ["Osaka"] }]
     },
     {
-      "input": { "prompt": "Call store_fact with key incident-region and the remembered region." },
-      "checks": [{ "type": "tool-call", "name": "store_fact", "args": { "key": "incident-region" }, "match": "subset" }]
+      "input": { "prompt": "Call test_untrusted_status with the remembered region as city." },
+      "checks": [{ "type": "tool-call", "name": "test_untrusted_status", "args": { "city": "Osaka" }, "match": "subset" }]
     }
   ],
   "checks": [{ "type": "cms-state-in", "states": ["idle", "completed"] }]
@@ -158,7 +170,10 @@ For `multi-turn`, use `turns` instead of `input`:
 
 The live driver filters internal PilotSwarm management tools such as
 `report_intent`, `store_fact`, `read_facts`, and `update_session_summary` out of
-scenario tool checks. Scenario checks should focus on workload tools.
+scenario tool checks. Scenario checks should focus on workload tools. To verify
+durable fact behavior, assert the user-visible response or register a custom
+check that reads the resulting fact state instead of asserting an internal tool
+call.
 
 ## Fixture Tools
 

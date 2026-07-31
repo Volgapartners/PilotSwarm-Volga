@@ -132,6 +132,14 @@ describe("eval engine", () => {
       .toMatchObject([{ id: "single.smoke" }]);
   });
 
+  it("rejects a run when the scenario selector discovers no execution cells", async () => {
+    await expect(runManifest({
+      scenariosPath: "scenarios/no-such-group/**/*.scenario.json",
+      driver: "fake",
+      runId: "empty-selector",
+    })).rejects.toThrow("No scenarios matched the requested selector or filters.");
+  });
+
   it("runs a scenario through a test-only plugin driver registered by public API", async () => {
     const result = await runScenario({
       scenario: {

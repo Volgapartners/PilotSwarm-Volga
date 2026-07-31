@@ -1,6 +1,7 @@
 import { defineTool, type Tool, type CopilotSession } from "@github/copilot-sdk";
 import type { TurnAction, TurnResult, TurnOptions, ManagedSessionConfig, CapturedEvent } from "./types.js";
 import type { RuntimeSessionHandle, RuntimeKind } from "./runtime.js";
+import type { ReasoningEffort } from "./model-providers.js";
 
 /**
  * Mutable state shared between the wait tool handler and runTurn().
@@ -28,6 +29,18 @@ function failureToolResult(error: unknown) {
     };
 }
 
+function normalizeReasoningEffort(value: unknown): ReasoningEffort | undefined {
+    const effort = String(value || "").trim().toLowerCase();
+    return effort === "low"
+        || effort === "medium"
+        || effort === "high"
+        || effort === "xhigh"
+        || effort === "max"
+        || effort === "ultra"
+        ? effort
+        : undefined;
+}
+
 function isBenignPostCompletionQueryError(eventData: any): boolean {
     if (!eventData || typeof eventData !== "object") return false;
     return eventData.errorType === "query"
@@ -52,6 +65,17 @@ export class ManagedSession {
     readonly sessionId: string;
     /** Which backend runtime hosts this session (copilot | codex). */
     readonly runtimeKind: RuntimeKind;
+    /**
+     * Normalized model the UNDERLYING runtime handle was created/resumed
+     * with. `config.model` can drift ahead of the live handle (a
+     * `set_model` command rewrites config before the next turn), so this
+     * records what the backend actually runs. SessionManager compares it
+     * against the incoming config to decide whether a warm handle is
+     * still safe to reuse.
+     */
+    readonly boundModel: string | undefined;
+    /** Effective reasoning effort the underlying runtime handle was created with. */
+    readonly boundReasoningEffort: string | undefined;
     private copilotSession: RuntimeSessionHandle;
     private config: ManagedSessionConfig;
 
@@ -59,12 +83,14 @@ export class ManagedSession {
         sessionId: string,
         copilotSession: RuntimeSessionHandle | CopilotSession,
         config: ManagedSessionConfig,
-        options?: { runtimeKind?: RuntimeKind },
+        options?: { runtimeKind?: RuntimeKind; boundModel?: string; boundReasoningEffort?: string },
     ) {
         this.sessionId = sessionId;
         this.copilotSession = copilotSession as RuntimeSessionHandle;
         this.config = config;
         this.runtimeKind = options?.runtimeKind ?? "copilot";
+        this.boundModel = options?.boundModel;
+        this.boundReasoningEffort = options?.boundReasoningEffort;
     }
 
     /**
@@ -176,10 +202,11 @@ export class ManagedSession {
         const listModelsTool = defineTool("list_available_models", {
             description:
                 "List all available LLM models across all configured providers. " +
-                "Returns each model's exact qualified name (provider:model), description, and cost tier. " +
+                "Returns each model's exact qualified name (provider:model), description, cost tier, and supported reasoning efforts (with the model's default). " +
                 "This output is the authoritative source for model selection. " +
                 "Use this when choosing the best model for a sub-agent task, or when the user asks about available models. " +
                 "If you plan to pass spawn_agent(model=...), you must choose an exact provider:model value from this list and must not invent or shorten names. " +
+                "If you plan to pass spawn_agent(reasoning_effort=...), you must choose one of the supported reasoning efforts listed here for that model. " +
                 "When choosing a model for a sub-agent, prefer lower-cost models for simple tasks " +
                 "and higher-cost models for complex reasoning tasks.",
             parameters: {
@@ -227,6 +254,11 @@ export class ManagedSession {
                     model: {
                         type: "string",
                         description: "Optional exact provider:model override from list_available_models (e.g. 'anthropic:claude-sonnet-4-6'). Do not invent or shorten model names. If omitted, inherits parent's model.",
+                    },
+                    reasoning_effort: {
+                        type: "string",
+                        enum: ["low", "medium", "high", "xhigh", "max", "ultra"],
+                        description: "Optional reasoning effort override for the sub-agent. Call list_available_models first and use only a reasoning value listed for the selected model. If omitted, inherits the parent's reasoning effort.",
                     },
                     system_message: {
                         type: "string",
@@ -582,10 +614,11 @@ export class ManagedSession {
         const listModelsTool = defineTool("list_available_models", {
             description:
                 "List all available LLM models across all configured providers. " +
-                "Returns each model's exact qualified name (provider:model), description, and cost tier. " +
+                "Returns each model's exact qualified name (provider:model), description, cost tier, and supported reasoning efforts (with the model's default). " +
                 "This output is the authoritative source for model selection. " +
                 "Use this when choosing the best model for a sub-agent task, or when the user asks about available models. " +
                 "If you plan to pass spawn_agent(model=...), you must choose an exact provider:model value from this list and must not invent or shorten names. " +
+                "If you plan to pass spawn_agent(reasoning_effort=...), you must choose one of the supported reasoning efforts listed here for that model. " +
                 "When choosing a model for a sub-agent, prefer lower-cost models for simple tasks " +
                 "and higher-cost models for complex reasoning tasks.",
             parameters: {
@@ -625,6 +658,11 @@ export class ManagedSession {
                         type: "string",
                         description: "Optional exact provider:model override from list_available_models. Do not invent or shorten model names.",
                     },
+                    reasoning_effort: {
+                        type: "string",
+                        enum: ["low", "medium", "high", "xhigh", "max", "ultra"],
+                        description: "Optional reasoning effort override from list_available_models for the selected model. If omitted, inherits the parent's reasoning effort.",
+                    },
                     system_message: {
                         type: "string",
                         description: "Optional custom system message. Only for custom agents.",
@@ -640,17 +678,22 @@ export class ManagedSession {
                     },
                 },
             },
-            handler: async (args: { agent_name?: string; task?: string; model?: string; system_message?: string; tool_names?: string[]; title?: string }) => {
+            handler: async (args: { agent_name?: string; task?: string; model?: string; reasoning_effort?: string; system_message?: string; tool_names?: string[]; title?: string }) => {
                 if (!args.agent_name && !args.task) {
                     return "Error: either agent_name or task is required.";
                 }
+                const reasoningEffort = args.reasoning_effort ? normalizeReasoningEffort(args.reasoning_effort) : undefined;
+                if (args.reasoning_effort && !reasoningEffort) {
+                    return "Error: reasoning_effort must be one of low, medium, high, xhigh, max, ultra.";
+                }
                 if (controlBridge) {
-                    return await controlBridge.spawnAgent(args);
+                    return await controlBridge.spawnAgent({ ...args, ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}) });
                 }
                 turnState.pendingActions.push({
                     type: "spawn_agent",
                     task: args.task || "",
                     model: args.model,
+                    reasoningEffort,
                     systemMessage: args.system_message,
                     toolNames: args.tool_names,
                     agentName: args.agent_name,
@@ -1063,11 +1106,17 @@ export class ManagedSession {
         // Optional timeout race — disabled by default.
         // Uses turnTimeoutMs from session config if set.
         const TURN_TIMEOUT = this.config.turnTimeoutMs ?? 0;
+        let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
         const timeoutPromise = TURN_TIMEOUT > 0
-            ? new Promise<void>((_, reject) => {
-                setTimeout(() => reject(new Error("Turn timed out")), TURN_TIMEOUT);
+            ? new Promise<never>((_, reject) => {
+                timeoutHandle = setTimeout(() => reject(new Error("Turn timed out")), TURN_TIMEOUT);
             })
             : null;
+        // The timeout promise loses the race whenever the turn completes
+        // normally. Attach an inert handler so the eventual rejection is
+        // never reported as an unhandledRejection, and so a `send()` that
+        // throws before the race is entered can't leak it either.
+        if (timeoutPromise) timeoutPromise.catch(() => {});
 
         const effectivePrompt = opts?.requiredTool
             ? [
@@ -1080,18 +1129,27 @@ export class ManagedSession {
             : prompt;
 
         try {
-            // Fire the prompt — non-blocking
-            await this.copilotSession.send({
-                prompt: effectivePrompt,
-                ...(effectivePrompt !== prompt ? { displayPrompt: prompt } : {}),
-                ...(opts?.requiredTool ? { requiredTool: opts.requiredTool } : {}),
-            });
-
-            // Wait for session.idle, or timeout if explicitly enabled.
-            if (timeoutPromise) {
-                await Promise.race([turnComplete, timeoutPromise]);
-            } else {
+            // The timeout must cover the COMPLETE operation: `send()` itself
+            // can stall indefinitely (the Codex runtime only resolves it once
+            // the `turn/start` ack returns, and that ack sits behind a
+            // per-CODEX_HOME queue). Racing only `turnComplete` would let a
+            // wedged send hang the turn forever.
+            const turnOperation = (async () => {
+                await this.copilotSession.send({
+                    prompt: effectivePrompt,
+                    ...(effectivePrompt !== prompt ? { displayPrompt: prompt } : {}),
+                    ...(opts?.requiredTool ? { requiredTool: opts.requiredTool } : {}),
+                });
                 await turnComplete;
+            })();
+            // If the timeout wins the race, a later rejection from the
+            // in-flight operation would otherwise be unhandled.
+            turnOperation.catch(() => {});
+
+            if (timeoutPromise) {
+                await Promise.race([turnOperation, timeoutPromise]);
+            } else {
+                await turnOperation;
             }
         } catch (err: any) {
             // Timeout — kill it
@@ -1108,6 +1166,9 @@ export class ManagedSession {
                 return { type: "error", message: errMsg };
             }
         } finally {
+            // Always release the timeout timer so a completed turn can't keep
+            // the event loop (or the process) alive.
+            if (timeoutHandle) clearTimeout(timeoutHandle);
             // Always clean up subscriptions
             for (const unsub of unsubscribers) unsub();
         }
@@ -1213,6 +1274,7 @@ export class ManagedSession {
      */
     updateConfig(config: Partial<ManagedSessionConfig>): void {
         if (config.model !== undefined) this.config.model = config.model;
+        if (config.reasoningEffort !== undefined) this.config.reasoningEffort = config.reasoningEffort;
         if (config.tools !== undefined) this.config.tools = config.tools;
         if (config.systemMessage !== undefined) this.config.systemMessage = config.systemMessage;
         if (config.turnSystemPrompt !== undefined) this.config.turnSystemPrompt = config.turnSystemPrompt;

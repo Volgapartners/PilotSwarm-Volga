@@ -6,15 +6,15 @@ import {
     SASProtocol,
 } from "@azure/storage-blob";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {
     DEFAULT_SESSION_STATE_DIR,
     type SessionMetadata,
     type SessionStateStore,
     type ArtifactStore,
-    archiveSessionDir,
+    archiveSessionDirAtomic,
     buildMetadata,
+    createSessionWorkDir,
     extractSessionArchive,
     resolveContainedSessionDir,
     validateSessionId,
@@ -60,6 +60,14 @@ function logBlobStore(
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error ?? "");
 }
+
+/**
+ * Fixed filename INSIDE a per-operation staging directory. Uniqueness
+ * comes from the `mkdtemp` directory, not from the file name, so the
+ * staged path is never guessable and never shared between concurrent
+ * operations on the same session.
+ */
+const ARCHIVE_STAGE_FILENAME = "session-state.tar.gz";
 
 /**
  * Manages session state in Azure Blob Storage.
@@ -121,9 +129,14 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
             );
         }
 
-        const tarPath = path.join(os.tmpdir(), `${sessionId}.tar.gz`);
+        // Stage inside a private, per-operation directory. A predictable
+        // `os.tmpdir()/<sessionId>.tar.gz` is both a symlink-swap target
+        // on a shared host and a collision point between two concurrent
+        // operations on the same session.
+        const workDir = createSessionWorkDir(this.sessionStateDir, ".dehydrate-stage-");
+        const tarPath = path.join(workDir, ARCHIVE_STAGE_FILENAME);
         try {
-            archiveSessionDir(this.sessionStateDir, sessionId, tarPath);
+            archiveSessionDirAtomic(this.sessionStateDir, sessionId, tarPath);
             const tarSizeBytes = fs.existsSync(tarPath) ? fs.statSync(tarPath).size : undefined;
 
             // Upload tar
@@ -160,29 +173,26 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
             });
             throw error;
         } finally {
-            // Always clean up temp tar
-            try { fs.unlinkSync(tarPath); } catch {}
+            // Always clean up the private staging directory.
+            try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
         }
     }
 
     /**
-     * Hydrate a session: download tar from blob, extract to local disk.
-     * No-op if local session files already exist.
+     * Hydrate a session: download to a unique local directory, preflight
+     * the archive, then replace the live session directory.
      */
     async hydrate(sessionId: string): Promise<void> {
         const sessionDir = resolveContainedSessionDir(this.sessionStateDir, sessionId);
+        fs.mkdirSync(this.sessionStateDir, { recursive: true });
         logBlobStore("info", sessionId, "hydrate start", {
             container: this.containerName,
             dir: sessionDir,
         });
 
-        // Always download from blob — overwrite any stale local files
-        if (fs.existsSync(sessionDir)) {
-            fs.rmSync(sessionDir, { recursive: true, force: true });
-        }
-
         const tarBlob = this.containerClient.getBlockBlobClient(`${sessionId}.tar.gz`);
-        const tarPath = path.join(os.tmpdir(), `${sessionId}.tar.gz`);
+        const downloadDir = createSessionWorkDir(this.sessionStateDir, ".hydrate-download-");
+        const tarPath = path.join(downloadDir, ARCHIVE_STAGE_FILENAME);
 
         try {
             logBlobStore("info", sessionId, "hydrate download tar", {
@@ -190,7 +200,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
                 blob: `${sessionId}.tar.gz`,
             });
             await tarBlob.downloadToFile(tarPath);
-            extractSessionArchive(this.sessionStateDir, tarPath);
+            extractSessionArchive(this.sessionStateDir, sessionId, tarPath);
             logBlobStore("info", sessionId, "hydrate complete", {
                 container: this.containerName,
                 restoredDir: sessionDir,
@@ -203,7 +213,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
             });
             throw error;
         } finally {
-            try { fs.unlinkSync(tarPath); } catch {}
+            fs.rmSync(downloadDir, { recursive: true, force: true });
         }
     }
 
@@ -221,13 +231,32 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
             return;
         }
 
-        const tarPath = path.join(os.tmpdir(), `${sessionId}.tar.gz`);
+        // Same readiness gate as dehydrate(). Checkpoint overwrites the
+        // ONLY recoverable snapshot blob, so archiving a half-written or
+        // corrupt session directory (invalid `codex-thread.json`, empty
+        // `codexThreadId`, or a missing / symlinked / escaping
+        // `rolloutSnapshotRelPath`) would destroy the last known-good
+        // state. Unlike dehydrate, a checkpoint is periodic and
+        // best-effort: skip this round and leave the previous blob
+        // intact rather than failing the orchestration activity.
+        const snapshot = await waitForSessionSnapshot(this.sessionStateDir, sessionId);
+        if (!snapshot.ready) {
+            logBlobStore("warn", sessionId, "checkpoint skipped", {
+                container: this.containerName,
+                reason: "snapshot not ready",
+                missing: snapshot.missing.join(", ") || "unknown",
+            });
+            return;
+        }
+
+        const workDir = createSessionWorkDir(this.sessionStateDir, ".checkpoint-stage-");
+        const tarPath = path.join(workDir, ARCHIVE_STAGE_FILENAME);
         try {
             logBlobStore("info", sessionId, "checkpoint start", {
                 container: this.containerName,
                 dir: sessionDir,
             });
-            archiveSessionDir(this.sessionStateDir, sessionId, tarPath);
+            archiveSessionDirAtomic(this.sessionStateDir, sessionId, tarPath);
             const tarSizeBytes = fs.existsSync(tarPath) ? fs.statSync(tarPath).size : undefined;
 
             const tarBlob = this.containerClient.getBlockBlobClient(`${sessionId}.tar.gz`);
@@ -251,7 +280,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
             });
             throw error;
         } finally {
-            try { fs.unlinkSync(tarPath); } catch {}
+            try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
         }
     }
 

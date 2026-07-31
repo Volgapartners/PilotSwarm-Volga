@@ -42,7 +42,11 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Tool } from "@github/copilot-sdk";
 import type { RuntimeClient, RuntimeSessionHandle } from "./runtime.js";
-import { resolveContainedSessionDir } from "./session-store.js";
+import {
+    resolveContainedSessionDir,
+    isCompleteJsonlSnapshot,
+    isCompleteJsonlSnapshotContent,
+} from "./session-store.js";
 
 // ─── Public constants ────────────────────────────────────────────
 
@@ -62,6 +66,7 @@ export const CODEX_ROLLOUT_SNAPSHOT_FILENAME = "codex-rollout.jsonl";
 
 /** clientInfo.version reported to `codex app-server`. */
 const PILOTSWARM_CLIENT_INFO_VERSION = "0.1";
+let markerWriteCounter = 0;
 
 // ─── Session-id / directory safety ───────────────────────────────
 
@@ -149,6 +154,8 @@ export class CodexRuntimeClient implements RuntimeClient {
     private sessions = new Map<string, CodexRuntimeSession>();
     /** Per-client mutex so overlapping turn/start calls stay ordered. */
     private turnQueue: Promise<void> = Promise.resolve();
+    private stopping = false;
+    private stopPromise: Promise<void> | null = null;
 
     constructor(opts: CodexRuntimeClientOptions) {
         this.opts = opts;
@@ -188,6 +195,7 @@ export class CodexRuntimeClient implements RuntimeClient {
         if (config.cwd) params.cwd = config.cwd;
         if (config.developerInstructions) params.developerInstructions = config.developerInstructions;
         if (config.baseInstructions) params.baseInstructions = config.baseInstructions;
+        if (config.config && typeof config.config === "object") params.config = config.config;
         const dynamicTools = buildDynamicToolSpecs(config.tools);
         if (dynamicTools.length > 0) params.dynamicTools = dynamicTools;
 
@@ -205,6 +213,9 @@ export class CodexRuntimeClient implements RuntimeClient {
             cwd: config.cwd,
             developerInstructions: config.developerInstructions,
             baseInstructions: config.baseInstructions,
+            appServerConfig: (config.config && typeof config.config === "object")
+                ? (config.config as Record<string, unknown>)
+                : undefined,
         });
         if (config.tools?.length) session.registerTools(config.tools);
         return session;
@@ -229,6 +240,9 @@ export class CodexRuntimeClient implements RuntimeClient {
             cwd: config?.cwd,
             developerInstructions: config?.developerInstructions,
             baseInstructions: config?.baseInstructions,
+            appServerConfig: (config?.config && typeof config.config === "object")
+                ? (config.config as Record<string, unknown>)
+                : undefined,
         });
         await session._issueThreadResume();
         if (config?.tools?.length) session.registerTools(config.tools);
@@ -241,6 +255,13 @@ export class CodexRuntimeClient implements RuntimeClient {
         // sessionStateDir and rm arbitrary host directories.
         const stateDir = resolveSafeCodexSessionDir(this.opts.sessionStateDir, sessionId);
         const active = this.sessions.get(sessionId);
+        // Issue the remote interrupt before local settlement releases
+        // the shared turn queue. The request is fire-and-forget, but its
+        // synchronous invocation must precede any overlapping next turn.
+        if (active) {
+            active.abort();
+            active._settleActiveTurnForClose(`Codex session ${sessionId} deleted`);
+        }
         const codexThreadId = active?.codexThreadId ?? this._readThreadState(sessionId)?.codexThreadId;
         if (this.transport && codexThreadId) {
             try {
@@ -267,14 +288,32 @@ export class CodexRuntimeClient implements RuntimeClient {
     }
 
     async stop(): Promise<void> {
-        for (const session of this.sessions.values()) session._teardown();
-        this.sessions.clear();
-        if (this.transport) {
-            try { await this.transport.close(); } catch {}
-            this.transport = null;
-        }
-        this.initialized = false;
-        this.initPromise = null;
+        if (this.stopPromise) return this.stopPromise;
+        this.stopping = true;
+        this.stopPromise = (async () => {
+            const sessions = [...this.sessions.values()];
+            const stopError = new Error("Codex runtime stopped");
+            for (const session of sessions) session._prepareForClientStop(stopError);
+
+            const transport = this.transport;
+            if (transport) {
+                try { await transport.close(); } catch {}
+            }
+
+            // A conforming transport emits `close`, but settle explicitly
+            // before listener teardown as a fallback for injected/custom
+            // transports that only resolve close().
+            for (const session of sessions) session._settleForClientStop();
+            await this.turnQueue;
+
+            for (const session of sessions) session._teardown();
+            this.sessions.clear();
+            if (this.transport === transport) this.transport = null;
+            this.initialized = false;
+            this.initPromise = null;
+            this.turnQueue = Promise.resolve();
+        })();
+        return this.stopPromise;
     }
 
     /** Serialize app-server calls that must not overlap across sessions. */
@@ -283,6 +322,11 @@ export class CodexRuntimeClient implements RuntimeClient {
         // Swallow errors so a rejected turn does not poison the chain.
         this.turnQueue = next.then(() => undefined, () => undefined);
         return next;
+    }
+
+    /** @internal */
+    _isStopping(): boolean {
+        return this.stopping;
     }
 
     private _ensureCodexHomeReady(): void {
@@ -545,7 +589,22 @@ export class CodexRuntimeClient implements RuntimeClient {
                 delete payload.rolloutSnapshotRelPath;
             }
         }
-        fs.writeFileSync(file, JSON.stringify(payload, null, 2), { mode: 0o600 });
+        const tempFile = `${file}.tmp.${process.pid}.${Date.now()}.${markerWriteCounter++}`;
+        try {
+            fs.writeFileSync(tempFile, JSON.stringify(payload, null, 2), {
+                mode: 0o600,
+                flag: "wx",
+            });
+            fs.chmodSync(tempFile, 0o600);
+            fs.renameSync(tempFile, file);
+        } catch (error) {
+            try { fs.unlinkSync(tempFile); } catch {}
+            throw error;
+        }
+    }
+
+    hasUsableThreadState(sessionId: string): boolean {
+        return this._readThreadState(sessionId) !== null;
     }
 
     _readThreadState(sessionId: string): {
@@ -557,7 +616,38 @@ export class CodexRuntimeClient implements RuntimeClient {
         const dir = resolveSafeCodexSessionDir(this.opts.sessionStateDir, sessionId);
         const file = path.join(dir, CODEX_THREAD_STATE_FILENAME);
         if (!fs.existsSync(file)) return null;
-        try { return JSON.parse(fs.readFileSync(file, "utf-8")); } catch { return null; }
+        try {
+            const stat = fs.lstatSync(file);
+            if (stat.isSymbolicLink() || !stat.isFile()) return null;
+            const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf-8"));
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+            const state = parsed as Record<string, unknown>;
+            if (typeof state.codexThreadId !== "string" || state.codexThreadId.trim() === "") {
+                return null;
+            }
+            const rollout = state.rolloutSnapshotRelPath;
+            if (rollout != null && rollout !== "") {
+                if (typeof rollout !== "string" || path.isAbsolute(rollout)) return null;
+                const rolloutPath = path.resolve(dir, rollout);
+                const dirPrefix = path.resolve(dir) + path.sep;
+                if (!rolloutPath.startsWith(dirPrefix)) return null;
+                const rolloutStat = fs.lstatSync(rolloutPath);
+                if (rolloutStat.isSymbolicLink() || !rolloutStat.isFile()) return null;
+                // A rollout that is empty or ends mid-record cannot be
+                // handed to `thread/resume`. Treat the whole marker as
+                // unusable so callers fall back to hydrating a stored
+                // checkpoint instead of resuming from torn state.
+                if (!isCompleteJsonlSnapshot(rolloutPath)) return null;
+            }
+            return {
+                codexThreadId: state.codexThreadId,
+                ...(typeof state.codexHome === "string" ? { codexHome: state.codexHome } : {}),
+                ...(typeof state.model === "string" ? { model: state.model } : {}),
+                ...(typeof rollout === "string" && rollout ? { rolloutSnapshotRelPath: rollout } : {}),
+            };
+        } catch {
+            return null;
+        }
     }
 
     private _registerSession(
@@ -569,6 +659,7 @@ export class CodexRuntimeClient implements RuntimeClient {
             cwd?: string;
             developerInstructions?: string;
             baseInstructions?: string;
+            appServerConfig?: Record<string, unknown>;
         },
     ): CodexRuntimeSession {
         const session = new CodexRuntimeSession(this, sessionId, codexThreadId, opts);
@@ -626,16 +717,35 @@ export class CodexRuntimeClient implements RuntimeClient {
         const sessionDir = resolveSafeCodexSessionDir(this.opts.sessionStateDir, sessionId);
         const rolloutPath = findCodexRolloutPath(this.opts.codexHome, codexThreadId);
         if (!rolloutPath) return false;
+        // Read once, validate those exact bytes, and commit those same
+        // bytes. Codex appends to the rollout while a turn is live, so
+        // validating the path and then re-reading it would allow a torn
+        // append to race into the committed snapshot.
+        let contents: Buffer;
+        try {
+            contents = fs.readFileSync(rolloutPath);
+        } catch {
+            return false;
+        }
+        if (!isCompleteJsonlSnapshotContent(contents)) return false;
+
         fs.mkdirSync(sessionDir, { recursive: true });
         const dest = path.join(sessionDir, CODEX_ROLLOUT_SNAPSHOT_FILENAME);
+        // Atomic commit: write a unique same-directory temp (0600, `wx`
+        // so we never adopt a pre-existing file) and rename it over the
+        // destination. `rename(2)` within a directory is atomic, so a
+        // crash or ENOSPC mid-write can never leave a partially written
+        // rollout where the previous good one used to be.
+        const tempFile = path.join(
+            sessionDir,
+            `.${CODEX_ROLLOUT_SNAPSHOT_FILENAME}.tmp.${process.pid}.${Date.now()}.${markerWriteCounter++}`,
+        );
         try {
-            // Read the raw bytes rather than fs.copyFileSync because
-            // copyFileSync will happily traverse a symlink at the source
-            // (findCodexRolloutPath already rejected those, but this is a
-            // belt-and-braces safeguard so future refactors stay safe).
-            const contents = fs.readFileSync(rolloutPath);
-            fs.writeFileSync(dest, contents, { mode: 0o600 });
+            fs.writeFileSync(tempFile, contents, { mode: 0o600, flag: "wx" });
+            fs.chmodSync(tempFile, 0o600);
+            fs.renameSync(tempFile, dest);
         } catch {
+            try { fs.unlinkSync(tempFile); } catch {}
             return false;
         }
         this._persistThreadState(sessionId, codexThreadId, {
@@ -719,6 +829,16 @@ export interface CodexCreateSessionConfig {
     reasoningEffort?: string;
     /** Dynamic tool set declared at thread/start and refreshed each turn. */
     tools?: Tool<any>[];
+    /**
+     * Codex app-server thread config. Mapped to
+     * `ThreadStartParams.config` and `ThreadResumeParams.config`.
+     * Callers must ensure any values here are safe to persist to disk
+     * (Codex writes these into thread config / session metadata).
+     * PilotSwarm uses this to carry native MCP server configs
+     * (`{ mcp_servers: ... }`) that reference secrets by env-var name
+     * only.
+     */
+    config?: Record<string, unknown>;
     /** Anything else the caller wants passed through. */
     [key: string]: unknown;
 }
@@ -844,6 +964,8 @@ interface PerTurnState {
     aborted: boolean;
     terminal: boolean;
     respTurnId: string | null;
+    resolveAck: () => void;
+    rejectAck: (error: Error) => void;
 }
 
 /** @internal */
@@ -865,6 +987,12 @@ export class CodexRuntimeSession implements RuntimeSessionHandle {
     private defaultCwd: string | undefined;
     private defaultDeveloperInstructions: string | undefined;
     private defaultBaseInstructions: string | undefined;
+    /**
+     * App-server thread config (e.g. `{ mcp_servers: {...} }`) sent on
+     * thread/start and re-sent on every subsequent thread/resume so warm
+     * sessions and post-crash reconnects keep the same MCP wiring.
+     */
+    private defaultAppServerConfig: Record<string, unknown> | undefined;
     /** The in-flight send() invocation, if any. @internal */
     private _currentTurn: PerTurnState | null = null;
     /**
@@ -885,6 +1013,7 @@ export class CodexRuntimeSession implements RuntimeSessionHandle {
             cwd?: string;
             developerInstructions?: string;
             baseInstructions?: string;
+            appServerConfig?: Record<string, unknown>;
         },
     ) {
         this.client = client;
@@ -895,6 +1024,7 @@ export class CodexRuntimeSession implements RuntimeSessionHandle {
         this.defaultCwd = opts?.cwd;
         this.defaultDeveloperInstructions = opts?.developerInstructions;
         this.defaultBaseInstructions = opts?.baseInstructions;
+        this.defaultAppServerConfig = opts?.appServerConfig;
         this.attachedGeneration = client.generation;
     }
 
@@ -926,6 +1056,9 @@ export class CodexRuntimeSession implements RuntimeSessionHandle {
     }
 
     async send(params: { prompt: string; [key: string]: unknown }): Promise<void> {
+        if (this.client._isStopping()) {
+            throw new Error("Codex runtime stopped");
+        }
         // Codex.send() mirrors Copilot.send() semantics: resolve after the
         // runtime has accepted the prompt (turn/start ack), NOT after
         // turn/completed. ManagedSession.runTurn() does
@@ -942,27 +1075,56 @@ export class CodexRuntimeSession implements RuntimeSessionHandle {
             aborted: false,
             terminal: false,
             respTurnId: null,
+            resolveAck: () => {},
+            rejectAck: () => {},
         };
         this._currentTurn = perTurn;
 
         // `ack` resolves after turn/start returns; `rejectAck` propagates
         // request failures back to the caller instead of only becoming a
         // session.error event.
-        let ackResolve!: () => void;
-        let ackReject!: (err: Error) => void;
+        let ackSettled = false;
         const ack = new Promise<void>((resolve, reject) => {
-            ackResolve = resolve;
-            ackReject = reject;
+            perTurn.resolveAck = () => {
+                if (ackSettled) return;
+                ackSettled = true;
+                resolve();
+            };
+            perTurn.rejectAck = (error: Error) => {
+                if (ackSettled) return;
+                ackSettled = true;
+                reject(error);
+            };
         });
 
         const queued = this.client._enqueueTurn(async () => {
+            if (perTurn.aborted && perTurn.terminal) {
+                if (this._currentTurn === perTurn) this._currentTurn = null;
+                perTurn.resolveAck();
+                return;
+            }
+            // Open the new turn's lifecycle window BEFORE any early-exit
+            // path. `turnEndFired` is the per-turn duplicate-terminal
+            // suppressor; it is still `true` from the PREVIOUS turn's
+            // terminal event at this point. Leaving it set would make the
+            // abort short-circuit (and the reconnect-failure path) below
+            // treat this turn's first-and-only terminal as a duplicate,
+            // swallowing `session.idle` and hanging the caller's idle
+            // race. Within this turn the flag still flips back to `true`
+            // on the first terminal, so duplicate suppression is intact.
+            this.turnEndFired = false;
+            this.turnAccumulatedText = "";
+            this.turnTokenUsage = null;
+            this.latestMessagesByItem.clear();
+
             // If abort() ran before this lambda even started, do not
             // consume a Codex turn. Route through the terminal helper
             // so the queue release is bookkept the same way as every
             // other end-of-turn path.
             if (perTurn.aborted) {
                 this._markTurnTerminal({ emitEnd: false, emitIdle: true });
-                ackResolve();
+                if (this._currentTurn === perTurn) this._currentTurn = null;
+                perTurn.resolveAck();
                 return;
             }
 
@@ -977,20 +1139,16 @@ export class CodexRuntimeSession implements RuntimeSessionHandle {
                 const message = (err as Error).message || "codex reconnect failed";
                 this._emit({ type: "session.error", data: { message } });
                 this._markTurnTerminal({ emitEnd: false, emitIdle: true });
-                ackReject(err as Error);
+                perTurn.rejectAck(err as Error);
                 return;
             }
 
-            this.turnEndFired = false;
-            this.turnAccumulatedText = "";
-            this.turnTokenUsage = null;
-            this.latestMessagesByItem.clear();
             const transport = (this.client as any).transport as CodexTransport | null;
             if (!transport) {
                 const message = "Codex transport is not connected";
                 this._emit({ type: "session.error", data: { message } });
                 this._markTurnTerminal({ emitEnd: false, emitIdle: true });
-                ackReject(new Error(message));
+                perTurn.rejectAck(new Error(message));
                 return;
             }
 
@@ -1015,7 +1173,7 @@ export class CodexRuntimeSession implements RuntimeSessionHandle {
             } catch (err) {
                 this._emit({ type: "session.error", data: { message: (err as Error).message } });
                 this._markTurnTerminal({ emitEnd: false, emitIdle: true });
-                ackReject(err as Error);
+                perTurn.rejectAck(err as Error);
                 return;
             }
             // Latch the turn id from the response so abort() can build a
@@ -1043,7 +1201,7 @@ export class CodexRuntimeSession implements RuntimeSessionHandle {
             }
             // send() returns here — the caller can now start its own idle
             // race. The queue stays held below on `await completion`.
-            ackResolve();
+            perTurn.resolveAck();
             // Late abort: caller invoked abort() between the moment we
             // sent turn/start and the moment the response came back. Now
             // that we know the turn id we can interrupt. Use
@@ -1132,6 +1290,7 @@ export class CodexRuntimeSession implements RuntimeSessionHandle {
         if (this.defaultCwd) params.cwd = this.defaultCwd;
         if (this.defaultDeveloperInstructions) params.developerInstructions = this.defaultDeveloperInstructions;
         if (this.defaultBaseInstructions) params.baseInstructions = this.defaultBaseInstructions;
+        if (this.defaultAppServerConfig) params.config = this.defaultAppServerConfig;
         try {
             await transport.request("thread/resume", params);
         } catch (err) {
@@ -1156,15 +1315,23 @@ export class CodexRuntimeSession implements RuntimeSessionHandle {
     abort(): void {
         const perTurn = this._currentTurn;
         if (perTurn) perTurn.aborted = true;
+        if (perTurn?.terminal) return;
         const transport = (this.client as any).transport as CodexTransport | null;
-        if (!transport || !this.activeTurnId) return;
+        const turnId = this.activeTurnId ?? perTurn?.respTurnId;
+        if (!transport || !turnId) return;
         void transport.request("turn/interrupt", {
             threadId: this.codexThreadId,
-            turnId: this.activeTurnId,
+            turnId,
         }).catch(() => {});
     }
 
     async disconnect(): Promise<void> {
+        // Issue the remote interrupt before local settlement releases
+        // the shared turn queue. abort() is fire-and-forget, so close
+        // never waits indefinitely for the app-server response.
+        this.abort();
+        this._settleActiveTurnForClose(`Codex session ${this.sessionId} disconnected`);
+
         // A stale handle (one whose PilotSwarm sessionId was already
         // re-registered under a fresh handle) MUST NOT mutate the
         // per-session state directory. The exact-reference check runs
@@ -1438,6 +1605,51 @@ export class CodexRuntimeSession implements RuntimeSessionHandle {
         this._markTurnTerminal({ emitEnd: false, emitIdle: true });
     }
 
+    /**
+     * Settle the active/current turn because THIS session is being
+     * closed (disconnect / delete), as opposed to the whole runtime
+     * stopping.
+     *
+     * Must run BEFORE `thread/unsubscribe`, `_unregisterSession()` and
+     * `_teardown()`:
+     *   - `_teardown()` clears every listener, so an idle emitted after
+     *     it is invisible to the caller awaiting the turn.
+     *   - the queued `send()` lambda parks on `await completion`, which
+     *     holds the shared per-CODEX_HOME turn queue. Without an
+     *     explicit terminal here the queue is held forever and no other
+     *     session on the same client can ever start a turn.
+     *
+     * Idempotent: a second call after the turn already reached a
+     * terminal state is a no-op (no duplicate `session.idle`, no second
+     * queue release, no ack re-settle).
+     * @internal
+     */
+    _settleActiveTurnForClose(reason: string): void {
+        const perTurn = this._currentTurn;
+        if (!perTurn) return;
+        perTurn.aborted = true;
+        // No-op when the caller's send() already resolved on the
+        // turn/start ack; rejects a still-queued turn so the caller
+        // does not hang on a session that is going away.
+        perTurn.rejectAck(new Error(reason));
+        if (perTurn.terminal) return;
+        this._emit({ type: "session.error", data: { message: reason } });
+        this._markTurnTerminal({ emitEnd: false, emitIdle: true });
+    }
+
+    /** @internal */
+    _prepareForClientStop(error: Error): void {
+        if (!this._currentTurn) return;
+        this._currentTurn.aborted = true;
+        this._currentTurn.rejectAck(error);
+    }
+
+    /** @internal */
+    _settleForClientStop(): void {
+        if (!this._currentTurn || this._currentTurn.terminal) return;
+        this._handleTransportClosed();
+    }
+
     /** @internal */
     _teardown(): void {
         this.catchAll.clear();
@@ -1469,6 +1681,7 @@ export class SpawnedCodexAppServerTransport extends EventEmitter implements Code
     private pending = new Map<number | string, { resolve: (v: any) => void; reject: (e: Error) => void }>();
     private buf = "";
     private closed = false;
+    private closeEmitted = false;
     /**
      * Ring buffer of the most recent stderr lines from the child process.
      * Attached to pending-request rejections so operators can see why
@@ -1486,15 +1699,13 @@ export class SpawnedCodexAppServerTransport extends EventEmitter implements Code
         proc.stdout.setEncoding("utf-8");
         proc.stdout.on("data", (chunk: string) => this._onData(chunk));
         proc.stdout.on("close", () => this._handleClose());
+        proc.stdin.on("error", (err) => this._handleStreamError(err));
         if (proc.stderr) {
             proc.stderr.setEncoding?.("utf-8");
             proc.stderr.on("data", (chunk: string) => this._onStderr(chunk));
         }
         proc.on("exit", (code, signal) => this._handleExit(code, signal));
-        proc.on("error", (err) => {
-            for (const { reject } of this.pending.values()) reject(err);
-            this.pending.clear();
-        });
+        proc.on("error", (err) => this._finalizeClose(err));
     }
 
     request(method: string, params: unknown): Promise<any> {
@@ -1526,15 +1737,17 @@ export class SpawnedCodexAppServerTransport extends EventEmitter implements Code
     }
 
     async close(): Promise<void> {
-        if (this.closed) return;
-        this.closed = true;
+        if (this.closeEmitted) return;
+        this._finalizeClose(new Error("codex transport closed"));
         try { this.proc.stdin?.end(); } catch {}
         try { this.proc.kill("SIGTERM"); } catch {}
     }
 
     private _write(msg: unknown): void {
         try {
-            this.proc.stdin!.write(JSON.stringify(msg) + "\n");
+            this.proc.stdin!.write(JSON.stringify(msg) + "\n", (err) => {
+                if (err) this._handleStreamError(err);
+            });
         } catch {
             // The child exited between checks — treat as closed.
             this._handleClose();
@@ -1606,34 +1819,41 @@ export class SpawnedCodexAppServerTransport extends EventEmitter implements Code
     }
 
     private _handleExit(code: number | null, signal: NodeJS.Signals | null): void {
-        if (this.closed && this.pending.size === 0) {
-            this.emit("close");
-            return;
-        }
-        this.closed = true;
         const tail = this.stderrTail.slice(-8).join(" | ");
         const desc = signal
             ? `codex app-server exited via signal ${signal}`
             : `codex app-server exited with code ${code ?? "unknown"}`;
         const message = tail ? `${desc}: ${tail}` : desc;
-        for (const { reject } of this.pending.values()) {
-            reject(new Error(message));
-        }
-        this.pending.clear();
-        this.emit("close");
+        this._finalizeClose(new Error(message));
     }
 
     private _handleClose(): void {
-        if (this.closed) return;
-        this.closed = true;
         const tail = this.stderrTail.slice(-8).join(" | ");
         const message = tail
             ? `codex transport closed: ${tail}`
             : "codex transport closed";
+        this._finalizeClose(new Error(message));
+    }
+
+    private _handleStreamError(error: Error): void {
+        const message = error?.message
+            ? `codex app-server stdin error: ${error.message}`
+            : "codex app-server stdin error";
+        const wrapped = new Error(message);
+        if ((error as NodeJS.ErrnoException)?.code) {
+            (wrapped as NodeJS.ErrnoException).code = (error as NodeJS.ErrnoException).code;
+        }
+        this._finalizeClose(wrapped);
+    }
+
+    private _finalizeClose(error: Error): void {
+        this.closed = true;
         for (const { reject } of this.pending.values()) {
-            reject(new Error(message));
+            reject(error);
         }
         this.pending.clear();
+        if (this.closeEmitted) return;
+        this.closeEmitted = true;
         this.emit("close");
     }
 }

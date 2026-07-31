@@ -761,6 +761,7 @@ export function registerActivities(
                 agent_name?: string;
                 task?: string;
                 model?: string;
+                reasoning_effort?: string;
                 system_message?: string;
                 tool_names?: string[];
                 title?: string;
@@ -783,6 +784,9 @@ export function registerActivities(
                     let agentSystemMessage = args.system_message;
                     let agentToolNames = args.tool_names;
                     let agentModel = args.model;
+                    const agentReasoningEffort = typeof args.reasoning_effort === "string" && args.reasoning_effort.trim()
+                        ? args.reasoning_effort.trim()
+                        : undefined;
                     let agentIsSystem = false;
                     const explicitAgentTitle = typeof args.title === "string" && args.title.trim() ? args.title.trim() : undefined;
                     let agentTitle: string | undefined = explicitAgentTitle;
@@ -843,11 +847,16 @@ export function registerActivities(
                     const {
                         boundAgentName: _parentBoundAgentName,
                         promptLayering: _parentPromptLayering,
-                        ...parentConfig
+                        reasoningEffort: parentReasoningEffort,
+                        ...parentConfigWithoutEffort
                     } = input.config;
+                    const inheritsParentModel = !agentModel || agentModel === input.config.model;
+                    const effectiveChildReasoningEffort = agentReasoningEffort
+                        ?? (inheritsParentModel ? parentReasoningEffort : undefined);
                     const childConfig: SerializableSessionConfig = {
-                        ...parentConfig,
+                        ...parentConfigWithoutEffort,
                         ...(agentModel ? { model: agentModel } : {}),
+                        ...(effectiveChildReasoningEffort ? { reasoningEffort: effectiveChildReasoningEffort } : {}),
                         ...(agentSystemMessage ? { systemMessage: agentSystemMessage } : {}),
                         ...(boundAgentName ? { boundAgentName } : {}),
                         ...(promptLayeringKind ? { promptLayering: { kind: promptLayeringKind } } : {}),
@@ -895,6 +904,7 @@ export function registerActivities(
                         parentSessionId: input.sessionId,
                         nestingLevel: childNestingLevel,
                         model: childConfig.model,
+                        reasoningEffort: childConfig.reasoningEffort,
                         systemMessage: childConfig.systemMessage,
                         boundAgentName: childConfig.boundAgentName,
                         promptLayering: childConfig.promptLayering,

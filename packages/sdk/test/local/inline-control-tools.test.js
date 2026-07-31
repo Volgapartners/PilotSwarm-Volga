@@ -1,5 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { PilotSwarmClient } from "../../src/client.ts";
 import { ManagedSession } from "../../src/managed-session.ts";
+import { registerActivities } from "../../src/session-proxy.ts";
 
 class FakeCopilotSession {
     registeredTools = [];
@@ -64,6 +66,67 @@ class FakeCopilotSession {
     }
 }
 
+async function spawnThroughInlineBridge({ parentConfig, spawnArgs }) {
+    const handlers = {};
+    const runtime = {
+        registerActivity(name, handler) {
+            handlers[name] = handler;
+        },
+    };
+    const childSession = {
+        sessionId: "inline-child",
+        send: vi.fn(async () => {}),
+    };
+    const createSession = vi.spyOn(PilotSwarmClient.prototype, "createSession")
+        .mockResolvedValue(childSession);
+    vi.spyOn(PilotSwarmClient.prototype, "start").mockResolvedValue();
+    vi.spyOn(PilotSwarmClient.prototype, "stop").mockResolvedValue();
+    vi.spyOn(PilotSwarmClient.prototype, "listSessions").mockResolvedValue([]);
+
+    const session = {
+        abort: vi.fn(),
+        runTurn: vi.fn(async (_prompt, options) => {
+            const spawnResult = await options.controlToolBridge.spawnAgent(spawnArgs);
+            expect(spawnResult).toContain("Sub-agent spawned successfully");
+            return { type: "completed", content: "spawned", events: [] };
+        }),
+    };
+    const sessionManager = {
+        getOrCreate: vi.fn(async () => session),
+        getModelSummary: vi.fn(() => undefined),
+        getPromptGuardrails: vi.fn(() => ({ enabled: false })),
+        normalizeModelRef: vi.fn((model) => model),
+    };
+
+    registerActivities(
+        runtime,
+        sessionManager,
+        null,
+        undefined,
+        null,
+        undefined,
+        "postgres://unused",
+    );
+
+    const result = await handlers.runTurn(
+        { traceInfo: () => {}, isCancelled: () => false },
+        {
+            sessionId: "inline-parent",
+            prompt: "spawn a child",
+            config: parentConfig,
+            turnIndex: 0,
+        },
+    );
+
+    expect(result.type).toBe("completed");
+    expect(createSession).toHaveBeenCalledTimes(1);
+    return createSession.mock.calls[0][0];
+}
+
+afterEach(() => {
+    vi.restoreAllMocks();
+});
+
 describe("inline control tool execution", () => {
     it("keeps spawn_agent inline when a control bridge is provided", async () => {
         const fakeSession = new FakeCopilotSession();
@@ -121,6 +184,104 @@ describe("inline control tool execution", () => {
         }));
         expect(result.type).toBe("completed");
         expect(result.content).toBe("Spawned titled child.");
+    });
+
+    it("advertises model reasoning options through list_available_models", async () => {
+        const fakeSession = new FakeCopilotSession();
+        fakeSession.assistantContent = "checked models";
+
+        const managed = new ManagedSession("inline-list-models", fakeSession, {});
+        await managed.runTurn("list models", {
+            modelSummary: "Available models\n- github-copilot:gpt-5.5 [reasoning: medium, xhigh; default: medium]",
+        });
+
+        const listTool = fakeSession.registeredTools.find((tool) => tool.name === "list_available_models");
+        expect(listTool?.description).toContain("supported reasoning efforts");
+        const result = await listTool.handler({});
+        expect(result).toContain("github-copilot:gpt-5.5");
+        expect(result).toContain("reasoning: medium, xhigh; default: medium");
+    });
+
+    it("advertises and forwards an optional spawn_agent reasoning_effort", async () => {
+        const fakeSession = new FakeCopilotSession();
+        fakeSession.scriptedToolCalls = [
+            { name: "spawn_agent", args: { task: "reason deeply", model: "github-copilot:gpt-5.5", reasoning_effort: "xhigh" } },
+        ];
+        fakeSession.assistantContent = "Spawned reasoning child.";
+
+        const controlToolBridge = {
+            spawnAgent: vi.fn(async () => "[SYSTEM: spawned]"),
+            messageAgent: vi.fn(),
+            checkAgents: vi.fn(),
+            resolveWaitForAgents: vi.fn(),
+            listSessions: vi.fn(),
+            completeAgent: vi.fn(),
+            cancelAgent: vi.fn(),
+            deleteAgent: vi.fn(),
+        };
+
+        const managed = new ManagedSession("inline-spawn-reasoning", fakeSession, {});
+        const result = await managed.runTurn("spawn a high reasoning child", { controlToolBridge });
+
+        const spawnTool = fakeSession.registeredTools.find((tool) => tool.name === "spawn_agent");
+        expect(spawnTool?.parameters?.properties?.reasoning_effort?.enum).toEqual(
+            expect.arrayContaining(["low", "medium", "high", "xhigh", "max", "ultra"]),
+        );
+        expect(controlToolBridge.spawnAgent).toHaveBeenCalledWith(expect.objectContaining({
+            task: "reason deeply",
+            model: "github-copilot:gpt-5.5",
+            reasoning_effort: "xhigh",
+        }));
+        expect(result.type).toBe("completed");
+        expect(result.content).toBe("Spawned reasoning child.");
+    });
+
+    it("drops the parent reasoning effort when inline spawn_agent overrides the model", async () => {
+        const childConfig = await spawnThroughInlineBridge({
+            parentConfig: {
+                model: "codex-subscription:gpt-5.6-sol",
+                reasoningEffort: "ultra",
+            },
+            spawnArgs: {
+                task: "Use the child model",
+                model: "github-copilot:gpt-5.5",
+            },
+        });
+
+        expect(childConfig.model).toBe("github-copilot:gpt-5.5");
+        expect(childConfig.reasoningEffort).toBeUndefined();
+    });
+
+    it("inherits the parent reasoning effort when inline spawn_agent keeps the same model", async () => {
+        const childConfig = await spawnThroughInlineBridge({
+            parentConfig: {
+                model: "codex-subscription:gpt-5.6-sol",
+                reasoningEffort: "ultra",
+            },
+            spawnArgs: {
+                task: "Use the parent model",
+            },
+        });
+
+        expect(childConfig.model).toBe("codex-subscription:gpt-5.6-sol");
+        expect(childConfig.reasoningEffort).toBe("ultra");
+    });
+
+    it("keeps an explicit inline spawn_agent effort when overriding the model", async () => {
+        const childConfig = await spawnThroughInlineBridge({
+            parentConfig: {
+                model: "codex-subscription:gpt-5.6-sol",
+                reasoningEffort: "ultra",
+            },
+            spawnArgs: {
+                task: "Use an explicit child effort",
+                model: "github-copilot:gpt-5.5",
+                reasoning_effort: "xhigh",
+            },
+        });
+
+        expect(childConfig.model).toBe("github-copilot:gpt-5.5");
+        expect(childConfig.reasoningEffort).toBe("xhigh");
     });
 
     it("still suspends the turn for wait_for_agents", async () => {

@@ -173,6 +173,10 @@ export interface ModelSummary {
     modelName: string;
     description?: string;
     cost?: string;
+    /** Reasoning-effort values this model accepts, if it exposes any. */
+    supportedReasoningEfforts?: string[];
+    /** Reasoning effort applied when the caller does not pick one. */
+    defaultReasoningEffort?: string;
 }
 
 /** Credential availability for a configured model provider. */
@@ -1214,6 +1218,8 @@ export class PilotSwarmManagementClient {
             modelName: m.modelName,
             description: m.description,
             cost: m.cost,
+            supportedReasoningEfforts: m.supportedReasoningEfforts,
+            defaultReasoningEffort: m.defaultReasoningEffort,
         }));
     }
 
@@ -1232,6 +1238,8 @@ export class PilotSwarmManagementClient {
                 modelName: m.modelName,
                 description: m.description,
                 cost: m.cost,
+                supportedReasoningEfforts: m.supportedReasoningEfforts,
+                defaultReasoningEffort: m.defaultReasoningEffort,
             })),
         }));
     }

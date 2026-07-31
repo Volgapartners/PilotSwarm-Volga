@@ -1,0 +1,2 @@
+#!/bin/bash
+printf 'npx|%s|%s\n' "$PWD" "$*" >> "$RUN_TESTS_CONTRACT_LOG"

@@ -67,14 +67,14 @@ describe("orchestration warm resume durability", () => {
         const third = gen.next(undefined);
         expect(third.value).toMatchObject({
             effect: "continueAsNew",
-            version: "1.0.43",
+            version: "1.0.44",
         });
         expect(third.value.input.prompt).toContain("Sub-agent spawned successfully");
         expect(third.value.input.sourceOrchestrationVersion).toBe("1.0.30");
         expect(calls).toEqual([
             "spawnChildSession",
             "checkpoint",
-            "continueAsNew:1.0.43",
+            "continueAsNew:1.0.44",
         ]);
 
         const done = gen.next();
@@ -97,7 +97,7 @@ describe("orchestration warm resume durability", () => {
             }),
         };
 
-        const { durableSessionOrchestration_1_0_43 } = await import("../../src/orchestration.ts");
+        const { durableSessionOrchestration_1_0_44 } = await import("../../src/orchestration.ts");
         const { commandResponseKey } = await import("../../src/types.ts");
 
         const ctx = {
@@ -114,7 +114,7 @@ describe("orchestration warm resume durability", () => {
             newGuid: () => ({ effect: "newGuid" }),
         };
 
-        const gen = durableSessionOrchestration_1_0_43(ctx, {
+        const gen = durableSessionOrchestration_1_0_44(ctx, {
             sessionId: "upgrade-session",
             config: { model: "github-copilot:gpt-5.4" },
             sourceOrchestrationVersion: "1.0.30",

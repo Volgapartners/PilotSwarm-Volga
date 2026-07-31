@@ -140,6 +140,7 @@ export class PilotSwarmClient {
         if (config) {
             const fullConfig: ManagedSessionConfig = {
                 model: config.model,
+                reasoningEffort: config.reasoningEffort,
                 systemMessage: config.systemMessage,
                 boundAgentName: config.boundAgentName,
                 promptLayering: config.promptLayering,
@@ -185,6 +186,8 @@ export class PilotSwarmClient {
      */
     async createSessionForAgent(agentName: string, opts?: {
         model?: string;
+        /** Reasoning-effort hint forwarded to models that support it (e.g. Codex). */
+        reasoningEffort?: string;
         onUserInputRequest?: UserInputHandler;
         toolNames?: string[];
         title?: string;
@@ -201,6 +204,7 @@ export class PilotSwarmClient {
 
         const session = await this.createSession({
             model: opts?.model,
+            reasoningEffort: opts?.reasoningEffort,
             toolNames: opts?.toolNames,
             onUserInputRequest: opts?.onUserInputRequest,
             agentId: agentName,
@@ -451,6 +455,7 @@ export class PilotSwarmClient {
 
         const serializableConfig: SerializableSessionConfig = {
             model: fullConfig?.model,
+            reasoningEffort: fullConfig?.reasoningEffort,
             systemMessage: fullConfig?.systemMessage,
             workingDirectory: fullConfig?.workingDirectory,
             waitThreshold: fullConfig?.waitThreshold ?? this.config.waitThreshold,

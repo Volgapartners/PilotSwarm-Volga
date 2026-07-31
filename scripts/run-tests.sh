@@ -14,6 +14,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+REPO_ROOT="$PWD"
 
 SDK_DIR="packages/sdk"
 ENV_FILE=".env"

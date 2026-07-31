@@ -13,7 +13,7 @@
  * Run: npx vitest run test/local/codex-thread-persistence.test.js
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -91,5 +91,56 @@ describe("Codex thread persistence", () => {
         ).rejects.toThrow(/no persisted threadId/);
 
         await client.stop();
+    });
+
+    it("reports only a valid regular marker as usable and writes it with mode 0600", async () => {
+        const { codexHome, sessionStateDir } = mkHomes();
+        const client = new CodexRuntimeClient({
+            codexHome,
+            sessionStateDir,
+            transportFactory: () => createFakeCodexTransport({ thread: { id: "unused" } }),
+        });
+        const sid = "ps-persist-usable";
+        const sessionDir = path.join(sessionStateDir, sid);
+        const stateFile = path.join(sessionDir, CODEX_THREAD_STATE_FILENAME);
+
+        client._persistThreadState(sid, "codex-thread-usable");
+
+        expect(client.hasUsableThreadState(sid)).toBe(true);
+        expect(fs.statSync(stateFile).mode & 0o777).toBe(0o600);
+        expect(fs.readdirSync(sessionDir).filter((name) => name.includes(".tmp."))).toEqual([]);
+
+        fs.writeFileSync(stateFile, '{"codexThreadId":');
+        expect(client.hasUsableThreadState(sid)).toBe(false);
+    });
+
+    it("keeps the previous marker and removes the temp file when atomic rename fails", async () => {
+        const { codexHome, sessionStateDir } = mkHomes();
+        const client = new CodexRuntimeClient({
+            codexHome,
+            sessionStateDir,
+            transportFactory: () => createFakeCodexTransport({ thread: { id: "unused" } }),
+        });
+        const sid = "ps-persist-atomic-failure";
+        const sessionDir = path.join(sessionStateDir, sid);
+        const stateFile = path.join(sessionDir, CODEX_THREAD_STATE_FILENAME);
+        client._persistThreadState(sid, "codex-thread-before");
+        const before = fs.readFileSync(stateFile, "utf-8");
+        const renameSync = fs.renameSync.bind(fs);
+        const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+            if (to === stateFile) throw new Error("injected marker rename failure");
+            return renameSync(from, to);
+        });
+
+        try {
+            expect(() => {
+                client._persistThreadState(sid, "codex-thread-after");
+            }).toThrow(/injected marker rename failure/);
+        } finally {
+            renameSpy.mockRestore();
+        }
+
+        expect(fs.readFileSync(stateFile, "utf-8")).toBe(before);
+        expect(fs.readdirSync(sessionDir).filter((name) => name.includes(".tmp."))).toEqual([]);
     });
 });

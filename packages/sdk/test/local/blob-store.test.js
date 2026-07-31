@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { SessionBlobStore } from "../../src/blob-store.ts";
 
@@ -15,6 +16,49 @@ function makeConnectionString() {
 }
 
 describe("SessionBlobStore", () => {
+    it("downloads hydration archives to a unique local directory and atomically replaces stale state", async () => {
+        const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pilotswarm-blob-hydrate-"));
+        const sessionStateDir = path.join(baseDir, "session-state");
+        const archiveSource = path.join(baseDir, "archive-source");
+        const sessionId = "blob-hydrate-safe";
+        const sourceSessionDir = path.join(archiveSource, sessionId);
+        const liveSessionDir = path.join(sessionStateDir, sessionId);
+        const archivePath = path.join(baseDir, `${sessionId}.tar.gz`);
+        fs.mkdirSync(sourceSessionDir, { recursive: true });
+        fs.writeFileSync(
+            path.join(sourceSessionDir, "codex-thread.json"),
+            JSON.stringify({ codexThreadId: "blob-thread-restored" }),
+        );
+        execFileSync("tar", ["-czf", archivePath, "-C", archiveSource, sessionId]);
+        fs.mkdirSync(liveSessionDir, { recursive: true });
+        fs.writeFileSync(path.join(liveSessionDir, "old-state"), "OLD-KEEP-UNTIL-COMMIT");
+
+        const store = new SessionBlobStore(makeConnectionString(), "test-container", sessionStateDir);
+        let downloadedTo;
+        store.containerClient = {
+            getBlockBlobClient() {
+                return {
+                    async downloadToFile(destination) {
+                        downloadedTo = destination;
+                        fs.copyFileSync(archivePath, destination);
+                    },
+                };
+            },
+        };
+
+        try {
+            await store.hydrate(sessionId);
+
+            expect(downloadedTo.startsWith(`${sessionStateDir}${path.sep}`)).toBe(true);
+            expect(fs.existsSync(path.join(liveSessionDir, "old-state"))).toBe(false);
+            expect(JSON.parse(fs.readFileSync(path.join(liveSessionDir, "codex-thread.json"), "utf-8")))
+                .toEqual({ codexThreadId: "blob-thread-restored" });
+            expect(fs.readdirSync(sessionStateDir).filter((name) => name.startsWith(".hydrate-"))).toEqual([]);
+        } finally {
+            fs.rmSync(baseDir, { recursive: true, force: true });
+        }
+    });
+
     it("waits for the current session snapshot layout before archiving on dehydrate", async () => {
         const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pilotswarm-blob-store-"));
         const sessionStateDir = path.join(baseDir, "session-state");
@@ -112,6 +156,186 @@ describe("SessionBlobStore", () => {
         } finally {
             fs.rmSync(baseDir, { recursive: true, force: true });
         }
+    });
+
+    // ─── checkpoint snapshot-readiness gate ──────────────────────────
+
+    describe("checkpoint gates on snapshot readiness before archiving", () => {
+        // Regression: `dehydrate()` runs `waitForSessionSnapshot()` before
+        // it archives + uploads, but `checkpoint()` only checked that the
+        // session directory existed. A half-written or corrupt Codex
+        // marker (`codex-thread.json` with invalid JSON / empty
+        // `codexThreadId`) or a bad `rolloutSnapshotRelPath` (missing,
+        // symlinked, or escaping the session dir) therefore produced a
+        // tarball that OVERWROTE the last known-good `<id>.tar.gz` blob,
+        // destroying the only recoverable snapshot.
+        function mkStore(sessionStateDir) {
+            const store = new SessionBlobStore(makeConnectionString(), "test-container", sessionStateDir);
+            const uploads = [];
+            const metadataWrites = [];
+            store.containerClient = {
+                getBlockBlobClient(name) {
+                    return {
+                        async uploadFile(filePath) {
+                            uploads.push({ name, filePath });
+                        },
+                        async upload(body) {
+                            metadataWrites.push({ name, body: String(body) });
+                        },
+                        async deleteIfExists() { return { succeeded: true }; },
+                        async exists() { return true; },
+                        async downloadToFile() {
+                            throw new Error("downloadToFile should not be called in this test");
+                        },
+                        url: `https://example.test/${name}`,
+                    };
+                },
+                async *listBlobsFlat() {},
+            };
+            return { store, uploads, metadataWrites };
+        }
+
+        function seedCodexSession(sessionStateDir, sessionId, marker) {
+            const sessionDir = path.join(sessionStateDir, sessionId);
+            fs.mkdirSync(sessionDir, { recursive: true });
+            fs.writeFileSync(
+                path.join(sessionDir, "codex-thread.json"),
+                typeof marker === "string" ? marker : JSON.stringify(marker),
+                "utf-8",
+            );
+            return sessionDir;
+        }
+
+        it("uploads on checkpoint when the Codex marker is valid", async () => {
+            const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pilotswarm-ckpt-ok-"));
+            const sessionStateDir = path.join(baseDir, "session-state");
+            const sessionId = "ckpt-valid";
+            const sessionDir = seedCodexSession(sessionStateDir, sessionId, {
+                codexThreadId: "codex-thread-abc",
+                codexHome: "/nonexistent",
+            });
+            fs.writeFileSync(path.join(sessionDir, "rollout.jsonl"), "{}\n", "utf-8");
+
+            const { store, uploads, metadataWrites } = mkStore(sessionStateDir);
+            try {
+                await store.checkpoint(sessionId);
+
+                expect(uploads.map((u) => u.name)).toEqual([`${sessionId}.tar.gz`]);
+                expect(metadataWrites.map((m) => m.name)).toEqual([`${sessionId}.meta.json`]);
+                expect(JSON.parse(metadataWrites[0].body).reason).toBe("checkpoint");
+                // Local files stay in place — checkpoint keeps the session warm.
+                expect(fs.existsSync(sessionDir)).toBe(true);
+            } finally {
+                fs.rmSync(baseDir, { recursive: true, force: true });
+            }
+        }, 20_000);
+
+        it("uploads on checkpoint when a valid rollout snapshot is referenced", async () => {
+            const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pilotswarm-ckpt-rollout-ok-"));
+            const sessionStateDir = path.join(baseDir, "session-state");
+            const sessionId = "ckpt-rollout-valid";
+            const sessionDir = seedCodexSession(sessionStateDir, sessionId, {
+                codexThreadId: "codex-thread-abc",
+                rolloutSnapshotRelPath: "rollout/rollout.jsonl",
+            });
+            fs.mkdirSync(path.join(sessionDir, "rollout"), { recursive: true });
+            fs.writeFileSync(path.join(sessionDir, "rollout", "rollout.jsonl"), "{}\n", "utf-8");
+
+            const { store, uploads } = mkStore(sessionStateDir);
+            try {
+                await store.checkpoint(sessionId);
+                expect(uploads.map((u) => u.name)).toEqual([`${sessionId}.tar.gz`]);
+            } finally {
+                fs.rmSync(baseDir, { recursive: true, force: true });
+            }
+        }, 20_000);
+
+        const CORRUPT_CASES = [
+            {
+                name: "codex-thread.json is not valid JSON",
+                seed: (sessionStateDir, sessionId) => {
+                    seedCodexSession(sessionStateDir, sessionId, "{ not json");
+                },
+            },
+            {
+                name: "codex-thread.json has an empty codexThreadId",
+                seed: (sessionStateDir, sessionId) => {
+                    seedCodexSession(sessionStateDir, sessionId, { codexThreadId: "   " });
+                },
+            },
+            {
+                name: "rolloutSnapshotRelPath points at a missing file",
+                seed: (sessionStateDir, sessionId) => {
+                    seedCodexSession(sessionStateDir, sessionId, {
+                        codexThreadId: "codex-thread-abc",
+                        rolloutSnapshotRelPath: "rollout/rollout.jsonl",
+                    });
+                },
+            },
+            {
+                name: "rolloutSnapshotRelPath is a symlink",
+                seed: (sessionStateDir, sessionId) => {
+                    const sessionDir = seedCodexSession(sessionStateDir, sessionId, {
+                        codexThreadId: "codex-thread-abc",
+                        rolloutSnapshotRelPath: "rollout.jsonl",
+                    });
+                    const realTarget = path.join(sessionDir, "real-rollout.jsonl");
+                    fs.writeFileSync(realTarget, "{}\n", "utf-8");
+                    fs.symlinkSync(realTarget, path.join(sessionDir, "rollout.jsonl"));
+                },
+            },
+            {
+                name: "rolloutSnapshotRelPath escapes the session directory",
+                seed: (sessionStateDir, sessionId) => {
+                    seedCodexSession(sessionStateDir, sessionId, {
+                        codexThreadId: "codex-thread-abc",
+                        rolloutSnapshotRelPath: "../victim/rollout.jsonl",
+                    });
+                    const victimDir = path.join(sessionStateDir, "victim");
+                    fs.mkdirSync(victimDir, { recursive: true });
+                    fs.writeFileSync(path.join(victimDir, "rollout.jsonl"), "{}\n", "utf-8");
+                },
+            },
+        ];
+
+        for (const testCase of CORRUPT_CASES) {
+            it(`preserves the previous good blob when ${testCase.name}`, async () => {
+                const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pilotswarm-ckpt-bad-"));
+                const sessionStateDir = path.join(baseDir, "session-state");
+                const sessionId = "ckpt-corrupt";
+                testCase.seed(sessionStateDir, sessionId);
+
+                const { store, uploads, metadataWrites } = mkStore(sessionStateDir);
+                try {
+                    await store.checkpoint(sessionId);
+
+                    // No archive was uploaded, so the last known-good blob
+                    // (and its metadata) survives untouched.
+                    expect(uploads).toEqual([]);
+                    expect(metadataWrites).toEqual([]);
+                    expect(store.snapshotSizeBySession.size).toBe(0);
+                    // Local state is never removed by checkpoint.
+                    expect(fs.existsSync(path.join(sessionStateDir, sessionId))).toBe(true);
+                } finally {
+                    fs.rmSync(baseDir, { recursive: true, force: true });
+                }
+            }, 30_000);
+        }
+
+        it("still skips without touching blob storage when the session dir is missing", async () => {
+            const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pilotswarm-ckpt-missing-"));
+            const sessionStateDir = path.join(baseDir, "session-state");
+            fs.mkdirSync(sessionStateDir, { recursive: true });
+
+            const { store, uploads, metadataWrites } = mkStore(sessionStateDir);
+            try {
+                await store.checkpoint("ckpt-absent");
+                expect(uploads).toEqual([]);
+                expect(metadataWrites).toEqual([]);
+            } finally {
+                fs.rmSync(baseDir, { recursive: true, force: true });
+            }
+        });
     });
 
     // ─── R5: shared session-id validation across every public method ──

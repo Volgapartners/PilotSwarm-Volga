@@ -10,6 +10,14 @@ set -a; source .env; set +a
 
 Exit code `3` means an infrastructure failure.
 
+The v0 managed live runner has no model/provider selector. It uses the
+configured PilotSwarm default but still requires and passes `GITHUB_TOKEN`;
+bundled runs are validated on GitHub/Copilot. If the default points at Codex,
+do not interpret a run as supported Codex eval coverage. Restore the tested
+GitHub-backed default for eval-harness runs and use the
+[Codex Runtime validation guide](../../../docs/codex-runtime.md#validation)
+for Codex.
+
 ## Unknown tool
 
 `Scenario <id> references unknown tool "<name>"`

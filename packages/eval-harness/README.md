@@ -8,9 +8,12 @@ capture CMS/tool evidence, exercise durable waits, restart a worker during a
 timer, cover multi-turn memory, run safety probes, and invoke explicit LLM
 judge checks.
 
+v0 is a private workspace package and is not published to the npm registry.
+Run it from a PilotSwarm source checkout.
+
 ## Run It
 
-From the repo root:
+From the PilotSwarm repo root:
 
 ```bash
 npm install
@@ -21,6 +24,18 @@ packages/eval-harness/bin/run-eval.sh --run=live-smoke
 
 Live runs require `GITHUB_TOKEN`, `DATABASE_URL`, and a reachable PostgreSQL
 instance.
+
+### v0 Runtime Target
+
+The managed live runner does not expose a model/provider selector. It creates
+sessions without a `model`, so PilotSwarm uses its configured default, while
+the v0 runner still requires and passes the existing `GITHUB_TOKEN` path. The
+bundled live runs are validated on that GitHub/Copilot path.
+
+Codex is not yet a configurable eval target. Do not treat a Codex catalog entry
+or default as supported eval-harness coverage. Use the focused
+[Codex Runtime validation guide](../../docs/codex-runtime.md#validation) for
+Codex adapter and full-orchestration checks.
 
 ## Bundled Runs
 

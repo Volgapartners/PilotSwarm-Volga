@@ -10,7 +10,7 @@ import {
 import { PgSessionCatalogProvider } from "./cms.js";
 import type { SessionCatalogProvider } from "./cms.js";
 import { loadAgentFiles, systemAgentUUID, systemChildAgentUUID } from "./agent-loader.js";
-import { loadMcpConfig } from "./mcp-loader.js";
+import { loadMcpConfig, loadCodexMcpConfig, translateMcpConfigForCodex } from "./mcp-loader.js";
 import { loadModelProviders, type ModelProviderRegistry } from "./model-providers.js";
 import { createArtifactTools } from "./artifact-tools.js";
 import { createFactStoreForUrl, type FactStore } from "./facts-store.js";
@@ -110,6 +110,13 @@ export class PilotSwarmWorker {
     private _loadedAgents: Array<{ name: string; description?: string; prompt: string; tools?: string[] | null; namespace?: string }> = [];
     /** Loaded MCP server configs from plugins + direct config. */
     private _loadedMcpServers: Record<string, any> = {};
+    /**
+     * Loaded Codex-native MCP server configs (safe translation — env-var
+     * NAMES only, never resolved secret values). Passed to Codex via
+     * `SessionManager.workerDefaults.codexMcpServers` and never handed
+     * to the Copilot SDK.
+     */
+    private _loadedCodexMcpServers: Record<string, any> = {};
     /** Model provider registry — multi-provider LLM config. */
     private _modelProviders: ModelProviderRegistry | null = null;
     /** Embedded PilotSwarm framework prompt. */
@@ -173,6 +180,7 @@ export class PilotSwarmWorker {
                 skillDirectories: this._loadedSkillDirs,
                 customAgents: this._loadedAgents,
                 mcpServers: this._loadedMcpServers,
+                codexMcpServers: this._loadedCodexMcpServers,
                 provider: options.provider,
                 modelProviders: this._modelProviders ?? undefined,
                 turnTimeoutMs: options.turnTimeoutMs,
@@ -559,6 +567,12 @@ export class PilotSwarmWorker {
         }
         if (this.config.mcpServers) {
             Object.assign(this._loadedMcpServers, this.config.mcpServers);
+            // Attempt to translate the same inline entries into safe
+            // Codex-native config. Entries that cannot be translated
+            // without embedding a resolved secret are dropped with a
+            // warning by translateMcpConfigForCodex().
+            const inlineCodex = translateMcpConfigForCodex(this.config.mcpServers as Record<string, any>);
+            Object.assign(this._loadedCodexMcpServers, inlineCodex);
         }
         this._appDefaultPrompt = mergePromptSections([
             this._appDefaultPrompt,
@@ -645,6 +659,8 @@ export class PilotSwarmWorker {
         // MCP
         const mcpConfig = loadMcpConfig(absDir);
         Object.assign(this._loadedMcpServers, mcpConfig);
+        const codexMcpConfig = loadCodexMcpConfig(absDir);
+        Object.assign(this._loadedCodexMcpServers, codexMcpConfig);
 
         // Session policy — last one wins
         const policyPath = path.join(absDir, "session-policy.json");

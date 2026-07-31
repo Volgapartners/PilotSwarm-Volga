@@ -151,6 +151,30 @@ function archiveSessionDirAtomic(sessionStateDir: string, sessionId: string, tar
     }
 }
 
+/**
+ * Create a private, per-operation scratch directory for archive work.
+ *
+ * Session archives must never be staged at a predictable path such as
+ * `os.tmpdir()/<sessionId>.tar.gz`: on a shared host that is a classic
+ * symlink-swap / pre-creation target, and two concurrent operations on
+ * the same session (a periodic checkpoint racing a dehydrate) would
+ * clobber each other's staging file.
+ *
+ * The directory is created with `mkdtemp` (unique, unguessable suffix)
+ * under the PilotSwarm-owned session-state root — the same privacy
+ * domain the session data already lives in — and is chmod'ed to 0700 so
+ * no other local user can read the staged archive. Callers MUST remove
+ * it recursively when done.
+ */
+function createSessionWorkDir(root: string, prefix: string): string {
+    fs.mkdirSync(root, { recursive: true });
+    const dir = fs.mkdtempSync(path.join(root, prefix));
+    // mkdtemp is 0700 per POSIX, but be explicit: a permissive umask or
+    // a non-POSIX filesystem must not widen the staging directory.
+    try { fs.chmodSync(dir, 0o700); } catch {}
+    return dir;
+}
+
 function writeMetadataAtomic(metaPath: string, metadata: SessionMetadata): void {
     const tmp = `${metaPath}.tmp.${process.pid}.${Date.now()}`;
     try {
@@ -162,15 +186,153 @@ function writeMetadataAtomic(metaPath: string, metadata: SessionMetadata): void 
     }
 }
 
-function extractSessionArchive(sessionStateDir: string, tarPath: string): void {
-    fs.mkdirSync(sessionStateDir, { recursive: true });
-    // Argv-based execution — no shell — so any paths with spaces or
-    // shell metacharacters extract correctly and safely.
-    execFileSync(
+function archiveListingLines(tarPath: string, verbose: boolean): string[] {
+    const output = execFileSync(
         "tar",
-        ["xzf", tarPath, "-C", sessionStateDir],
-        { stdio: ["ignore", "ignore", "pipe"] },
+        [verbose ? "-tvzf" : "-tzf", tarPath],
+        {
+            encoding: "utf-8",
+            stdio: ["ignore", "pipe", "pipe"],
+            maxBuffer: 64 * 1024 * 1024,
+        },
     );
+    return output.split(/\r?\n/).filter((line) => line.length > 0);
+}
+
+function preflightSessionArchive(tarPath: string, expectedSessionId: string): void {
+    const names = archiveListingLines(tarPath, false);
+    const verbose = archiveListingLines(tarPath, true);
+    if (names.length === 0) {
+        throw new Error(`Session archive is empty: ${tarPath}`);
+    }
+    if (verbose.length !== names.length) {
+        throw new Error(`Session archive listing mismatch: ${tarPath}`);
+    }
+
+    const seen = new Set<string>();
+    for (let index = 0; index < names.length; index += 1) {
+        const rawName = names[index];
+        const type = verbose[index]?.[0];
+        if (type === "l" || type === "h") {
+            throw new Error(`Session archive contains a link entry: ${rawName}`);
+        }
+        if (type !== "-" && type !== "d") {
+            throw new Error(`Session archive contains unsupported entry type "${type ?? "unknown"}": ${rawName}`);
+        }
+        if (/[\0\r\n]/.test(rawName)) {
+            throw new Error("Session archive contains a control character in an entry name");
+        }
+        if (
+            path.posix.isAbsolute(rawName)
+            || path.win32.isAbsolute(rawName)
+            || rawName.startsWith("/")
+            || rawName.startsWith("\\")
+            || rawName.includes("\\")
+        ) {
+            throw new Error(`Session archive contains an absolute or platform-ambiguous entry: ${rawName}`);
+        }
+
+        const withoutTrailingSlash = rawName.endsWith("/") ? rawName.slice(0, -1) : rawName;
+        const segments = withoutTrailingSlash.split("/");
+        if (
+            !withoutTrailingSlash
+            || segments.some((segment) => segment === "" || segment === "." || segment === "..")
+        ) {
+            throw new Error(`Session archive contains a traversal entry: ${rawName}`);
+        }
+        if (segments[0] !== expectedSessionId) {
+            throw new Error(
+                `Session archive top-level root must be exactly "${expectedSessionId}" (got "${segments[0]}")`,
+            );
+        }
+        if (seen.has(rawName)) {
+            throw new Error(`Session archive contains a duplicate entry: ${rawName}`);
+        }
+        seen.add(rawName);
+    }
+}
+
+function validateExtractedSessionTree(sessionDir: string): void {
+    const stack = [sessionDir];
+    while (stack.length > 0) {
+        const current = stack.pop()!;
+        for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+            const entryPath = path.join(current, entry.name);
+            const stat = fs.lstatSync(entryPath);
+            if (stat.isSymbolicLink()) {
+                throw new Error(`Extracted session archive contains a symbolic link: ${entryPath}`);
+            }
+            if (stat.isDirectory()) {
+                stack.push(entryPath);
+                continue;
+            }
+            if (!stat.isFile()) {
+                throw new Error(`Extracted session archive contains a non-regular file: ${entryPath}`);
+            }
+            if (stat.nlink > 1) {
+                throw new Error(`Extracted session archive contains a hard-linked file: ${entryPath}`);
+            }
+        }
+    }
+}
+
+function extractSessionArchive(
+    sessionStateDir: string,
+    expectedSessionId: string,
+    tarPath: string,
+): void {
+    const targetSessionDir = resolveContainedSessionDir(sessionStateDir, expectedSessionId);
+    preflightSessionArchive(tarPath, expectedSessionId);
+    fs.mkdirSync(sessionStateDir, { recursive: true });
+
+    const stagingRoot = fs.mkdtempSync(path.join(sessionStateDir, ".hydrate-stage-"));
+    const stagedSessionDir = path.join(stagingRoot, expectedSessionId);
+    const backupSessionDir = `${stagingRoot}.backup`;
+    let movedExisting = false;
+    let installed = false;
+    try {
+        execFileSync(
+            "tar",
+            ["xzf", tarPath, "-C", stagingRoot],
+            { stdio: ["ignore", "ignore", "pipe"] },
+        );
+
+        const topLevel = fs.readdirSync(stagingRoot);
+        if (topLevel.length !== 1 || topLevel[0] !== expectedSessionId) {
+            throw new Error(
+                `Session archive extracted an unexpected top-level layout: ${topLevel.join(", ") || "<empty>"}`,
+            );
+        }
+        const rootStat = fs.lstatSync(stagedSessionDir);
+        if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+            throw new Error(`Session archive root is not a regular directory: ${expectedSessionId}`);
+        }
+        validateExtractedSessionTree(stagedSessionDir);
+
+        if (fs.existsSync(targetSessionDir)) {
+            fs.renameSync(targetSessionDir, backupSessionDir);
+            movedExisting = true;
+        }
+        try {
+            fs.renameSync(stagedSessionDir, targetSessionDir);
+            installed = true;
+        } catch (error) {
+            if (movedExisting && !fs.existsSync(targetSessionDir) && fs.existsSync(backupSessionDir)) {
+                fs.renameSync(backupSessionDir, targetSessionDir);
+                movedExisting = false;
+            }
+            throw error;
+        }
+        if (movedExisting) {
+            fs.rmSync(backupSessionDir, { recursive: true, force: true });
+            movedExisting = false;
+        }
+    } finally {
+        fs.rmSync(stagingRoot, { recursive: true, force: true });
+        if (installed && movedExisting) {
+            fs.rmSync(backupSessionDir, { recursive: true, force: true });
+        }
+    }
 }
 
 async function waitForPath(pathToCheck: string, timeoutMs = 5_000, pollMs = 100): Promise<boolean> {
@@ -219,6 +381,62 @@ function collectSessionSnapshotEntries(sessionDir: string): string[] {
 
 const CURRENT_LAYOUT_SIGNAL_FILES = new Set<string>(["workspace.yaml"]);
 const CURRENT_LAYOUT_SIGNAL_DIRS = new Set<string>(["checkpoints", "files", "research"]);
+
+/**
+ * Do these exact bytes contain a complete, non-empty JSONL snapshot?
+ *
+ * A Codex rollout is append-only JSONL. A torn write (crash, ENOSPC,
+ * container kill mid-flush) leaves a file whose tail is a partial line.
+ * Resuming from — or archiving — such a file silently loses the tail of
+ * the conversation, and Codex rejects it at parse time.
+ *
+ * The check is deliberately cheap and conservative:
+ *   - the file must exist, be a regular file, and be non-empty
+ *   - it must be newline-terminated (an unterminated tail is by
+ *     definition a partial record)
+ *   - the last nonempty line must parse as JSON
+ *
+ * Only the LAST line is parsed: earlier lines were committed by earlier
+ * appends and re-parsing a multi-megabyte rollout on every readiness
+ * poll would be wasteful.
+ */
+function isCompleteJsonlSnapshotContent(contents: Buffer | string): boolean {
+    const raw = Buffer.isBuffer(contents) ? contents.toString("utf-8") : contents;
+    if (raw.length === 0 || !raw.endsWith("\n")) return false;
+
+    const lines = raw.split("\n");
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const line = lines[index];
+        if (line.trim() === "") continue;
+        try {
+            JSON.parse(line);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+    // Whitespace/newlines only — no records at all.
+    return false;
+}
+
+/** Path-level readiness check that also rejects symlinks and non-files. */
+function isCompleteJsonlSnapshot(absPath: string): boolean {
+    let stat: fs.Stats;
+    try {
+        stat = fs.lstatSync(absPath);
+    } catch {
+        return false;
+    }
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size === 0) return false;
+
+    let raw: Buffer;
+    try {
+        raw = fs.readFileSync(absPath);
+    } catch {
+        return false;
+    }
+    return isCompleteJsonlSnapshotContent(raw);
+}
 
 /**
  * Single-shot readiness check for a session-state directory.
@@ -310,6 +528,15 @@ function checkSessionSnapshot(
             }
             if (!lstat.isFile()) {
                 return { ready: false, missing: [`${sessionId}/${rel} is not a regular file`] };
+            }
+            // A rollout that is empty or ends mid-record is NOT
+            // resumable. Archiving it would overwrite the last good
+            // snapshot with state Codex cannot parse.
+            if (!isCompleteJsonlSnapshot(absTarget)) {
+                return {
+                    ready: false,
+                    missing: [`${sessionId}/${rel} is an empty or truncated JSONL rollout`],
+                };
             }
         }
         return { ready: true, missing: [] };
@@ -474,15 +701,12 @@ export class FilesystemSessionStore implements SessionStateStore {
     }
 
     async hydrate(sessionId: string): Promise<void> {
-        const sessionDir = resolveContainedSessionDir(this.sessionStateDir, sessionId);
+        resolveContainedSessionDir(this.sessionStateDir, sessionId);
         const tarPath = this.tarPath(sessionId);
         if (!fs.existsSync(tarPath)) {
             throw new Error(`Session archive not found: ${sessionId}`);
         }
-        if (fs.existsSync(sessionDir)) {
-            fs.rmSync(sessionDir, { recursive: true, force: true });
-        }
-        extractSessionArchive(this.sessionStateDir, tarPath);
+        extractSessionArchive(this.sessionStateDir, sessionId, tarPath);
     }
 
     async checkpoint(sessionId: string): Promise<void> {
@@ -644,7 +868,11 @@ export {
     DEFAULT_FILESYSTEM_STORE_DIR,
     DEFAULT_SESSION_STATE_DIR,
     archiveSessionDir,
+    archiveSessionDirAtomic,
     buildMetadata,
+    createSessionWorkDir,
     extractSessionArchive,
+    isCompleteJsonlSnapshot,
+    isCompleteJsonlSnapshotContent,
     waitForSessionSnapshot,
 };

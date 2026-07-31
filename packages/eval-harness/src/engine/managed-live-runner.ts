@@ -114,59 +114,118 @@ async function createManagedLiveRuntime(
     resolveSdk(deps),
     resolveCreateEnv(deps.createEnv),
   ]);
-  const env = createEnv(label);
-  const globalTools = await selectedSdkTools([...tools.keys()], sdk.defineTool, []);
-  const createWorker = () => {
-    const worker = new sdk.WorkerCtor({
+  let env: ManagedLiveEnv | undefined;
+  let client: any;
+  let clientStopped = false;
+  let envCleaned = false;
+  const workers: any[] = [];
+  const ownedWorkers: any[] = [];
+
+  const stopOwnedWorker = async (worker: any): Promise<void> => {
+    await worker?.stop?.();
+    const ownedIndex = ownedWorkers.lastIndexOf(worker);
+    if (ownedIndex >= 0) ownedWorkers.splice(ownedIndex, 1);
+  };
+  const cleanupResources = async (): Promise<Error[]> => {
+    const errors: Error[] = [];
+    if (client && !clientStopped) {
+      try {
+        await client.stop?.();
+        clientStopped = true;
+      } catch (error) {
+        errors.push(asError(error));
+      }
+    }
+    for (const worker of [...ownedWorkers].reverse()) {
+      try {
+        await stopOwnedWorker(worker);
+      } catch (error) {
+        errors.push(asError(error));
+      }
+    }
+    if (env && !envCleaned) {
+      try {
+        await env.cleanup?.();
+        envCleaned = true;
+      } catch (error) {
+        errors.push(asError(error));
+      }
+    }
+    return errors;
+  };
+
+  try {
+    env = createEnv(label);
+    const globalTools = await selectedSdkTools([...tools.keys()], sdk.defineTool, []);
+    const createWorker = () => {
+      const worker = new sdk.WorkerCtor({
+        store: env!.store,
+        githubToken: process.env.GITHUB_TOKEN,
+        duroxideSchema: env!.duroxideSchema,
+        cmsSchema: env!.cmsSchema,
+        factsSchema: env!.factsSchema,
+        sessionStateDir: env!.sessionStateDir,
+        workerNodeId: `eval-${randomBytes(4).toString("hex")}`,
+        disableManagementAgents: config.worker?.disableManagementAgents ?? true,
+        pluginDirs: resolveWorkerPaths(config, config.worker?.pluginDirs),
+        customAgents: config.worker?.customAgents,
+        skillDirectories: resolveWorkerPaths(config, config.worker?.skillDirectories),
+        logLevel: process.env.DUROXIDE_LOG_LEVEL || "error",
+      });
+      ownedWorkers.push(worker);
+      if (globalTools.sdkTools.length > 0) worker.registerTools?.(globalTools.sdkTools);
+      return worker;
+    };
+
+    for (let index = 0; index < workerCount; index += 1) workers.push(createWorker());
+    for (const worker of workers) await worker.start();
+
+    client = new sdk.ClientCtor({
       store: env.store,
-      githubToken: process.env.GITHUB_TOKEN,
       duroxideSchema: env.duroxideSchema,
       cmsSchema: env.cmsSchema,
       factsSchema: env.factsSchema,
-      sessionStateDir: env.sessionStateDir,
-      workerNodeId: `eval-${randomBytes(4).toString("hex")}`,
-      disableManagementAgents: config.worker?.disableManagementAgents ?? true,
-      pluginDirs: resolveWorkerPaths(config, config.worker?.pluginDirs),
-      customAgents: config.worker?.customAgents,
-      skillDirectories: resolveWorkerPaths(config, config.worker?.skillDirectories),
-      logLevel: process.env.DUROXIDE_LOG_LEVEL || "error",
+      dehydrateThreshold: 0,
     });
-    if (globalTools.sdkTools.length > 0) worker.registerTools?.(globalTools.sdkTools);
-    return worker;
-  };
-  const workers = Array.from({ length: workerCount }, () => createWorker());
+    await client.start();
 
-  for (const worker of workers) await worker.start();
+    return {
+      env,
+      workers,
+      client,
+      sdk,
+      workerCount,
+      async replaceWorker(index, sessionId, sessionConfig, sdkTools) {
+        const current = workers[index];
+        if (!current) throw new Error(`Managed live worker ${index} is unavailable.`);
+        await stopOwnedWorker(current);
+        workers[index] = undefined;
 
-  const client = new sdk.ClientCtor({
-    store: env.store,
-    duroxideSchema: env.duroxideSchema,
-    cmsSchema: env.cmsSchema,
-    factsSchema: env.factsSchema,
-    dehydrateThreshold: 0,
-  });
-  await client.start();
-
-  return {
-    env,
-    workers,
-    client,
-    sdk,
-    workerCount,
-    async replaceWorker(index, sessionId, sessionConfig, sdkTools) {
-      const current = workers[index];
-      await current?.stop?.();
-      const replacement = createWorker();
-      await replacement.start();
-      replacement.setSessionConfig?.(sessionId, { ...sessionConfig, tools: sdkTools });
-      workers[index] = replacement;
-    },
-    async close() {
-      await client?.stop?.();
-      for (const worker of [...workers].reverse()) await worker?.stop?.();
-      await env.cleanup?.();
-    },
-  };
+        let replacement: any;
+        try {
+          replacement = createWorker();
+          await replacement.start();
+          replacement.setSessionConfig?.(sessionId, { ...sessionConfig, tools: sdkTools });
+          workers[index] = replacement;
+        } catch (error) {
+          const cleanupErrors: Error[] = [];
+          if (replacement) {
+            try {
+              await stopOwnedWorker(replacement);
+            } catch (cleanupError) {
+              cleanupErrors.push(asError(cleanupError));
+            }
+          }
+          throwPrimaryWithCleanup(error, cleanupErrors, "Managed live worker replacement failed");
+        }
+      },
+      async close() {
+        throwCleanupErrors(await cleanupResources(), "Managed live runtime cleanup failed");
+      },
+    };
+  } catch (error) {
+    throwPrimaryWithCleanup(error, await cleanupResources(), "Managed live runtime startup failed");
+  }
 }
 
 function resolveWorkerPaths(config: RunConfig, paths?: string[]): string[] | undefined {
@@ -259,7 +318,7 @@ async function runManagedLiveScenario(
       async () => session.getMessages?.(2000).catch(() => []) ?? [],
     );
     for (const worker of runtime.workers) {
-      worker.setSessionConfig?.(sessionId, { ...sessionConfig, tools: sdkTools });
+      worker?.setSessionConfig?.(sessionId, { ...sessionConfig, tools: sdkTools });
     }
 
     const timeoutMs = effectiveTimeoutMs(scenario, config);
@@ -299,14 +358,33 @@ async function runManagedLiveScenario(
       },
     };
   } catch (error) {
-    await chaos?.cancel();
+    const cleanupErrors: Error[] = [];
+    try {
+      await chaos?.cancel();
+    } catch (cleanupError) {
+      cleanupErrors.push(asError(cleanupError));
+    }
     const skipped = isChaosSkipError(error);
+    if (session) {
+      try {
+        await session.abort?.();
+      } catch (cleanupError) {
+        cleanupErrors.push(asError(cleanupError));
+      }
+    }
     const [info, messages] = session
       ? await Promise.all([
         session.getInfo?.().catch(() => undefined),
         session.getMessages?.(2000).catch(() => []) ?? [],
       ])
       : [undefined, []];
+    if (session) {
+      try {
+        await session.destroy?.();
+      } catch (cleanupError) {
+        cleanupErrors.push(asError(cleanupError));
+      }
+    }
     const cmsEvents = normalizeCmsEvents(messages);
     const chaosMetadata = chaos?.metadata();
     return {
@@ -322,7 +400,7 @@ async function runManagedLiveScenario(
         managed: true,
         isolation,
         sessionId,
-        reason: error instanceof Error ? error.message : String(error),
+        reason: failureReason(error, cleanupErrors),
         ...(skipped ? { skipped: true } : {}),
         ...(chaosMetadata
           ? { chaos: chaosMetadata }
@@ -345,6 +423,28 @@ function sessionConfigForScenario(scenario: Scenario, config: RunConfig, toolNam
     sessionConfig.promptLayering = { kind: "app-agent" };
   }
   return sessionConfig;
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function throwPrimaryWithCleanup(primary: unknown, cleanupErrors: Error[], message: string): never {
+  const primaryError = asError(primary);
+  if (cleanupErrors.length === 0) throw primaryError;
+  throw new AggregateError([primaryError, ...cleanupErrors], `${message}: ${primaryError.message}`);
+}
+
+function throwCleanupErrors(errors: Error[], message: string): void {
+  if (errors.length === 0) return;
+  if (errors.length === 1) throw errors[0];
+  throw new AggregateError(errors, message);
+}
+
+function failureReason(primary: unknown, cleanupErrors: Error[]): string {
+  const primaryMessage = asError(primary).message;
+  if (cleanupErrors.length === 0) return primaryMessage;
+  return `${primaryMessage}; cleanup failed: ${cleanupErrors.map((error) => error.message).join("; ")}`;
 }
 
 async function mapLimit<T>(

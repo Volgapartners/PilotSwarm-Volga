@@ -28,9 +28,14 @@ cp .env.example .env
 # copy the checked-in model catalog template, then edit the local file
 cp .model_providers.example.json .model_providers.json
 $EDITOR .model_providers.json
-# edit .env: set DATABASE_URL and at least one LLM provider key
-# easiest: set GITHUB_TOKEN (gives access to Claude, GPT, etc. via GitHub Copilot)
+# set DATABASE_URL, then choose one worker-side LLM path:
+# GITHUB_TOKEN, a configured BYOK key, or an authenticated Codex CLI
+# Codex subscription mode uses CODEX_HOME login state and needs no API key
 ```
+
+Only workers need LLM credentials. Clients use PostgreSQL and the public
+PilotSwarm APIs. See the [Codex Runtime](docs/codex-runtime.md) guide before
+running subscription-backed Codex sessions in a multi-process deployment.
 
 ```typescript
 import { PilotSwarmClient, PilotSwarmWorker, defineTool } from "pilotswarm-sdk";
@@ -148,7 +153,8 @@ Common entry points:
 
 - Node.js >= 24
 - PostgreSQL
-- LLM access through GitHub Copilot, Codex subscription authentication, or a configured BYOK provider
+- worker-side LLM access through one of: a GitHub token, a configured BYOK
+  provider, or an authenticated Codex CLI subscription (no Codex API key)
 - Azure Blob Storage (optional, for session dehydration across nodes)
 
 ## License

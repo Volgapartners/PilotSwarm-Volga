@@ -8,7 +8,7 @@
  * Run: npx vitest run test/local/codex-session-manager.test.js
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -67,7 +67,7 @@ function mkTmpDirs() {
 }
 
 describe("SessionManager Codex routing", () => {
-    it("creates a codex-backed session without any GITHUB_TOKEN", async () => {
+    it("creates a codex-backed session without touching the Copilot client", async () => {
         const { codexHome, sessionStateDir } = mkTmpDirs();
         const transport = createFakeCodexTransport({
             thread: { id: "codex-thread-sm-1" },
@@ -93,12 +93,16 @@ describe("SessionManager Codex routing", () => {
         manager.setFactStore(mkFactStoreStub());
         manager.setSessionCatalog(mkCatalogStub());
         manager._setCodexTransportFactoryForTests(() => transport);
+        const ensureClient = vi.spyOn(manager, "ensureClient").mockRejectedValue(
+            new Error("CopilotClient must not be initialized for Codex sessions"),
+        );
 
         const managed = await manager.getOrCreate("ps-codex-1", {
             model: "codex-subscription:gpt-5.6-sol",
             toolNames: [],
         }, { turnIndex: 0 });
 
+        expect(ensureClient).not.toHaveBeenCalled();
         expect(managed).toBeTruthy();
         expect(managed.runtimeKind).toBe("codex");
         // Persistence written under sessionStateDir, not codexHome.
@@ -144,10 +148,14 @@ describe("SessionManager Codex routing", () => {
         const manager = new SessionManager(undefined, null, { modelProviders: providers }, sessionStateDir);
         manager.setFactStore(mkFactStoreStub());
         manager.setSessionCatalog(mkCatalogStub());
+        const ensureClient = vi.spyOn(manager, "ensureClient").mockRejectedValue(
+            new Error("CopilotClient must not be constructed without a GitHub Copilot key"),
+        );
 
         await expect(
             manager.getOrCreate("ps-github-nohome", { model: "github-copilot:claude-sonnet-4.6" }, { turnIndex: 0 }),
         ).rejects.toThrow(/GitHub Copilot key not configured/);
+        expect(ensureClient).not.toHaveBeenCalled();
     });
 
     it("passes model, cwd, developerInstructions, reasoning effort and dynamicTools to thread/start", async () => {
@@ -316,6 +324,50 @@ describe("SessionManager Codex routing", () => {
         fs.rmSync(storeDir, { recursive: true, force: true });
     });
 
+    it("hydrates a good stored checkpoint when the local Codex marker is truncated", async () => {
+        const { codexHome, sessionStateDir } = mkTmpDirs();
+        const { FilesystemSessionStore } = await import("../../src/session-store.ts");
+        const storeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-sm-corrupt-fallback-"));
+        const sid = "ps-corrupt-local-fallback";
+        const sessionDir = path.join(sessionStateDir, sid);
+        const stateFile = path.join(sessionDir, "codex-thread.json");
+        fs.mkdirSync(sessionDir, { recursive: true });
+        fs.writeFileSync(stateFile, JSON.stringify({
+            codexThreadId: "codex-thread-from-checkpoint",
+            codexHome,
+        }), { mode: 0o600 });
+
+        const store = new FilesystemSessionStore(storeDir, sessionStateDir);
+        await store.checkpoint(sid);
+        fs.writeFileSync(stateFile, '{"codexThreadId":');
+
+        const transport = createFakeCodexTransport({ thread: { id: "codex-thread-from-checkpoint" } });
+        const providers = new ModelProviderRegistry({
+            providers: [{ id: "codex-subscription", type: "codex", codexHome, models: ["gpt-5.6-sol"] }],
+            defaultModel: "codex-subscription:gpt-5.6-sol",
+        });
+        const manager = new SessionManager(undefined, store, { modelProviders: providers }, sessionStateDir);
+        manager.setFactStore(mkFactStoreStub());
+        manager.setSessionCatalog(mkCatalogStub());
+        manager._setCodexTransportFactoryForTests(() => transport);
+
+        try {
+            await manager.getOrCreate(
+                sid,
+                { model: "codex-subscription:gpt-5.6-sol", toolNames: [] },
+                { turnIndex: 1 },
+            );
+
+            const restored = JSON.parse(fs.readFileSync(stateFile, "utf-8"));
+            expect(restored.codexThreadId).toBe("codex-thread-from-checkpoint");
+            const resume = transport.recordedRequests.find((request) => request.method === "thread/resume");
+            expect(resume?.params?.threadId).toBe("codex-thread-from-checkpoint");
+        } finally {
+            await manager.shutdown();
+            fs.rmSync(storeDir, { recursive: true, force: true });
+        }
+    }, 10_000);
+
     it("(R4-D1a) SessionManager Codex getOrCreate rejects traversal/absolute session ids BEFORE any sessionStore or thread call", async () => {
         // Regression: SessionManager's Codex branch previously reached
         // `sessionStore.exists()` / `.delete()` / `.hydrate()` with the
@@ -376,4 +428,35 @@ describe("SessionManager Codex routing", () => {
         fs.unlinkSync(victimTar);
         fs.unlinkSync(victimMeta);
     }, 5_000);
+});
+
+// ─── Dead per-user-client-key remnant ───────────────────────────────
+
+describe("SessionManager per-session client-key bookkeeping", () => {
+    // Regression: the Codex-runtime commit re-introduced a
+    // `sessionClientKeys` map (plus a doc comment promising that a warm
+    // session is destroyed when the resolved GitHub Copilot token
+    // changes) without any of the code that populates or reads it. The
+    // map is only ever `.delete()`d, so the documented behavior does not
+    // exist and the comment actively misleads readers.
+    //
+    // This invariant is source-level on purpose: a write-only private
+    // map has no observable runtime behavior to assert against. Either
+    // the map is gone, or it is genuinely wired up (set AND get).
+    it("does not carry a write-only sessionClientKeys map with a misleading contract", async () => {
+        const source = await fs.promises.readFile(
+            new URL("../../src/session-manager.ts", import.meta.url),
+            "utf-8",
+        );
+        if (!source.includes("sessionClientKeys")) return; // removed — nothing to check
+
+        expect(
+            source.includes("sessionClientKeys.set("),
+            "sessionClientKeys is never populated — remove it or wire up the token-rebind path",
+        ).toBe(true);
+        expect(
+            source.includes("sessionClientKeys.get("),
+            "sessionClientKeys is never read — remove it or wire up the token-rebind path",
+        ).toBe(true);
+    });
 });

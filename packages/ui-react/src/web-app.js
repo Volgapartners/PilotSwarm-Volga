@@ -25,6 +25,7 @@ import {
     selectModelPickerModal,
     selectRenameSessionModal,
     selectSessionAgentPickerModal,
+    selectReasoningEffortPickerModal,
     selectSessionRows,
     selectStatusBar,
     selectThemePickerModal,
@@ -2141,6 +2142,7 @@ function ModalLayer({ controller }) {
         themePicker: selectThemePickerModal(state),
         modelPicker: selectModelPickerModal(state),
         sessionAgentPicker: selectSessionAgentPickerModal(state),
+        reasoningEffortPicker: selectReasoningEffortPickerModal(state),
         artifactPicker: selectArtifactPickerModal(state),
         logFilter: selectLogFilterModal(state),
         filesFilter: selectFilesFilterModal(state),
@@ -2176,6 +2178,7 @@ function ModalLayer({ controller }) {
             "themePicker",
             "modelPicker",
             "sessionAgentPicker",
+            "reasoningEffortPicker",
             "artifactPicker",
             "logFilter",
             "filesFilter",
@@ -2196,6 +2199,7 @@ function ModalLayer({ controller }) {
         modalState.themePicker?.selectedRowIndex,
         modalState.modelPicker?.selectedRowIndex,
         modalState.sessionAgentPicker?.selectedRowIndex,
+        modalState.reasoningEffortPicker?.selectedRowIndex,
         modalState.artifactPicker?.selectedRowIndex,
         modalState.logFilter?.selectedRowIndex,
         modalState.filesFilter?.selectedRowIndex,
@@ -2209,7 +2213,9 @@ function ModalLayer({ controller }) {
     const renderListModal = (presentation, confirmLabel = "Apply") => {
         const rows = Array.isArray(presentation.rows) ? presentation.rows : [];
         const rowItemIndexes = Array.isArray(presentation.rowItemIndexes) ? presentation.rowItemIndexes : null;
-        const usesHangingIndent = modal.type === "modelPicker" || modal.type === "sessionAgentPicker";
+        const usesHangingIndent = modal.type === "modelPicker"
+            || modal.type === "sessionAgentPicker"
+            || modal.type === "reasoningEffortPicker";
         const renderedList = rowItemIndexes && rowItemIndexes.length === rows.length
             ? rows.map((row, rowIndex) => {
                 const itemIndex = rowItemIndexes[rowIndex];
@@ -2299,6 +2305,9 @@ function ModalLayer({ controller }) {
     }
     if (modal.type === "sessionAgentPicker" && modalState.sessionAgentPicker) {
         return renderListModal(modalState.sessionAgentPicker, "Create Session");
+    }
+    if (modal.type === "reasoningEffortPicker" && modalState.reasoningEffortPicker) {
+        return renderListModal(modalState.reasoningEffortPicker, "Continue");
     }
     if (modal.type === "artifactPicker" && modalState.artifactPicker) {
         return renderListModal(modalState.artifactPicker, "Download");

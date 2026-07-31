@@ -3,11 +3,27 @@
 v0 supports a small live eval path that downstream apps can copy and extend
 locally. Keep scenarios JSON-only and put executable app logic in plugins.
 
-## Install
+The v0 managed runner uses PilotSwarm's configured default model but still
+requires the existing GitHub token path. Codex is not yet a configurable eval
+target; use the [Codex Runtime validation guide](../../../docs/codex-runtime.md#validation)
+for focused Codex checks.
+
+## Source Checkout Setup
+
+The v0 eval harness is a private PilotSwarm workspace package. It is not
+published to the npm registry. Keep the downstream `eval/` directory in a
+PilotSwarm source checkout, or add equivalent workspace wiring in the
+downstream monorepo.
+
+From the PilotSwarm repo root:
 
 ```bash
-npm install pilotswarm-eval-harness
+npm install
+npm run build --workspace=pilotswarm-eval-harness
 ```
+
+The workspace install makes `pilotswarm-eval-harness` available to plugin
+imports inside that checkout.
 
 ## Layout
 
@@ -87,7 +103,7 @@ Run it:
 
 ```bash
 set -a; source .env; set +a
-npm exec run-eval -- --config=eval/runs/smoke/config.json --require=eval/eval-plugins.js
+packages/eval-harness/bin/run-eval.sh --config=eval/runs/smoke/config.json --require=eval/eval-plugins.js
 ```
 
 ## Conventions

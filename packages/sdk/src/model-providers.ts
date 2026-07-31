@@ -19,6 +19,9 @@ import path from "node:path";
 
 // ─── Types ───────────────────────────────────────────────────────
 
+/** Reasoning effort levels accepted by the Copilot SDK and Codex runtime. */
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+
 /** A model entry within a provider. */
 export interface ModelEntry {
     /** Model name (deployment name for Azure). */
@@ -27,6 +30,16 @@ export interface ModelEntry {
     description?: string;
     /** Relative cost tier. */
     cost?: "low" | "medium" | "high";
+    /**
+     * Reasoning-effort values this model accepts. Unrecognized values are
+     * dropped; order and duplicates are normalized.
+     */
+    supportedReasoningEfforts?: ReasoningEffort[];
+    /**
+     * Reasoning effort applied when the caller does not pick one. Ignored
+     * unless it is present in `supportedReasoningEfforts`.
+     */
+    defaultReasoningEffort?: ReasoningEffort;
 }
 
 /** A single provider entry in model_providers.json. */
@@ -88,6 +101,10 @@ export interface ModelDescriptor {
     description?: string;
     /** Relative cost tier. */
     cost?: "low" | "medium" | "high";
+    /** Normalized reasoning-effort values this model accepts. */
+    supportedReasoningEfforts?: ReasoningEffort[];
+    /** Reasoning effort applied when the caller does not pick one. */
+    defaultReasoningEffort?: ReasoningEffort;
 }
 
 /** Resolved provider info for a specific model — ready to use. */
@@ -164,6 +181,11 @@ export class ModelProviderRegistry {
             for (const m of p.models) {
                 const entry: ModelEntry = typeof m === "string" ? { name: m } : m;
                 const qualified = `${p.id}:${entry.name}`;
+                const supportedReasoningEfforts = normalizeReasoningEfforts(entry.supportedReasoningEfforts);
+                const defaultReasoningEffort = normalizeDefaultReasoningEffort(
+                    entry.defaultReasoningEffort,
+                    supportedReasoningEfforts,
+                );
                 const desc: ModelDescriptor = {
                     qualifiedName: qualified,
                     modelName: entry.name,
@@ -171,6 +193,8 @@ export class ModelProviderRegistry {
                     providerType: p.type,
                     description: entry.description,
                     cost: entry.cost,
+                    ...(supportedReasoningEfforts.length > 0 && { supportedReasoningEfforts }),
+                    ...(defaultReasoningEffort && { defaultReasoningEffort }),
                 };
                 this.descriptors.set(qualified, desc);
                 this.qualifiedToProvider.set(qualified, p);
@@ -307,8 +331,12 @@ export class ModelProviderRegistry {
             lines.push(`\n## ${group.providerId} (${group.type})`);
             for (const m of group.models) {
                 const costLabel = m.cost ? ` [cost: ${m.cost}]` : "";
+                const efforts = m.supportedReasoningEfforts || [];
+                const reasoningLabel = efforts.length > 0
+                    ? ` [reasoning: ${efforts.join(", ")}${m.defaultReasoningEffort ? `; default: ${m.defaultReasoningEffort}` : ""}]`
+                    : "";
                 const desc = m.description ? ` — ${m.description}` : "";
-                lines.push(`- ${m.qualifiedName}${costLabel}${desc}`);
+                lines.push(`- ${m.qualifiedName}${costLabel}${reasoningLabel}${desc}`);
             }
         }
         lines.push(`\nDefault: ${this._defaultModel || "none"}`);
@@ -395,6 +423,30 @@ function buildFromEnv(): ModelProviderRegistry | null {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────
+
+const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
+
+function normalizeReasoningEfforts(values?: ReasoningEffort[]): ReasoningEffort[] {
+    if (!Array.isArray(values)) return [];
+    const out: ReasoningEffort[] = [];
+    for (const raw of values) {
+        const value = String(raw || "").trim().toLowerCase();
+        if (!REASONING_EFFORTS.has(value)) continue;
+        if (out.includes(value as ReasoningEffort)) continue;
+        out.push(value as ReasoningEffort);
+    }
+    return out;
+}
+
+function normalizeDefaultReasoningEffort(
+    value: ReasoningEffort | undefined,
+    supported: ReasoningEffort[],
+): ReasoningEffort | undefined {
+    if (!supported.length) return undefined;
+    const normalized = String(value || "").trim().toLowerCase() as ReasoningEffort;
+    if (normalized && supported.includes(normalized)) return normalized;
+    return supported[0];
+}
 
 function resolveEnvValue(value?: string): string | undefined {
     if (!value) return undefined;

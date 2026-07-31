@@ -1,7 +1,7 @@
 {
   "name": "pilotswarm-eval-harness",
   "version": "0.1.0",
-  "private": false,
+  "private": true,
   "license": "MIT",
   "type": "module",
   "main": "./dist/src/index.js",
@@ -46,7 +46,7 @@
     "vitest": "^4.1.0"
   },
   "peerDependencies": {
-    "pilotswarm-sdk": "^0.1.29"
+    "pilotswarm-sdk": "^0.1.20"
   },
   "engines": {
     "node": ">=24.0.0"

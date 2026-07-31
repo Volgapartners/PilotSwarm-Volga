@@ -458,4 +458,361 @@ describe("managed live runner", () => {
     expect(results[0]?.passed).toBe(true);
     expect(timeouts).toEqual([240_000]);
   });
+
+  it("rolls back partially started workers and the environment in reverse order", async () => {
+    const events: string[] = [];
+    let workerId = 0;
+
+    class FakeWorker {
+      readonly id = ++workerId;
+
+      constructor(_options: Record<string, unknown>) {}
+      registerTools(): void {}
+      async start(): Promise<void> {
+        events.push(`worker:${this.id}:start`);
+        if (this.id === 2) throw new Error("worker 2 start failed");
+      }
+      async stop(): Promise<void> {
+        events.push(`worker:${this.id}:stop`);
+      }
+    }
+
+    class FakeClient {
+      constructor(_options: Record<string, unknown>) {
+        throw new Error("client must not be acquired");
+      }
+    }
+
+    const config = {
+      id: "unit-live-partial-worker-start",
+      defaults: { driver: "live", concurrent: 2, isolation: "shared-worker", timeoutMs: 1000 },
+      reporters: [],
+    } as unknown as RunConfig;
+    const scenarios = [{
+      schemaVersion: 1,
+      kind: "single-turn",
+      id: "partial.worker.start",
+      description: "Worker startup fails.",
+      input: { prompt: "unused" },
+      checks: [],
+    }] as unknown as Scenario[];
+
+    await expect(runManagedLiveScenarios(scenarios, config, {
+      createEnv(label) {
+        return {
+          ...envFor(label),
+          async cleanup() {
+            events.push("env:cleanup");
+          },
+        };
+      },
+      WorkerCtor: FakeWorker,
+      ClientCtor: FakeClient,
+    })).rejects.toThrow("worker 2 start failed");
+
+    expect(events).toEqual([
+      "worker:1:start",
+      "worker:2:start",
+      "worker:2:stop",
+      "worker:1:stop",
+      "env:cleanup",
+    ]);
+  });
+
+  it("rolls back an acquired client, workers, and environment when client startup fails", async () => {
+    const events: string[] = [];
+    let workerId = 0;
+
+    class FakeWorker {
+      readonly id = ++workerId;
+
+      constructor(_options: Record<string, unknown>) {}
+      registerTools(): void {}
+      async start(): Promise<void> {
+        events.push(`worker:${this.id}:start`);
+      }
+      async stop(): Promise<void> {
+        events.push(`worker:${this.id}:stop`);
+      }
+    }
+
+    class FakeClient {
+      constructor(_options: Record<string, unknown>) {
+        events.push("client:construct");
+      }
+      async start(): Promise<void> {
+        events.push("client:start");
+        throw new Error("client start failed");
+      }
+      async stop(): Promise<void> {
+        events.push("client:stop");
+      }
+    }
+
+    const config = {
+      id: "unit-live-client-start",
+      defaults: { driver: "live", concurrent: 2, isolation: "shared-worker", timeoutMs: 1000 },
+      reporters: [],
+    } as unknown as RunConfig;
+    const scenarios = [{
+      schemaVersion: 1,
+      kind: "single-turn",
+      id: "partial.client.start",
+      description: "Client startup fails.",
+      input: { prompt: "unused" },
+      checks: [],
+    }] as unknown as Scenario[];
+
+    await expect(runManagedLiveScenarios(scenarios, config, {
+      createEnv(label) {
+        return {
+          ...envFor(label),
+          async cleanup() {
+            events.push("env:cleanup");
+          },
+        };
+      },
+      WorkerCtor: FakeWorker,
+      ClientCtor: FakeClient,
+    })).rejects.toThrow("client start failed");
+
+    expect(events).toEqual([
+      "worker:1:start",
+      "worker:2:start",
+      "client:construct",
+      "client:start",
+      "client:stop",
+      "worker:2:stop",
+      "worker:1:stop",
+      "env:cleanup",
+    ]);
+  });
+
+  it("releases both current and replacement worker ownership when replacement start fails", async () => {
+    const workerStops: number[] = [];
+    const cmsEvents: Array<{ eventType: string; createdAt: string }> = [];
+    let workerId = 0;
+
+    class FakeWorker {
+      readonly id = ++workerId;
+
+      constructor(_options: Record<string, unknown>) {}
+      registerTools(): void {}
+      setSessionConfig(): void {}
+      async start(): Promise<void> {
+        if (this.id === 2) throw new Error("replacement start failed");
+      }
+      async stop(): Promise<void> {
+        workerStops.push(this.id);
+      }
+    }
+
+    class FakeClient {
+      async start(): Promise<void> {}
+      async stop(): Promise<void> {}
+      async createSession() {
+        return {
+          sessionId: "replacement-start-failure",
+          async sendAndWait() {
+            cmsEvents.push({ eventType: "session.wait_started", createdAt: "2026-05-18T00:00:00.000Z" });
+            await new Promise((resolve) => setTimeout(resolve, 60));
+            return "done";
+          },
+          async getInfo() {
+            return { status: "idle" };
+          },
+          async getMessages() {
+            return [...cmsEvents];
+          },
+        };
+      }
+    }
+
+    const config = {
+      id: "unit-live-replacement-start-failure",
+      defaults: { driver: "live", concurrent: 1, isolation: "shared-worker", timeoutMs: 1000 },
+      reporters: [],
+    } as unknown as RunConfig;
+    const scenarios: Scenario[] = [{
+      schemaVersion: 1,
+      kind: "durable-trajectory",
+      id: "replacement.start.failure",
+      description: "Replacement worker start fails.",
+      input: { prompt: "Wait durably." },
+      chaos: { injectAt: "during-wait", type: "worker-restart", onTargetMissing: "error" },
+      checks: [],
+    }];
+
+    const [result] = await runManagedLiveScenarios(scenarios, config, {
+      createEnv: envFor,
+      WorkerCtor: FakeWorker,
+      ClientCtor: FakeClient,
+    });
+
+    expect(result?.passed).toBe(false);
+    expect(result?.failureMessage).toContain("replacement start failed");
+    expect(workerStops).toEqual([1, 2]);
+  });
+
+  it.each([
+    ["failure", new Error("turn failed")],
+    ["timeout", new Error("sendAndWait timed out")],
+  ])("aborts and destroys a session after scenario %s before starting the next cell", async (_kind, turnError) => {
+    const events: string[] = [];
+    let sessionCount = 0;
+
+    class FakeWorker {
+      constructor(_options: Record<string, unknown>) {}
+      registerTools(): void {}
+      setSessionConfig(): void {}
+      async start(): Promise<void> {}
+      async stop(): Promise<void> {}
+    }
+
+    class FakeClient {
+      async start(): Promise<void> {}
+      async stop(): Promise<void> {}
+      async createSession() {
+        const sessionNumber = ++sessionCount;
+        events.push(`session:${sessionNumber}:create`);
+        return {
+          sessionId: `failure-cleanup-${sessionNumber}`,
+          async sendAndWait() {
+            events.push(`session:${sessionNumber}:send`);
+            if (sessionNumber === 1) throw turnError;
+            return "ok";
+          },
+          async abort() {
+            events.push(`session:${sessionNumber}:abort`);
+          },
+          async destroy() {
+            events.push(`session:${sessionNumber}:destroy`);
+          },
+          async getInfo() {
+            return { status: sessionNumber === 1 ? "running" : "completed" };
+          },
+          async getMessages() {
+            return [];
+          },
+        };
+      }
+    }
+
+    const config = {
+      id: "unit-live-scenario-failure-cleanup",
+      defaults: { driver: "live", concurrent: 1, isolation: "shared-worker", timeoutMs: 1000 },
+      reporters: [],
+    } as unknown as RunConfig;
+    const scenarios = [1, 2].map((number) => ({
+      schemaVersion: 1,
+      kind: "single-turn",
+      id: `scenario.failure.cleanup.${number}`,
+      description: `Scenario ${number}.`,
+      input: { prompt: "Say ok." },
+      checks: [{ type: "response-contains", any: ["ok"] }],
+    })) as Scenario[];
+
+    const results = await runManagedLiveScenarios(scenarios, config, {
+      createEnv: envFor,
+      WorkerCtor: FakeWorker,
+      ClientCtor: FakeClient,
+    });
+
+    expect(results.map((result) => result.passed)).toEqual([false, true]);
+    expect(events).toEqual([
+      "session:1:create",
+      "session:1:send",
+      "session:1:abort",
+      "session:1:destroy",
+      "session:2:create",
+      "session:2:send",
+    ]);
+  });
+
+  it("attempts every close cleanup and aggregates cleanup rejections", async () => {
+    const cleanupEvents: string[] = [];
+    let workerId = 0;
+
+    class FakeWorker {
+      readonly id = ++workerId;
+
+      constructor(_options: Record<string, unknown>) {}
+      registerTools(): void {}
+      setSessionConfig(): void {}
+      async start(): Promise<void> {}
+      async stop(): Promise<void> {
+        cleanupEvents.push(`worker:${this.id}:stop`);
+        throw new Error(`worker ${this.id} stop failed`);
+      }
+    }
+
+    class FakeClient {
+      async start(): Promise<void> {}
+      async stop(): Promise<void> {
+        cleanupEvents.push("client:stop");
+        throw new Error("client stop failed");
+      }
+      async createSession() {
+        return {
+          sessionId: "close-cleanup",
+          async sendAndWait() {
+            return "ok";
+          },
+          async getInfo() {
+            return { status: "completed" };
+          },
+          async getMessages() {
+            return [];
+          },
+        };
+      }
+    }
+
+    const config = {
+      id: "unit-live-close-cleanup",
+      defaults: { driver: "live", concurrent: 2, isolation: "shared-worker", timeoutMs: 1000 },
+      reporters: [],
+    } as unknown as RunConfig;
+    const scenarios = [{
+      schemaVersion: 1,
+      kind: "single-turn",
+      id: "close.cleanup",
+      description: "Close cleanup.",
+      input: { prompt: "Say ok." },
+      checks: [{ type: "response-contains", any: ["ok"] }],
+    }] as unknown as Scenario[];
+
+    let caught: unknown;
+    try {
+      await runManagedLiveScenarios(scenarios, config, {
+        createEnv(label) {
+          return {
+            ...envFor(label),
+            async cleanup() {
+              cleanupEvents.push("env:cleanup");
+              throw new Error("environment cleanup failed");
+            },
+          };
+        },
+        WorkerCtor: FakeWorker,
+        ClientCtor: FakeClient,
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).errors.map((error) => (error as Error).message)).toEqual([
+      "client stop failed",
+      "worker 2 stop failed",
+      "worker 1 stop failed",
+      "environment cleanup failed",
+    ]);
+    expect(cleanupEvents).toEqual([
+      "client:stop",
+      "worker:2:stop",
+      "worker:1:stop",
+      "env:cleanup",
+    ]);
+  });
 });

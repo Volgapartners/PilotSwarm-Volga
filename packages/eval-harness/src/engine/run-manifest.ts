@@ -60,6 +60,9 @@ export async function runManifest(options: RunManifestOptions = {}): Promise<Run
     if (!reporters.has(name)) throw new Error(`Unknown reporter "${name}".`);
   }
   const discoveredScenarios = await discoverScenarios(options);
+  if (discoveredScenarios.length === 0) {
+    throw new Error("No scenarios matched the requested selector or filters.");
+  }
   for (const [index, scenario] of discoveredScenarios.entries()) {
     await options.onProgress?.({
       phase: "discover",
