@@ -154,10 +154,14 @@ export class PortalRuntime {
             case "getExecutionHistory":
                 return this.transport.getExecutionHistory(safeParams.sessionId, safeParams.executionId);
             case "createSession":
-                return this.transport.createSession({ model: safeParams.model });
+                return this.transport.createSession({
+                    model: safeParams.model,
+                    reasoningEffort: safeParams.reasoningEffort,
+                });
             case "createSessionForAgent":
                 return this.transport.createSessionForAgent(safeParams.agentName, {
                     model: safeParams.model,
+                    reasoningEffort: safeParams.reasoningEffort,
                     title: safeParams.title,
                     splash: safeParams.splash,
                     initialPrompt: safeParams.initialPrompt,

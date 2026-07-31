@@ -49,9 +49,9 @@ function createCtx(values, queue = []) {
 }
 
 async function loadHandler(version) {
-    if (version === "1.0.43") {
+    if (version === "1.0.44") {
         const mod = await import("../../src/orchestration.ts");
-        return mod.durableSessionOrchestration_1_0_43;
+        return mod.durableSessionOrchestration_1_0_44;
     }
     const fileVersion = version.replace(/\./g, "_");
     const mod = await import(`../../src/orchestration_${fileVersion}.ts`);
@@ -85,7 +85,7 @@ describe("orchestration version upgrades", () => {
         };
     });
 
-    for (const sourceVersion of ["1.0.40", "1.0.41", "1.0.42"]) {
+    for (const sourceVersion of ["1.0.40", "1.0.41", "1.0.42", "1.0.43"]) {
         it(`upgrades ${sourceVersion} snapshots into the latest orchestration`, async () => {
             const values = new Map();
             const { DURABLE_SESSION_LATEST_VERSION } = await import("../../src/orchestration-version.ts");

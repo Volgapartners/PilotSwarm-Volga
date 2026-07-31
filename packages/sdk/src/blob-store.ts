@@ -6,16 +6,18 @@ import {
     SASProtocol,
 } from "@azure/storage-blob";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {
     DEFAULT_SESSION_STATE_DIR,
     type SessionMetadata,
     type SessionStateStore,
     type ArtifactStore,
-    archiveSessionDir,
+    archiveSessionDirAtomic,
     buildMetadata,
+    createSessionWorkDir,
     extractSessionArchive,
+    resolveContainedSessionDir,
+    validateSessionId,
     waitForSessionSnapshot,
 } from "./session-store.js";
 
@@ -60,6 +62,14 @@ function errorMessage(error: unknown): string {
 }
 
 /**
+ * Fixed filename INSIDE a per-operation staging directory. Uniqueness
+ * comes from the `mkdtemp` directory, not from the file name, so the
+ * staged path is never guessable and never shared between concurrent
+ * operations on the same session.
+ */
+const ARCHIVE_STAGE_FILENAME = "session-state.tar.gz";
+
+/**
  * Manages session state in Azure Blob Storage.
  *
  * - `dehydrate()` — tar + upload session dir, remove local files
@@ -97,7 +107,11 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
      * Frees the worker slot for another session.
      */
     async dehydrate(sessionId: string, meta?: Record<string, unknown>): Promise<void> {
-        const sessionDir = path.join(this.sessionStateDir, sessionId);
+        // Validate BEFORE any log call, path construction, temp file
+        // name, blob client lookup, or fs mutation. A malformed id
+        // (`../victim`, absolute, cross-separator, empty, `.`, `..`)
+        // must have ZERO local or Azure side effects.
+        const sessionDir = resolveContainedSessionDir(this.sessionStateDir, sessionId);
         logBlobStore("info", sessionId, "dehydrate start", {
             container: this.containerName,
             dir: sessionDir,
@@ -115,9 +129,14 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
             );
         }
 
-        const tarPath = path.join(os.tmpdir(), `${sessionId}.tar.gz`);
+        // Stage inside a private, per-operation directory. A predictable
+        // `os.tmpdir()/<sessionId>.tar.gz` is both a symlink-swap target
+        // on a shared host and a collision point between two concurrent
+        // operations on the same session.
+        const workDir = createSessionWorkDir(this.sessionStateDir, ".dehydrate-stage-");
+        const tarPath = path.join(workDir, ARCHIVE_STAGE_FILENAME);
         try {
-            archiveSessionDir(this.sessionStateDir, sessionId, tarPath);
+            archiveSessionDirAtomic(this.sessionStateDir, sessionId, tarPath);
             const tarSizeBytes = fs.existsSync(tarPath) ? fs.statSync(tarPath).size : undefined;
 
             // Upload tar
@@ -154,29 +173,26 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
             });
             throw error;
         } finally {
-            // Always clean up temp tar
-            try { fs.unlinkSync(tarPath); } catch {}
+            // Always clean up the private staging directory.
+            try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
         }
     }
 
     /**
-     * Hydrate a session: download tar from blob, extract to local disk.
-     * No-op if local session files already exist.
+     * Hydrate a session: download to a unique local directory, preflight
+     * the archive, then replace the live session directory.
      */
     async hydrate(sessionId: string): Promise<void> {
-        const sessionDir = path.join(this.sessionStateDir, sessionId);
+        const sessionDir = resolveContainedSessionDir(this.sessionStateDir, sessionId);
+        fs.mkdirSync(this.sessionStateDir, { recursive: true });
         logBlobStore("info", sessionId, "hydrate start", {
             container: this.containerName,
             dir: sessionDir,
         });
 
-        // Always download from blob — overwrite any stale local files
-        if (fs.existsSync(sessionDir)) {
-            fs.rmSync(sessionDir, { recursive: true, force: true });
-        }
-
         const tarBlob = this.containerClient.getBlockBlobClient(`${sessionId}.tar.gz`);
-        const tarPath = path.join(os.tmpdir(), `${sessionId}.tar.gz`);
+        const downloadDir = createSessionWorkDir(this.sessionStateDir, ".hydrate-download-");
+        const tarPath = path.join(downloadDir, ARCHIVE_STAGE_FILENAME);
 
         try {
             logBlobStore("info", sessionId, "hydrate download tar", {
@@ -184,7 +200,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
                 blob: `${sessionId}.tar.gz`,
             });
             await tarBlob.downloadToFile(tarPath);
-            extractSessionArchive(this.sessionStateDir, tarPath);
+            extractSessionArchive(this.sessionStateDir, sessionId, tarPath);
             logBlobStore("info", sessionId, "hydrate complete", {
                 container: this.containerName,
                 restoredDir: sessionDir,
@@ -197,7 +213,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
             });
             throw error;
         } finally {
-            try { fs.unlinkSync(tarPath); } catch {}
+            fs.rmSync(downloadDir, { recursive: true, force: true });
         }
     }
 
@@ -206,7 +222,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
      * Used for crash resilience — the session stays warm in memory.
      */
     async checkpoint(sessionId: string): Promise<void> {
-        const sessionDir = path.join(this.sessionStateDir, sessionId);
+        const sessionDir = resolveContainedSessionDir(this.sessionStateDir, sessionId);
         if (!fs.existsSync(sessionDir)) {
             logBlobStore("info", sessionId, "checkpoint skipped", {
                 container: this.containerName,
@@ -215,13 +231,32 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
             return;
         }
 
-        const tarPath = path.join(os.tmpdir(), `${sessionId}.tar.gz`);
+        // Same readiness gate as dehydrate(). Checkpoint overwrites the
+        // ONLY recoverable snapshot blob, so archiving a half-written or
+        // corrupt session directory (invalid `codex-thread.json`, empty
+        // `codexThreadId`, or a missing / symlinked / escaping
+        // `rolloutSnapshotRelPath`) would destroy the last known-good
+        // state. Unlike dehydrate, a checkpoint is periodic and
+        // best-effort: skip this round and leave the previous blob
+        // intact rather than failing the orchestration activity.
+        const snapshot = await waitForSessionSnapshot(this.sessionStateDir, sessionId);
+        if (!snapshot.ready) {
+            logBlobStore("warn", sessionId, "checkpoint skipped", {
+                container: this.containerName,
+                reason: "snapshot not ready",
+                missing: snapshot.missing.join(", ") || "unknown",
+            });
+            return;
+        }
+
+        const workDir = createSessionWorkDir(this.sessionStateDir, ".checkpoint-stage-");
+        const tarPath = path.join(workDir, ARCHIVE_STAGE_FILENAME);
         try {
             logBlobStore("info", sessionId, "checkpoint start", {
                 container: this.containerName,
                 dir: sessionDir,
             });
-            archiveSessionDir(this.sessionStateDir, sessionId, tarPath);
+            archiveSessionDirAtomic(this.sessionStateDir, sessionId, tarPath);
             const tarSizeBytes = fs.existsSync(tarPath) ? fs.statSync(tarPath).size : undefined;
 
             const tarBlob = this.containerClient.getBlockBlobClient(`${sessionId}.tar.gz`);
@@ -245,11 +280,12 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
             });
             throw error;
         } finally {
-            try { fs.unlinkSync(tarPath); } catch {}
+            try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
         }
     }
 
     async getSnapshotSizeBytes(sessionId: string): Promise<number | undefined> {
+        validateSessionId(sessionId);
         const cached = this.snapshotSizeBySession.get(sessionId);
         if (Number.isFinite(cached)) return cached;
 
@@ -282,6 +318,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
 
     /** Check if a dehydrated session exists in blob storage. */
     async exists(sessionId: string): Promise<boolean> {
+        validateSessionId(sessionId);
         const tarBlob = this.containerClient.getBlockBlobClient(`${sessionId}.tar.gz`);
         try {
             const exists = await tarBlob.exists();
@@ -303,6 +340,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
 
     /** Delete a dehydrated session from blob storage. */
     async delete(sessionId: string): Promise<void> {
+        validateSessionId(sessionId);
         logBlobStore("info", sessionId, "delete start", {
             container: this.containerName,
         });
@@ -339,6 +377,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
         content: string,
         contentType = "text/markdown",
     ): Promise<string> {
+        validateSessionId(sessionId);
         const MAX_SIZE = 1_048_576; // 1MB
         if (content.length > MAX_SIZE) {
             throw new Error(`Artifact too large: ${content.length} bytes (max ${MAX_SIZE})`);
@@ -356,6 +395,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
      * Returns the file content as a string.
      */
     async downloadArtifact(sessionId: string, filename: string): Promise<string> {
+        validateSessionId(sessionId);
         const blobPath = this.artifactBlobPath(sessionId, filename);
         const blob = this.containerClient.getBlockBlobClient(blobPath);
         const response = await blob.download(0);
@@ -367,10 +407,23 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
     }
 
     /**
+     * Convenience wrapper that returns the artifact body as a string.
+     * Alias for {@link downloadArtifact} on this Azure-backed store;
+     * kept for parity with the {@link ArtifactStore} interface exposed
+     * by the filesystem-backed store and consumed by the SDK's
+     * artifact tools and portal proxy layer.
+     */
+    async downloadArtifactText(sessionId: string, filename: string): Promise<string> {
+        validateSessionId(sessionId);
+        return this.downloadArtifact(sessionId, filename);
+    }
+
+    /**
      * List artifact files for a session.
      * Returns filenames (not full blob paths).
      */
     async listArtifacts(sessionId: string): Promise<string[]> {
+        validateSessionId(sessionId);
         const prefix = `artifacts/${sessionId}/`;
         const files: string[] = [];
         for await (const blob of this.containerClient.listBlobsFlat({ prefix })) {
@@ -381,9 +434,21 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
     }
 
     /**
+     * Delete a single artifact from blob storage.
+     * Returns true if the artifact existed and was deleted.
+     */
+    async deleteArtifact(sessionId: string, filename: string): Promise<boolean> {
+        validateSessionId(sessionId);
+        const blobPath = this.artifactBlobPath(sessionId, filename);
+        const result = await this.containerClient.getBlockBlobClient(blobPath).deleteIfExists();
+        return result.succeeded === true;
+    }
+
+    /**
      * Check if an artifact exists.
      */
     async artifactExists(sessionId: string, filename: string): Promise<boolean> {
+        validateSessionId(sessionId);
         const blobPath = this.artifactBlobPath(sessionId, filename);
         return this.containerClient.getBlockBlobClient(blobPath).exists();
     }
@@ -402,6 +467,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
         filename: string,
         expiryMinutes = 1,
     ): string {
+        validateSessionId(sessionId);
         if (!this.credential) {
             throw new Error("Cannot generate SAS URL: connection string has no AccountKey");
         }
@@ -430,6 +496,7 @@ export class SessionBlobStore implements SessionStateStore, ArtifactStore {
      * Delete all artifacts for a session.
      */
     async deleteArtifacts(sessionId: string): Promise<number> {
+        validateSessionId(sessionId);
         const prefix = `artifacts/${sessionId}/`;
         let count = 0;
         for await (const blob of this.containerClient.listBlobsFlat({ prefix })) {

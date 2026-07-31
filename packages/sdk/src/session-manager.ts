@@ -1,14 +1,17 @@
 import { CopilotClient, type CopilotSession, type SectionOverride, type SystemMessageConfig, type Tool } from "@github/copilot-sdk";
 import { ManagedSession } from "./managed-session.js";
 import type { SessionStateStore } from "./session-store.js";
+import { validateSessionId, resolveContainedSessionDir } from "./session-store.js";
 import { SESSION_STATE_MISSING_PREFIX, type ManagedSessionConfig, type SerializableSessionConfig } from "./types.js";
-import type { ModelProviderRegistry } from "./model-providers.js";
+import type { ModelProviderRegistry, ReasoningEffort } from "./model-providers.js";
+import { CodexRuntimeClient, type CodexTransport } from "./codex-runtime.js";
+import type { RuntimeKind } from "./runtime.js";
 import { createFactTools } from "./facts-tools.js";
 import { createInspectTools } from "./inspect-tools.js";
 import type { SessionCatalogProvider } from "./cms.js";
 import type { FactStore } from "./facts-store.js";
 import { buildKnowledgePromptBlocks, loadKnowledgeIndexFromFactStore } from "./knowledge-index.js";
-import { composeStructuredSystemMessage, extractPromptContent, mergePromptSections } from "./prompt-layering.js";
+import { composeStructuredSystemMessage, composeSystemPrompt, extractPromptContent, mergePromptSections } from "./prompt-layering.js";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -50,6 +53,37 @@ function isMissingDehydrateSnapshotError(error: unknown): boolean {
     return /Session state directory not ready during dehydrate/i.test(message);
 }
 
+const KNOWN_REASONING_EFFORTS: ReadonlySet<string> = new Set([
+    "low", "medium", "high", "xhigh", "max", "ultra",
+]);
+
+/**
+ * Reasoning-effort levels the Copilot SDK's `SessionConfig.reasoningEffort`
+ * accepts. `max` / `ultra` are Codex-only and must never be forwarded.
+ */
+const COPILOT_SDK_REASONING_EFFORTS: ReadonlySet<string> = new Set([
+    "low", "medium", "high", "xhigh",
+]);
+
+/** Lower-case/trim a caller-supplied reasoning effort; undefined when blank. */
+function normalizeReasoningEffortValue(value: unknown): string | undefined {
+    const effort = String(value ?? "").trim().toLowerCase();
+    return effort ? effort : undefined;
+}
+
+// Stubs for the legacy prompt-layers subsystem that shipped in a fork
+// but was removed on main. The Codex runtime path calls into these
+// helpers only to emit an optional `session.prompt_layers` telemetry
+// event; returning an empty layer set here is a safe no-op that keeps
+// the Codex branch buildable without dragging the whole subsystem in.
+type PromptLayerDescriptor = unknown;
+function buildEffectivePromptLayers(_defaults: WorkerDefaults, _config: ManagedSessionConfig): PromptLayerDescriptor[] {
+    return [];
+}
+function buildPromptLayersEventPayload(layers: PromptLayerDescriptor[]): Record<string, unknown> {
+    return { layers };
+}
+
 /** Worker-level defaults — applied to every session. */
 export interface WorkerDefaults {
     frameworkBasePrompt?: string;
@@ -66,6 +100,13 @@ export interface WorkerDefaults {
     customAgents?: Array<{ name: string; description?: string; prompt: string; tools?: string[] | null }>;
     /** MCP server configs to pass to the Copilot SDK. */
     mcpServers?: Record<string, any>;
+    /**
+     * Codex-native MCP server configs (safe to persist — env-var names
+     * only, never resolved secret values). Passed to Codex via
+     * `thread/start.config.mcp_servers` and `thread/resume.config.mcp_servers`.
+     * Never handed to the Copilot SDK.
+     */
+    codexMcpServers?: Record<string, any>;
     /**
      * @deprecated Use `modelProviders` instead. Kept for backwards compatibility.
      * Custom LLM provider config (BYOK). Passed to every session.
@@ -98,6 +139,10 @@ export interface WorkerDefaults {
 export class SessionManager {
     private client: CopilotClient | null = null;
     private sessions = new Map<string, ManagedSession>();
+    /** Codex runtime clients, keyed by CODEX_HOME. */
+    private codexClients = new Map<string, CodexRuntimeClient>();
+    /** Test-only transport factory for the Codex runtime. Never used in prod. */
+    private _codexTransportFactoryForTests: (() => any) | undefined = undefined;
     private sessionStore: SessionStateStore | null = null;
     /** In-memory configs with non-serializable fields (tools, hooks). */
     private sessionConfigs = new Map<string, ManagedSessionConfig>();
@@ -230,6 +275,36 @@ export class SessionManager {
     }
 
     /**
+     * Test-only: inject a fake Codex transport factory so `getOrCreate`
+     * with a codex-typed model can be exercised without spawning the
+     * real `codex app-server` process. Not part of the public API.
+     * @internal
+     */
+    _setCodexTransportFactoryForTests(factory: () => CodexTransport): void {
+        this._codexTransportFactoryForTests = factory;
+        // Wipe any cached client so the next getOrCreate picks up the
+        // injected transport.
+        for (const [, client] of this.codexClients) {
+            void client.stop();
+        }
+        this.codexClients.clear();
+    }
+
+    /** Get-or-create a CodexRuntimeClient for the given CODEX_HOME. */
+    private _ensureCodexClient(codexHome: string, codexBinaryPath?: string): CodexRuntimeClient {
+        const cached = this.codexClients.get(codexHome);
+        if (cached) return cached;
+        const client = new CodexRuntimeClient({
+            codexHome,
+            codexBinaryPath,
+            sessionStateDir: this.sessionStateDir,
+            transportFactory: this._codexTransportFactoryForTests,
+        });
+        this.codexClients.set(codexHome, client);
+        return client;
+    }
+
+    /**
      * Resolve the default model's SDK provider config.
      * Used by activities (e.g. summarizeSession) that need a lightweight LLM
      * without requiring a GitHub token.
@@ -240,6 +315,104 @@ export class SessionManager {
         const resolved = registry.resolve(registry.defaultModel);
         if (!resolved?.sdkProvider) return undefined;
         return { modelName: resolved.modelName, sdkProvider: resolved.sdkProvider };
+    }
+
+    /**
+     * Resolve the reasoning effort that the runtime should actually use for
+     * `model`, validated against the model descriptor.
+     *
+     * Rules:
+     *  - Model declares no `supportedReasoningEfforts` → pass the configured
+     *    value through untouched (providers without effort metadata must
+     *    keep working).
+     *  - Configured effort is supported → use it.
+     *  - Configured effort is unsupported → fall back to the model's
+     *    `defaultReasoningEffort` (when itself supported) or the first
+     *    supported value, and warn.
+     *  - No configured effort → apply the model's `defaultReasoningEffort`.
+     */
+    private _resolveEffectiveReasoningEffort(
+        sessionId: string,
+        model: string,
+        configured: string | undefined,
+    ): string | undefined {
+        const normalized = normalizeReasoningEffortValue(configured);
+        const descriptor = model ? this.workerDefaults.modelProviders?.getDescriptor(model) : undefined;
+        const supported = descriptor?.supportedReasoningEfforts;
+
+        if (!supported?.length) {
+            if (normalized && !KNOWN_REASONING_EFFORTS.has(normalized)) {
+                console.warn(
+                    `[SessionManager] session=${sessionId} ignoring unrecognized reasoningEffort ` +
+                    `"${configured}" for model "${model}".`,
+                );
+                return undefined;
+            }
+            return normalized;
+        }
+
+        if (normalized && supported.includes(normalized as ReasoningEffort)) return normalized;
+
+        const fallback = descriptor?.defaultReasoningEffort
+            && supported.includes(descriptor.defaultReasoningEffort)
+            ? descriptor.defaultReasoningEffort
+            : supported[0];
+
+        if (normalized) {
+            console.warn(
+                `[SessionManager] session=${sessionId} reasoningEffort "${configured}" is not supported by ` +
+                `model "${model}" (supported: ${supported.join(", ")}); falling back to "${fallback}".`,
+            );
+        }
+        return fallback;
+    }
+
+    /**
+     * True when a warm `ManagedSession` is still bound to the runtime,
+     * model, and reasoning effort the incoming config asks for. A warm
+     * handle that fails this check is bound to stale backend state (an
+     * old Codex thread config or an old Copilot model) and must be
+     * recycled instead of reused.
+     */
+    private _warmBindingMatches(
+        warm: ManagedSession,
+        desired: { runtimeKind: RuntimeKind; model: string; reasoningEffort?: string },
+    ): boolean {
+        if (warm.runtimeKind !== desired.runtimeKind) return false;
+        if ((warm.boundModel ?? "") !== (desired.model ?? "")) return false;
+        return (warm.boundReasoningEffort ?? undefined) === (desired.reasoningEffort ?? undefined);
+    }
+
+    /**
+     * Drop a warm handle whose runtime binding drifted, WITHOUT deleting
+     * any persisted state. The caller then falls through to the normal
+     * create/resume path so the backend picks up the new model/effort.
+     */
+    private async _recycleWarmSession(
+        sessionId: string,
+        warm: ManagedSession,
+        reason: string,
+        trace?: SessionTraceWriter,
+    ): Promise<void> {
+        emitSessionManagerTrace(sessionId, `recycling warm ${warm.runtimeKind} session: ${reason}`, { trace });
+        try {
+            await warm.destroy();
+        } catch (error: unknown) {
+            emitSessionManagerTrace(
+                sessionId,
+                `warm session recycle destroy failed error=${normalizeError(error).message}`,
+                { trace, level: "warn" },
+            );
+        }
+        if (this.sessions.get(sessionId) === warm) this.sessions.delete(sessionId);
+    }
+
+    /**
+     * Test-only accessor for the stored per-session config.
+     * @internal
+     */
+    getSessionConfigForTests(sessionId: string): ManagedSessionConfig | undefined {
+        return this.sessionConfigs.get(sessionId);
     }
 
     /** Ensure the CopilotClient is started. */
@@ -274,8 +447,19 @@ export class SessionManager {
         );
     }
 
-    private async _resetSessionState(sessionId: string): Promise<void> {
+    private async _resetSessionState(
+        sessionId: string,
+        options?: { runtimeKind?: RuntimeKind },
+    ): Promise<void> {
+        // Validate the session id at the FIRST statement so a malformed
+        // `../victim` id can never reach the map, the CopilotClient,
+        // the sessionStore, or the recursive `fs.rmSync` below. Using
+        // `resolveContainedSessionDir` both validates AND returns the
+        // safe absolute session directory used by the rm at the end,
+        // so we compute the containment guarantee exactly once.
+        const sessionDir = resolveContainedSessionDir(this.sessionStateDir, sessionId);
         const existing = this.sessions.get(sessionId);
+        const runtimeKind: RuntimeKind = options?.runtimeKind ?? existing?.runtimeKind ?? "copilot";
         if (existing) {
             try {
                 await existing.destroy();
@@ -283,12 +467,21 @@ export class SessionManager {
             this.sessions.delete(sessionId);
         }
 
-        try {
-            const client = await this.ensureClient();
-            await client.deleteSession(sessionId);
-        } catch {}
+        if (runtimeKind === "codex") {
+            // Codex state is owned by the Codex runtime clients. Routing a
+            // Codex reset through the Copilot client would spin up a
+            // CopilotClient (and demand a GitHub token) for a session that
+            // never used it.
+            for (const [, codexClient] of this.codexClients) {
+                try { await codexClient.deleteSession(sessionId); } catch {}
+            }
+        } else {
+            try {
+                const client = await this.ensureClient();
+                await client.deleteSession(sessionId);
+            } catch {}
+        }
 
-        const sessionDir = path.join(this.sessionStateDir, sessionId);
         if (fs.existsSync(sessionDir)) {
             fs.rmSync(sessionDir, { recursive: true, force: true });
         }
@@ -309,6 +502,15 @@ export class SessionManager {
         serializableConfig: SerializableSessionConfig,
         options?: { turnIndex?: number; trace?: SessionTraceWriter },
     ): Promise<ManagedSession> {
+        // Validate the session id at the outermost public entry point
+        // — before the session-lock table interaction and before any
+        // Copilot/Codex branch runs. The Codex branch has its own
+        // first-line validator too (see rounds R3/R4) so both remain
+        // independently safe; this guard is what prevents a malformed
+        // id from reaching the Copilot turn0 stale-reset path
+        // (`_resetSessionState` → `fs.rmSync(sessionDir, { recursive })`)
+        // even when `sessionStore.exists()` throws for the same id.
+        validateSessionId(sessionId);
         const turnIndex = options?.turnIndex;
         const trace = options?.trace;
         const inheritedToolNames = Array.from(new Set([
@@ -332,7 +534,6 @@ export class SessionManager {
         };
         this.sessionConfigs.set(sessionId, config);
 
-        const client = await this.ensureClient();
         const sessionDir = path.join(this.sessionStateDir, sessionId);
 
         // Merge user tools with system tool definitions (wait, ask_user, sub-agent tools)
@@ -386,25 +587,266 @@ export class SessionManager {
         ];
         config.tools = persistentSessionTools;
 
-        // Build system message: worker base + client override
+        // Build system message once so both Copilot and Codex branches see
+        // the same effective prompt. Copilot takes the structured
+        // SystemMessageConfig; Codex takes the flat-text equivalent via
+        // `developerInstructions`. Content must be identical.
         const systemMessage = this._buildSystemMessage(sessionId, config);
+        const developerInstructionsText = this._buildFlatSystemPrompt(sessionId, config);
 
-        // Resolve model: config.model may be qualified (provider:model) or bare.
-        // The SDK needs the bare model name; the provider config is separate.
-        // Fall back to registry default if no model specified.
+        // Resolve model & provider up-front. Both the Codex and Copilot
+        // branches need this — Codex branches on `resolvedProvider.type`,
+        // Copilot needs `sdkModelName` and `resolvedProviderConfig`.
         const registry = this.workerDefaults.modelProviders;
         const effectiveModel = this.normalizeModelRef(config.model) || "";
-        const resolvedProviderConfig = this._resolveProviderConfig(effectiveModel);
+        const resolvedProvider = registry?.resolve(effectiveModel);
         let sdkModelName = effectiveModel;
         if (registry && effectiveModel) {
             const desc = registry.getDescriptor(effectiveModel);
             if (desc) sdkModelName = desc.modelName;
         }
 
+        // Reasoning effort is model-scoped. Validate the configured value
+        // against the model descriptor and write the resolved value back
+        // into the stored config so the UI, CMS, and the runtime all agree
+        // on the effort that actually reaches the backend.
+        const desiredRuntimeKind: RuntimeKind = resolvedProvider?.type === "codex" ? "codex" : "copilot";
+        const effectiveReasoningEffort = this._resolveEffectiveReasoningEffort(
+            sessionId,
+            effectiveModel,
+            config.reasoningEffort,
+        );
+        if (effectiveReasoningEffort !== undefined) {
+            config.reasoningEffort = effectiveReasoningEffort;
+        } else {
+            delete config.reasoningEffort;
+        }
+
+        // A warm ManagedSession is bound to the runtime kind, model, and
+        // reasoning effort its underlying handle was created with. Reusing
+        // it after any of those drift (set_model, cross-provider switch,
+        // effort change) would silently keep running the old backend
+        // configuration, so recycle it here — BEFORE either branch's warm
+        // reuse path — and let the normal create/resume path rebuild it.
+        //
+        // turnIndex 0 is left alone: both branches already discard warm
+        // state for a fresh turn 0.
+        let forceFreshRuntimeSession = false;
+        const warmBeforeBranch = turnIndex === 0 ? undefined : this.sessions.get(sessionId);
+        if (warmBeforeBranch && !this._warmBindingMatches(warmBeforeBranch, {
+            runtimeKind: desiredRuntimeKind,
+            model: effectiveModel,
+            reasoningEffort: effectiveReasoningEffort,
+        })) {
+            const previousKind = warmBeforeBranch.runtimeKind;
+            forceFreshRuntimeSession = previousKind !== desiredRuntimeKind;
+            await this._recycleWarmSession(
+                sessionId,
+                warmBeforeBranch,
+                `runtime=${previousKind}->${desiredRuntimeKind} ` +
+                `model=${warmBeforeBranch.boundModel ?? "none"}->${effectiveModel || "none"} ` +
+                `effort=${warmBeforeBranch.boundReasoningEffort ?? "none"}->${effectiveReasoningEffort ?? "none"}`,
+                trace,
+            );
+            if (forceFreshRuntimeSession) {
+                // The persisted state belongs to the PREVIOUS runtime; the
+                // new runtime has nothing it can resume from, so purge it
+                // (through the previous runtime's own teardown path) and
+                // start a fresh session on the new backend.
+                await this._resetSessionState(sessionId, { runtimeKind: previousKind });
+            }
+        }
+
+        // ── Codex runtime routing ─────────────────────────
+        // Codex subscription sessions do NOT use the Copilot SDK client
+        // at all — they talk to a locally running `codex app-server`
+        // through the CodexRuntimeClient. We branch here (after the
+        // shared tool assembly and system-prompt build) so ManagedSession
+        // still receives the same tool set and prompt layers, and we
+        // skip every Copilot-specific piece of session config below.
+        if (resolvedProvider?.type === "codex") {
+            // Validate the session id BEFORE any FS probe, sessionStore
+            // call, or Codex runtime call. Without this, a malformed
+            // `../victim` id could reach `sessionStore.exists()` /
+            // `.delete()` / `.hydrate()` and escape the store /
+            // sessionStateDir roots before the Codex runtime's own
+            // validation ever ran.
+            validateSessionId(sessionId);
+            const runtime = resolvedProvider.codexRuntime;
+            if (!runtime?.codexHome) {
+                throw new Error(
+                    `Codex provider "${resolvedProvider.providerId}" is missing a resolved CODEX_HOME. ` +
+                    `Set codexHome in the provider config.`,
+                );
+            }
+            const codexClient = this._ensureCodexClient(runtime.codexHome, runtime.codexBinaryPath);
+
+            const warmCodex = this.sessions.get(sessionId);
+            if (warmCodex) {
+                if (turnIndex === 0) {
+                    try { await warmCodex.destroy(); } catch {}
+                    this.sessions.delete(sessionId);
+                    try { await codexClient.deleteSession(sessionId); } catch {}
+                } else {
+                    warmCodex.updateConfig(config);
+                    return warmCodex;
+                }
+            }
+
+            const codexStateFile = path.join(sessionDir, "codex-thread.json");
+            const codexLocalExists = fs.existsSync(codexStateFile);
+            const codexLocalUsable = codexClient.hasUsableThreadState(sessionId);
+            let codexStoredExists = false;
+            if (this.sessionStore) {
+                try {
+                    codexStoredExists = await this.sessionStore.exists(sessionId);
+                } catch (error: unknown) {
+                    emitSessionManagerTrace(
+                        sessionId,
+                        `codex session-store exists probe failed turnIndex=${turnIndex ?? "unknown"} error=${normalizeError(error).message}`,
+                        { trace, level: "warn" },
+                    );
+                    codexStoredExists = false;
+                }
+            }
+            emitSessionManagerTrace(
+                sessionId,
+                `codex resume probe turnIndex=${turnIndex ?? "unknown"} localExists=${codexLocalExists} ` +
+                `localUsable=${codexLocalUsable} storedExists=${codexStoredExists}`,
+                { trace },
+            );
+
+            const codexMcpServers = this.workerDefaults.codexMcpServers;
+            const hasCodexMcp = codexMcpServers && Object.keys(codexMcpServers).length > 0;
+            const codexAppServerConfig: Record<string, unknown> | undefined = hasCodexMcp
+                ? { mcp_servers: codexMcpServers }
+                : undefined;
+
+            const codexCreateConfig = {
+                sessionId,
+                model: sdkModelName || undefined,
+                cwd: config.workingDirectory || undefined,
+                developerInstructions: developerInstructionsText || undefined,
+                reasoningEffort: config.reasoningEffort || undefined,
+                tools: allTools,
+                ...(codexAppServerConfig ? { config: codexAppServerConfig } : {}),
+            };
+
+            /** Verifies hydration actually restored a usable codex-thread.json marker. */
+            const ensureCodexMarker = () => {
+                if (codexClient.hasUsableThreadState(sessionId)) return;
+                throw this._missingSessionStateError(
+                    sessionId, turnIndex ?? 0,
+                    ` Hydration completed but ${codexStateFile} is missing or invalid.`,
+                );
+            };
+
+            let codexSessionHandle;
+            if (turnIndex === 0 || forceFreshRuntimeSession) {
+                if (codexLocalExists || codexStoredExists) {
+                    // Fresh turn 0 — discard stale local + stored state so
+                    // we begin a genuinely fresh Codex thread.
+                    try { await codexClient.deleteSession(sessionId); } catch {}
+                    if (this.sessionStore && codexStoredExists) {
+                        try { await this.sessionStore.delete(sessionId); } catch {}
+                    }
+                }
+                codexSessionHandle = await codexClient.createSession(codexCreateConfig);
+            } else if (turnIndex != null && turnIndex > 0) {
+                if (codexLocalUsable) {
+                    emitSessionManagerTrace(sessionId, "codex turn>0 resuming from local session directory", { trace });
+                    codexSessionHandle = await codexClient.resumeSession(sessionId, codexCreateConfig);
+                } else if (this.sessionStore && codexStoredExists) {
+                    emitSessionManagerTrace(sessionId, "codex turn>0 hydrating from session store before resume", { trace });
+                    try {
+                        await this.sessionStore.hydrate(sessionId);
+                    } catch (error: unknown) {
+                        emitSessionManagerTrace(
+                            sessionId,
+                            `codex turn>0 hydrate before resume failed error=${normalizeError(error).message}`,
+                            { trace, level: "warn" },
+                        );
+                        throw error;
+                    }
+                    ensureCodexMarker();
+                    emitSessionManagerTrace(sessionId, "codex turn>0 hydrate restored session directory; resuming session", { trace });
+                    codexSessionHandle = await codexClient.resumeSession(sessionId, codexCreateConfig);
+                } else {
+                    emitSessionManagerTrace(
+                        sessionId,
+                        `codex turn>0 missing resumable state localExists=${codexLocalExists} ` +
+                        `localUsable=${codexLocalUsable} storedExists=${codexStoredExists}`,
+                        { trace, level: "warn" },
+                    );
+                    throw this._missingSessionStateError(
+                        sessionId, turnIndex,
+                        ` No persisted Codex thread mapping was found at ${codexStateFile}.`,
+                    );
+                }
+            } else {
+                // Backward-compatible permissive path.
+                if (codexLocalUsable) {
+                    codexSessionHandle = await codexClient.resumeSession(sessionId, codexCreateConfig);
+                } else if (this.sessionStore && codexStoredExists) {
+                    try {
+                        await this.sessionStore.hydrate(sessionId);
+                        if (codexClient.hasUsableThreadState(sessionId)) {
+                            codexSessionHandle = await codexClient.resumeSession(sessionId, codexCreateConfig);
+                        } else {
+                            codexSessionHandle = await codexClient.createSession(codexCreateConfig);
+                        }
+                    } catch {
+                        codexSessionHandle = await codexClient.createSession(codexCreateConfig);
+                    }
+                } else {
+                    codexSessionHandle = await codexClient.createSession(codexCreateConfig);
+                }
+            }
+
+            if (allTools.length) codexSessionHandle.registerTools(allTools as any);
+
+            const managedCodex = new ManagedSession(sessionId, codexSessionHandle as any, config, {
+                runtimeKind: "codex",
+                boundModel: effectiveModel,
+                boundReasoningEffort: effectiveReasoningEffort,
+            });
+            this.sessions.set(sessionId, managedCodex);
+            const codexPromptLayers = buildEffectivePromptLayers(this.workerDefaults, config);
+            if (codexPromptLayers.length > 0 && this.sessionCatalog) {
+                void this.sessionCatalog.recordEvents(sessionId, [{
+                    eventType: "session.prompt_layers",
+                    data: buildPromptLayersEventPayload(codexPromptLayers),
+                }]).catch(() => {});
+            }
+            return managedCodex;
+        }
+
+        if (resolvedProvider?.type === "github" && !this.githubToken && !resolvedProvider.githubToken) {
+            throw new Error(
+                `GitHub Copilot key not configured for provider "${resolvedProvider.providerId}". ` +
+                "Set githubToken in the provider configuration or pass a GitHub Copilot key to the worker.",
+            );
+        }
+
+        const client = await this.ensureClient();
+
+        // Resolve model: config.model may be qualified (provider:model) or bare.
+        // The SDK needs the bare model name; the provider config is separate.
+        // (Model + provider already resolved above; only need provider-config here.)
+        const resolvedProviderConfig = this._resolveProviderConfig(effectiveModel);
+
         const sessionConfig: any = {
             sessionId,
             tools: allTools,
             model: sdkModelName,
+            // Only forward efforts the Copilot SDK understands. Codex-only
+            // levels (max/ultra) never reach here because
+            // `_resolveEffectiveReasoningEffort` already mapped them to a
+            // supported value for models that declare metadata; models with
+            // no metadata simply pass through whatever the caller set.
+            ...(effectiveReasoningEffort && COPILOT_SDK_REASONING_EFFORTS.has(effectiveReasoningEffort)
+                ? { reasoningEffort: effectiveReasoningEffort }
+                : {}),
             systemMessage: systemMessage
                 ? (typeof systemMessage === "string" ? { content: systemMessage } : systemMessage)
                 : undefined,
@@ -464,7 +906,7 @@ export class SessionManager {
             { trace },
         );
 
-        if (turnIndex === 0) {
+        if (turnIndex === 0 || forceFreshRuntimeSession) {
             if (localExists || storedExists) {
                 console.warn(
                     `[SessionManager] stale persisted Copilot session found for turn 0 (${sessionId}); ` +
@@ -528,7 +970,11 @@ export class SessionManager {
             }
         }
 
-        const managed = new ManagedSession(sessionId, copilotSession, config);
+        const managed = new ManagedSession(sessionId, copilotSession, config, {
+            runtimeKind: "copilot",
+            boundModel: effectiveModel,
+            boundReasoningEffort: effectiveReasoningEffort,
+        });
         this.sessions.set(sessionId, managed);
         return managed;
     }
@@ -552,6 +998,11 @@ export class SessionManager {
      * recover before we bubble a terminal error back to the orchestration.
      */
     async dehydrate(sessionId: string, reason: string, options?: { trace?: SessionTraceWriter }): Promise<void> {
+        // Validate BEFORE the destroy/rm/store pipeline. `sessionDir`
+        // is computed from the same id and later used in
+        // `fs.rmSync(sessionDir, { recursive })` — a traversal here
+        // would follow through to the outer filesystem.
+        validateSessionId(sessionId);
         const DESTROY_MAX_RETRIES = 3;
         const trace = options?.trace;
         let lastDestroyError: Error | undefined;
@@ -561,6 +1012,13 @@ export class SessionManager {
         emitSessionManagerTrace(sessionId, `dehydrate start reason=${reason}`, { trace });
 
         if (this.sessionStore && fs.existsSync(sessionDir)) {
+            // Give runtime backends (Codex) a chance to copy their
+            // durable state into the session directory before we
+            // snapshot it. No-op for Copilot.
+            const warmForCheckpoint = this.sessions.get(sessionId);
+            if (warmForCheckpoint) {
+                try { warmForCheckpoint.snapshotForCheckpoint(); } catch {}
+            }
             try {
                 emitSessionManagerTrace(sessionId, "pre-dehydrate checkpoint start", { trace });
                 await this.sessionStore.checkpoint(sessionId);
@@ -601,6 +1059,18 @@ export class SessionManager {
 
                 if (attempt < DESTROY_MAX_RETRIES) {
                     // Re-create the session from local files so we can try destroy again.
+                    // Only the Copilot runtime supports this recovery: a
+                    // Codex-backed session must NEVER be resumed through the
+                    // Copilot client (wrong backend, and it would force a
+                    // CopilotClient/GitHub token onto a Codex-only worker).
+                    if (session.runtimeKind !== "copilot") {
+                        emitSessionManagerTrace(
+                            sessionId,
+                            `destroy retry skipped for runtime=${session.runtimeKind}; no Copilot resume fallback`,
+                            { trace, level: "warn" },
+                        );
+                        break;
+                    }
                     if (fs.existsSync(sessionDir)) {
                         try {
                             const client = await this.ensureClient();
@@ -797,14 +1267,30 @@ export class SessionManager {
      * runtime must recreate a fresh Copilot session for lossy replay.
      */
     async resetSessionState(sessionId: string): Promise<void> {
+        // Validate BEFORE _resetSessionState touches session state.
+        validateSessionId(sessionId);
         await this._resetSessionState(sessionId);
     }
 
     /**
      * Checkpoint session state without destroying the session or
      * releasing affinity. Used for crash resilience — session stays warm.
+     *
+     * For runtimes that keep durable state outside the PilotSwarm
+     * session directory (currently Codex), we first invoke the runtime
+     * session's `snapshot()` hook so that state lands inside the
+     * session directory before the store archives it.
      */
     async checkpoint(sessionId: string): Promise<void> {
+        const warm = this.sessions.get(sessionId);
+        if (warm) {
+            try {
+                warm.snapshotForCheckpoint();
+            } catch {
+                // Snapshot is best-effort — never block the checkpoint
+                // itself on a filesystem hiccup.
+            }
+        }
         if (this.sessionStore) {
             await this.sessionStore.checkpoint(sessionId);
         }
@@ -815,7 +1301,7 @@ export class SessionManager {
         return [...this.sessions.keys()];
     }
 
-    /** Shutdown: destroy all sessions, stop CopilotClient. */
+    /** Shutdown: destroy all sessions, stop every runtime client. */
     async shutdown(): Promise<void> {
         for (const [_, session] of this.sessions) {
             try { await session.destroy(); } catch {}
@@ -825,21 +1311,63 @@ export class SessionManager {
             await this.client.stop();
             this.client = null;
         }
+        // Codex runtime clients keep long-lived `codex app-server`
+        // subprocesses (one per CODEX_HOME). Leaking them would keep
+        // the worker process alive after `shutdown()` returned.
+        for (const [, client] of this.codexClients) {
+            try { await client.stop(); } catch {}
+        }
+        this.codexClients.clear();
+    }
+
+    /**
+     * Test-only accessor for the number of cached Codex runtime clients.
+     * Not part of the public API.
+     * @internal
+     */
+    getCachedCodexClientCountForTests(): number {
+        return this.codexClients.size;
     }
 
     /**
      * Resolve tools from per-session config + worker-level registry.
      * Per-session tools take precedence over registry tools with the same name.
+     *
+     * Also emits a diagnostic warning when explicit `toolNames` cannot
+     * be resolved from the worker registry AND are not exposed by the
+     * Codex-native MCP config (server name prefix or `enabled_tools`
+     * membership). This is a warning — not a throw — because exact
+     * cross-server tool inventory is not always available at session
+     * creation time (Codex will validate at first use). See
+     * `feat/codex-runtime` fix: portal embedded workers previously
+     * silently dropped `teams_alert` because the tool was never
+     * registered there.
      */
     private _resolveTools(
         storedConfig: ManagedSessionConfig | undefined,
         serializableConfig: SerializableSessionConfig,
     ): Tool<any>[] {
         const registryTools: Tool<any>[] = [];
+        const perSessionNames = new Set<string>(
+            (storedConfig?.tools ?? []).map((t: any) => (t && typeof t.name === "string") ? t.name : "").filter(Boolean),
+        );
+        const codexMcpExposedNames = this._codexExposedToolNamesForDiagnostic();
         if (serializableConfig.toolNames?.length) {
             for (const name of serializableConfig.toolNames) {
                 const tool = this.toolRegistry.get(name);
-                if (tool) registryTools.push(tool);
+                if (tool) {
+                    registryTools.push(tool);
+                    continue;
+                }
+                if (perSessionNames.has(name)) continue;
+                if (codexMcpExposedNames.exposed.has(name)) continue;
+                if (this._matchesAnyCodexServerPrefix(name, codexMcpExposedNames.wildcardServers)) continue;
+                console.warn(
+                    `[SessionManager] tool "${name}" listed in toolNames is not registered on this worker ` +
+                    `and is not exposed by any configured Codex MCP server. ` +
+                    `The session will start, but the model will not be able to call it. ` +
+                    `Register it via PilotSwarmWorker.registerTools([...]) on THIS worker process.`,
+                );
             }
         }
 
@@ -859,6 +1387,71 @@ export class SessionManager {
             }
         }
         return deduped;
+    }
+
+    /**
+     * Best-effort inventory of tool names the configured Codex MCP
+     * servers can expose. Used only to silence the toolName diagnostic
+     * for names that a Codex native MCP will provide at runtime — never
+     * fatal, never used for permission or scheduling decisions.
+     *
+     * `exposed` holds names known EXACTLY (from `enabled_tools`
+     * allow-lists). `wildcardServers` holds the names of servers that
+     * declared no allow-list; for those we suppress only names in that
+     * server's plausible namespace (see `_matchesAnyCodexServerPrefix`).
+     *
+     * The pre-Round-3 behavior of a single global `wildcard` boolean
+     * was wrong: one server with no allow-list silenced EVERY
+     * unresolved worker toolName, defeating the deployment-topology
+     * diagnostic that catches missing tools like `teams_alert` on
+     * portal embedded workers.
+     * @internal
+     */
+    private _codexExposedToolNamesForDiagnostic(): { exposed: Set<string>; wildcardServers: string[] } {
+        const exposed = new Set<string>();
+        const wildcardServers: string[] = [];
+        const codexMcp = this.workerDefaults.codexMcpServers;
+        if (!codexMcp || typeof codexMcp !== "object") return { exposed, wildcardServers };
+        for (const [serverName, cfg] of Object.entries(codexMcp)) {
+            if (!cfg || typeof cfg !== "object") continue;
+            const enabled = (cfg as any).enabled_tools;
+            if (Array.isArray(enabled)) {
+                for (const t of enabled) {
+                    if (typeof t === "string" && t) exposed.add(t);
+                }
+                continue;
+            }
+            // No allow-list -> plausible-namespace suppression only.
+            wildcardServers.push(serverName);
+        }
+        return { exposed, wildcardServers };
+    }
+
+    /**
+     * True when `name` looks like it could be an MCP tool exposed by
+     * one of the wildcard-configured Codex servers. Two common
+     * namespaces are matched:
+     *   - `<server>_<toolName>`   (Codex's own concatenation pattern)
+     *   - `mcp__<server>__<tool>` (Copilot SDK / MCP client style)
+     *
+     * Server names are normalized for comparison (case-insensitive;
+     * hyphens and dots treated as underscores) so `signoz-prod`
+     * matches `signoz_prod_query`.
+     *
+     * Deliberately conservative: names that do not carry any server
+     * namespace still warn, which is the correct behavior for the
+     * deployment-topology diagnostic.
+     * @internal
+     */
+    private _matchesAnyCodexServerPrefix(name: string, wildcardServers: readonly string[]): boolean {
+        if (!wildcardServers.length) return false;
+        const lowerName = name.toLowerCase();
+        for (const server of wildcardServers) {
+            const normalized = server.toLowerCase().replace(/[-.]/g, "_");
+            if (lowerName.startsWith(`${normalized}_`)) return true;
+            if (lowerName.startsWith(`mcp__${normalized}__`)) return true;
+        }
+        return false;
     }
 
     /**
@@ -955,6 +1548,36 @@ export class SessionManager {
                 ? undefined
                 : this.workerDefaults.appDefaultPrompt,
             additionalSections,
+        });
+    }
+
+    /**
+     * Flat-text equivalent of the structured system message, used by
+     * runtimes (currently Codex) whose protocol takes a plain
+     * `developerInstructions` string instead of the Copilot SDK's
+     * structured SystemMessageConfig. Composed via the same helper so
+     * layer ordering and headers stay in sync.
+     */
+    private _buildFlatSystemPrompt(
+        sessionId: string,
+        config: SerializableSessionConfig,
+    ): string | undefined {
+        const frameworkBase = this.workerDefaults.frameworkBasePrompt ?? this.workerDefaults.systemMessage;
+        const boundAgentName = config.boundAgentName;
+        const layerKind = config.promptLayering?.kind ?? (boundAgentName ? "app-agent" : undefined);
+        const isPilotSwarmSystemAgent = layerKind === "pilotswarm-system-agent";
+        const activeAgentPrompt = boundAgentName
+            ? this.workerDefaults.agentPromptLookup?.[boundAgentName]?.prompt
+            : undefined;
+        const runtimeContext = mergePromptSections([
+            extractPromptContent(config.systemMessage),
+            config.turnSystemPrompt,
+        ]);
+        return composeSystemPrompt({
+            frameworkBase,
+            appDefault: isPilotSwarmSystemAgent ? undefined : this.workerDefaults.appDefaultPrompt,
+            activeAgentPrompt,
+            runtimeContext,
         });
     }
 }

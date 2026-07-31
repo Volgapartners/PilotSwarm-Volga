@@ -43,6 +43,37 @@ const FULLSCREENABLE_PANES = new Set([
     FOCUS_REGIONS.ACTIVITY,
 ]);
 
+const REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
+
+/**
+ * Normalize a model's advertised reasoning efforts: lowercase, de-duplicated,
+ * unknown values dropped. Order follows the model's own advertised order so a
+ * provider can express its preferred ordering.
+ */
+function normalizeReasoningEfforts(values) {
+    if (!Array.isArray(values)) return [];
+    const out = [];
+    for (const raw of values) {
+        const value = String(raw || "").trim().toLowerCase();
+        if (!REASONING_EFFORTS.includes(value)) continue;
+        if (out.includes(value)) continue;
+        out.push(value);
+    }
+    return out;
+}
+
+/**
+ * Resolve the effort that should be preselected for a model. Falls back to the
+ * first supported effort when the advertised default is missing or unsupported.
+ */
+function resolveDefaultReasoningEffort(modelItem) {
+    const supported = normalizeReasoningEfforts(modelItem?.supportedReasoningEfforts);
+    if (!supported.length) return null;
+    const preferred = String(modelItem?.defaultReasoningEffort || "").trim().toLowerCase();
+    if (preferred && supported.includes(preferred)) return preferred;
+    return supported[0];
+}
+
 function groupModelsByProvider(models = []) {
     const groups = [];
     const byProvider = new Map();
@@ -1916,6 +1947,47 @@ export class PilotSwarmUiController {
         await this.openSessionAgentPicker(options);
     }
 
+    openReasoningEffortPicker(modelItem, sessionOptions = {}) {
+        const supported = normalizeReasoningEfforts(modelItem?.supportedReasoningEfforts);
+        const selectedEffort = resolveDefaultReasoningEffort(modelItem);
+        if (!supported.length || !selectedEffort) {
+            this.openNewSessionFlow(sessionOptions).catch(() => {});
+            return;
+        }
+        // Skip the picker when the model only exposes a single effort — there
+        // is nothing to choose. Apply the sole supported value and continue
+        // to the agent picker / session creation flow.
+        if (supported.length === 1) {
+            const soleEffort = supported[0];
+            this.openNewSessionFlow({
+                ...sessionOptions,
+                reasoningEffort: soleEffort,
+            }).catch(() => {});
+            return;
+        }
+
+        const items = supported.map((effort) => ({
+            id: effort,
+            effort,
+            label: effort,
+            isDefault: selectedEffort === effort,
+        }));
+        const selectedIndex = Math.max(0, items.findIndex((item) => item.id === selectedEffort));
+        this.dispatch({
+            type: "ui/modal",
+            modal: {
+                type: "reasoningEffortPicker",
+                title: `Reasoning effort for ${modelItem?.modelName || modelItem?.qualifiedName || "model"}`,
+                items,
+                selectedIndex,
+                previousFocus: this.getState().ui.focusRegion,
+                modelItem,
+                sessionOptions,
+            },
+        });
+        this.dispatch({ type: "ui/status", text: "Select a reasoning effort and press Enter" });
+    }
+
     async openModelPicker() {
         if (typeof this.transport.listModels !== "function") {
             await this.openNewSessionFlow();
@@ -1948,6 +2020,8 @@ export class PilotSwarmUiController {
                         providerType: model.providerType || group.type || group.providerType,
                         description: model.description || "",
                         cost: model.cost || null,
+                        supportedReasoningEfforts: normalizeReasoningEfforts(model.supportedReasoningEfforts),
+                        defaultReasoningEffort: resolveDefaultReasoningEffort(model),
                         isDefault: defaultModel === model.qualifiedName,
                     };
                     items.push(item);
@@ -2619,7 +2693,26 @@ export class PilotSwarmUiController {
             if (previousFocus) {
                 this.setFocus(previousFocus);
             }
-            await this.openNewSessionFlow(item?.id ? { model: item.id } : {});
+            const sessionOptions = item?.id ? { model: item.id } : {};
+            if (item && normalizeReasoningEfforts(item.supportedReasoningEfforts).length > 0) {
+                this.openReasoningEffortPicker(item, sessionOptions);
+                return;
+            }
+            await this.openNewSessionFlow(sessionOptions);
+            return;
+        }
+        if (modal.type === "reasoningEffortPicker") {
+            const item = modal.items?.[modal.selectedIndex || 0];
+            const previousFocus = modal.previousFocus;
+            const sessionOptions = modal.sessionOptions || {};
+            this.dispatch({ type: "ui/modal", modal: null });
+            if (previousFocus) {
+                this.setFocus(previousFocus);
+            }
+            await this.openNewSessionFlow({
+                ...sessionOptions,
+                ...(item?.effort ? { reasoningEffort: item.effort } : {}),
+            });
             return;
         }
         if (modal.type === "sessionAgentPicker") {

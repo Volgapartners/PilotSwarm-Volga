@@ -101,6 +101,57 @@
                     "cost": "medium"
                 }
             ]
+        },
+        {
+            "_comment": "Codex subscription runtime. Uses a local `codex app-server` over stdio and requires no apiKey. Auth stays in CODEX_HOME/auth.json under the worker service user; PilotSwarm never reads or persists it. Trusted single-operator use only: run one dedicated Codex worker per CODEX_HOME and keep portal/TUI processes client-only. Model names and efforts must match app-server `model/list` on the target machine (verified with codex-cli 0.145.0 subscription).",
+            "id": "codex-subscription",
+            "type": "codex",
+            "codexHome": "env:CODEX_HOME",
+            "codexBinaryPath": "env:CODEX_BINARY_PATH",
+            "models": [
+                {
+                    "name": "gpt-5.6-sol",
+                    "description": "Codex GPT-5.6 Sol.",
+                    "cost": "medium",
+                    "supportedReasoningEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+                    "defaultReasoningEffort": "low"
+                },
+                {
+                    "name": "gpt-5.6-terra",
+                    "description": "Codex GPT-5.6 Terra.",
+                    "cost": "medium",
+                    "supportedReasoningEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+                    "defaultReasoningEffort": "medium"
+                },
+                {
+                    "name": "gpt-5.6-luna",
+                    "description": "Codex GPT-5.6 Luna.",
+                    "cost": "medium",
+                    "supportedReasoningEfforts": ["low", "medium", "high", "xhigh", "max"],
+                    "defaultReasoningEffort": "medium"
+                },
+                {
+                    "name": "gpt-5.5",
+                    "description": "Codex GPT-5.5.",
+                    "cost": "medium",
+                    "supportedReasoningEfforts": ["low", "medium", "high", "xhigh"],
+                    "defaultReasoningEffort": "medium"
+                },
+                {
+                    "name": "gpt-5.4",
+                    "description": "Codex GPT-5.4.",
+                    "cost": "medium",
+                    "supportedReasoningEfforts": ["low", "medium", "high", "xhigh"],
+                    "defaultReasoningEffort": "medium"
+                },
+                {
+                    "name": "gpt-5.4-mini",
+                    "description": "Codex GPT-5.4 Mini.",
+                    "cost": "medium",
+                    "supportedReasoningEfforts": ["low", "medium", "high", "xhigh"],
+                    "defaultReasoningEffort": "medium"
+                }
+            ]
         }
     ],
     "_defaultModel_opus46": "anthropic:claude-opus-4-6",

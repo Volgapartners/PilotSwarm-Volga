@@ -19,6 +19,9 @@ import path from "node:path";
 
 // ─── Types ───────────────────────────────────────────────────────
 
+/** Reasoning effort levels accepted by the Copilot SDK and Codex runtime. */
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+
 /** A model entry within a provider. */
 export interface ModelEntry {
     /** Model name (deployment name for Azure). */
@@ -27,6 +30,16 @@ export interface ModelEntry {
     description?: string;
     /** Relative cost tier. */
     cost?: "low" | "medium" | "high";
+    /**
+     * Reasoning-effort values this model accepts. Unrecognized values are
+     * dropped; order and duplicates are normalized.
+     */
+    supportedReasoningEfforts?: ReasoningEffort[];
+    /**
+     * Reasoning effort applied when the caller does not pick one. Ignored
+     * unless it is present in `supportedReasoningEfforts`.
+     */
+    defaultReasoningEffort?: ReasoningEffort;
 }
 
 /** A single provider entry in model_providers.json. */
@@ -34,7 +47,7 @@ export interface ModelProviderConfig {
     /** Unique identifier for this provider (e.g. "azure-openai", "github-copilot"). */
     id: string;
     /** Provider type. */
-    type: "github" | "azure" | "openai" | "anthropic";
+    type: "github" | "azure" | "openai" | "anthropic" | "codex";
     /**
      * GitHub token (type=github only). Supports `env:VAR_NAME` syntax.
      * When type=github, the SDK uses the Copilot API — no baseUrl needed.
@@ -51,6 +64,18 @@ export interface ModelProviderConfig {
     apiKey?: string;
     /** Azure API version (type=azure only). Defaults to "2024-10-21". */
     apiVersion?: string;
+    /**
+     * Codex CODEX_HOME directory (type=codex only). Supports `env:VAR_NAME`.
+     * Auth (`auth.json`) lives inside this directory but is never read,
+     * copied, or logged by PilotSwarm. The runtime only ensures the
+     * directory exists with mode 0700.
+     */
+    codexHome?: string;
+    /**
+     * Absolute path to the `codex` binary (type=codex only). If omitted the
+     * runtime resolves `codex` from `PATH`. Supports `env:VAR_NAME`.
+     */
+    codexBinaryPath?: string;
     /** Available models. Can be plain strings (legacy) or ModelEntry objects with descriptions. */
     models: (string | ModelEntry)[];
 }
@@ -71,11 +96,15 @@ export interface ModelDescriptor {
     /** Provider ID. */
     providerId: string;
     /** Provider type. */
-    providerType: "github" | "azure" | "openai" | "anthropic";
+    providerType: "github" | "azure" | "openai" | "anthropic" | "codex";
     /** Short description of when to use this model. */
     description?: string;
     /** Relative cost tier. */
     cost?: "low" | "medium" | "high";
+    /** Normalized reasoning-effort values this model accepts. */
+    supportedReasoningEfforts?: ReasoningEffort[];
+    /** Reasoning effort applied when the caller does not pick one. */
+    defaultReasoningEffort?: ReasoningEffort;
 }
 
 /** Resolved provider info for a specific model — ready to use. */
@@ -83,20 +112,31 @@ export interface ResolvedProvider {
     /** The provider ID from model_providers.json. */
     providerId: string;
     /** Provider type. */
-    type: "github" | "azure" | "openai" | "anthropic";
+    type: "github" | "azure" | "openai" | "anthropic" | "codex";
     /** Raw model name (for SDK config). */
     modelName: string;
     /** Resolved GitHub token (type=github only). */
     githubToken?: string;
     /**
      * Copilot SDK ProviderConfig — passed to SessionConfig.provider.
-     * Undefined for type=github (uses githubToken instead).
+     * Undefined for type=github (uses githubToken instead) and type=codex
+     * (uses codexRuntime instead).
      */
     sdkProvider?: {
         type: "openai" | "azure" | "anthropic";
         baseUrl: string;
         apiKey?: string;
         azure?: { apiVersion?: string };
+    };
+    /**
+     * Codex runtime config — passed to the Codex runtime adapter.
+     * Populated only for type=codex.
+     */
+    codexRuntime?: {
+        /** Absolute CODEX_HOME path. */
+        codexHome: string;
+        /** Absolute path to the `codex` binary. Undefined = resolve from PATH. */
+        codexBinaryPath?: string;
     };
 }
 
@@ -122,10 +162,16 @@ export class ModelProviderRegistry {
         this._defaultModel = configuredDefaultModel;
 
         // Filter to providers whose credentials are actually available.
-        // GitHub providers need a resolved githubToken; BYOK providers need a resolved apiKey.
+        // GitHub providers are kept even without an env token because a
+        // per-user key may be supplied later from CMS, and the UX should
+        // still show configured GitHub models. GitHub credential enforcement
+        // happens when creating/resuming a GitHub-backed session.
+        // Codex providers are kept unconditionally: subscription mode does
+        // not use an apiKey — auth lives inside CODEX_HOME/auth.json which
+        // PilotSwarm never reads.
         this.providers = config.providers.filter(p => {
-            if (p.type === "github") {
-                return !!resolveEnvValue(p.githubToken);
+            if (p.type === "github" || p.type === "codex") {
+                return true;
             }
             return !!resolveEnvValue(p.apiKey);
         });
@@ -135,6 +181,11 @@ export class ModelProviderRegistry {
             for (const m of p.models) {
                 const entry: ModelEntry = typeof m === "string" ? { name: m } : m;
                 const qualified = `${p.id}:${entry.name}`;
+                const supportedReasoningEfforts = normalizeReasoningEfforts(entry.supportedReasoningEfforts);
+                const defaultReasoningEffort = normalizeDefaultReasoningEffort(
+                    entry.defaultReasoningEffort,
+                    supportedReasoningEfforts,
+                );
                 const desc: ModelDescriptor = {
                     qualifiedName: qualified,
                     modelName: entry.name,
@@ -142,6 +193,8 @@ export class ModelProviderRegistry {
                     providerType: p.type,
                     description: entry.description,
                     cost: entry.cost,
+                    ...(supportedReasoningEfforts.length > 0 && { supportedReasoningEfforts }),
+                    ...(defaultReasoningEffort && { defaultReasoningEffort }),
                 };
                 this.descriptors.set(qualified, desc);
                 this.qualifiedToProvider.set(qualified, p);
@@ -221,6 +274,20 @@ export class ModelProviderRegistry {
             };
         }
 
+        if (provider.type === "codex") {
+            const codexHome = resolveEnvValue(provider.codexHome);
+            const codexBinaryPath = resolveEnvValue(provider.codexBinaryPath);
+            return {
+                providerId: provider.id,
+                type: "codex",
+                modelName: desc.modelName,
+                codexRuntime: {
+                    codexHome: codexHome || "",
+                    ...(codexBinaryPath ? { codexBinaryPath } : {}),
+                },
+            };
+        }
+
         const baseUrl = provider.baseUrl;
         if (!baseUrl) return undefined;
 
@@ -264,8 +331,12 @@ export class ModelProviderRegistry {
             lines.push(`\n## ${group.providerId} (${group.type})`);
             for (const m of group.models) {
                 const costLabel = m.cost ? ` [cost: ${m.cost}]` : "";
+                const efforts = m.supportedReasoningEfforts || [];
+                const reasoningLabel = efforts.length > 0
+                    ? ` [reasoning: ${efforts.join(", ")}${m.defaultReasoningEffort ? `; default: ${m.defaultReasoningEffort}` : ""}]`
+                    : "";
                 const desc = m.description ? ` — ${m.description}` : "";
-                lines.push(`- ${m.qualifiedName}${costLabel}${desc}`);
+                lines.push(`- ${m.qualifiedName}${costLabel}${reasoningLabel}${desc}`);
             }
         }
         lines.push(`\nDefault: ${this._defaultModel || "none"}`);
@@ -352,6 +423,30 @@ function buildFromEnv(): ModelProviderRegistry | null {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────
+
+const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
+
+function normalizeReasoningEfforts(values?: ReasoningEffort[]): ReasoningEffort[] {
+    if (!Array.isArray(values)) return [];
+    const out: ReasoningEffort[] = [];
+    for (const raw of values) {
+        const value = String(raw || "").trim().toLowerCase();
+        if (!REASONING_EFFORTS.has(value)) continue;
+        if (out.includes(value as ReasoningEffort)) continue;
+        out.push(value as ReasoningEffort);
+    }
+    return out;
+}
+
+function normalizeDefaultReasoningEffort(
+    value: ReasoningEffort | undefined,
+    supported: ReasoningEffort[],
+): ReasoningEffort | undefined {
+    if (!supported.length) return undefined;
+    const normalized = String(value || "").trim().toLowerCase() as ReasoningEffort;
+    if (normalized && supported.includes(normalized)) return normalized;
+    return supported[0];
+}
 
 function resolveEnvValue(value?: string): string | undefined {
     if (!value) return undefined;

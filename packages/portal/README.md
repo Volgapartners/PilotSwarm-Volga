@@ -22,6 +22,33 @@ npm run dev              # React app at http://localhost:5173
 node server.js           # API server at http://localhost:3001
 ```
 
+## Codex Subscription Deployment
+
+Run subscription-backed Codex turns on a dedicated headless worker and keep
+the portal client-only:
+
+```bash
+# Dedicated worker: owns CODEX_HOME, Codex app-server, and custom tool handlers.
+node --env-file=<worker-env-file> packages/sdk/examples/worker.js
+
+# Portal: client and management APIs only.
+WORKERS=0 npx pilotswarm-web \
+  --env <portal-env-file> \
+  --workers 0 \
+  --plugin <app-plugin-dir>
+```
+
+Set `CODEX_HOME`, `CODEX_BINARY_PATH`, and `PS_MODEL_PROVIDERS_PATH` on the
+worker. Set `WORKERS=0` and the same provider-catalog path on the portal so its
+model picker matches the worker. The portal does not inherit a separate
+worker's process-local custom tool registry; every eligible worker must
+register those handlers. Run the portal and worker as separate non-root Unix
+users. Only the worker user may read `CODEX_HOME/auth.json`; share the checkout
+and non-secret provider catalog read-only through a group or ACL.
+
+See [Codex Runtime](../../docs/codex-runtime.md#dedicated-worker-and-client-only-portal-with-systemd)
+for concurrency, durability, and systemd examples.
+
 ## Portal Customization
 
 The web portal reads app-facing customization from `plugin.json` in your app

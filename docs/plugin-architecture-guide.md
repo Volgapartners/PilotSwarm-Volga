@@ -321,6 +321,14 @@ All string values support `${VAR_NAME}` syntax. Variables are expanded from `pro
 
 Unresolved variables expand to empty strings.
 
+> **Codex MCP exception:** Codex-native MCP configuration is persisted by the
+> app-server, so PilotSwarm does not apply the general expansion rule to secret
+> fields. HTTP URLs must be literal. Use
+> `Authorization: Bearer ${TOKEN_VAR}` or a complete `${VAR}` header value;
+> use same-key `"KEY": "${KEY}"` for stdio environment passthrough. Unsafe
+> static or mixed secret forms are dropped with a warning. See
+> [Codex-Native MCP Security Translation](./codex-runtime.md#codex-native-mcp-security-translation).
+
 ---
 
 ## 7. Tool Registration (Code Layer)
@@ -414,7 +422,7 @@ Model providers configure which LLMs are available and how to authenticate with 
       "id": "azure-openai",
       "type": "azure",
       "baseUrl": "https://my-resource.openai.azure.com/openai",
-      "apiKey": "env:AZURE_OPENAI_KEY",
+      "apiKey": "env:AZURE_OAI_KEY",
       "apiVersion": "2024-04-01-preview",
       "models": [
         { "name": "gpt-4.1", "description": "GPT-4.1 full model.", "cost": "medium" },
@@ -436,6 +444,7 @@ Model providers configure which LLMs are available and how to authenticate with 
 | `azure` | `apiKey` | `baseUrl` pointing to Azure OpenAI resource |
 | `openai` | `apiKey` | `https://api.openai.com/v1` |
 | `anthropic` | `apiKey` | `https://api.anthropic.com` |
+| `codex` | worker-side Codex CLI login; no API key | Local `codex app-server --stdio` |
 
 ### Secret Syntax
 
@@ -444,7 +453,7 @@ API keys and tokens use `env:VAR_NAME` to reference environment variables:
 ```json
 {
   "githubToken": "env:GITHUB_TOKEN",
-  "apiKey": "env:AZURE_OPENAI_KEY"
+  "apiKey": "env:AZURE_OAI_KEY"
 }
 ```
 

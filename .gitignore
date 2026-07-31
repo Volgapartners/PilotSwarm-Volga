@@ -9,6 +9,7 @@ vendor/
 nohup.out
 dumps/
 perf/reports/
+*.eval-results/
 TODO.md
 # Squad: ignore runtime state (logs, inbox, sessions)
 .squad/orchestration-log/

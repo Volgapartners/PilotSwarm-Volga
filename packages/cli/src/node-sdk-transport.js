@@ -579,17 +579,28 @@ export class NodeSdkTransport {
         return this.mgmt.getExecutionHistory(sessionId, executionId);
     }
 
-    async createSession({ model } = {}) {
+    async createSession({ model, reasoningEffort } = {}) {
         const effectiveModel = model || this.mgmt.getDefaultModel();
-        const session = await this.client.createSession(effectiveModel ? { model: effectiveModel } : undefined);
+        const sessionConfig = {
+            ...(effectiveModel ? { model: effectiveModel } : {}),
+            ...(reasoningEffort ? { reasoningEffort } : {}),
+        };
+        const session = await this.client.createSession(
+            Object.keys(sessionConfig).length > 0 ? sessionConfig : undefined,
+        );
         this.sessionHandles.set(session.sessionId, session);
-        return { sessionId: session.sessionId, model: effectiveModel };
+        return {
+            sessionId: session.sessionId,
+            model: effectiveModel,
+            ...(reasoningEffort ? { reasoningEffort } : {}),
+        };
     }
 
-    async createSessionForAgent(agentName, { model, title, splash, initialPrompt } = {}) {
+    async createSessionForAgent(agentName, { model, reasoningEffort, title, splash, initialPrompt } = {}) {
         const effectiveModel = model || this.mgmt.getDefaultModel();
         const session = await this.client.createSessionForAgent(agentName, {
             ...(effectiveModel ? { model: effectiveModel } : {}),
+            ...(reasoningEffort ? { reasoningEffort } : {}),
             ...(title ? { title } : {}),
             ...(splash ? { splash } : {}),
             ...(initialPrompt ? { initialPrompt } : {}),
@@ -598,6 +609,7 @@ export class NodeSdkTransport {
         return {
             sessionId: session.sessionId,
             model: effectiveModel,
+            ...(reasoningEffort ? { reasoningEffort } : {}),
             agentName,
         };
     }

@@ -1,0 +1,2 @@
+#!/bin/bash
+printf 'npm|%s|%s\n' "$PWD" "$*" >> "$RUN_TESTS_CONTRACT_LOG"

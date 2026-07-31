@@ -2,7 +2,7 @@
 
 > **Experimental** — This project is under active development and not yet ready for production use. APIs may change without notice.
 
-A durable execution runtime for [GitHub Copilot SDK](https://github.com/github/copilot-sdk) agents. Crash recovery, durable timers, session dehydration, and multi-node scaling — powered by [duroxide](https://github.com/microsoft/duroxide). Just add a connection string.
+A durable execution runtime for [GitHub Copilot SDK](https://github.com/github/copilot-sdk) and Codex-backed agents. Crash recovery, durable timers, session dehydration, and multi-node scaling — powered by [duroxide](https://github.com/microsoft/duroxide). Just add a connection string.
 
 For the fastest first run, start with the [Docker Quickstart Guide](docs/getting-started-docker-appliance.md).
 
@@ -28,9 +28,14 @@ cp .env.example .env
 # copy the checked-in model catalog template, then edit the local file
 cp .model_providers.example.json .model_providers.json
 $EDITOR .model_providers.json
-# edit .env: set DATABASE_URL and at least one LLM provider key
-# easiest: set GITHUB_TOKEN (gives access to Claude, GPT, etc. via GitHub Copilot)
+# set DATABASE_URL, then choose one worker-side LLM path:
+# GITHUB_TOKEN, a configured BYOK key, or an authenticated Codex CLI
+# Codex subscription mode uses CODEX_HOME login state and needs no API key
 ```
+
+Only workers need LLM credentials. Clients use PostgreSQL and the public
+PilotSwarm APIs. See the [Codex Runtime](docs/codex-runtime.md) guide before
+running subscription-backed Codex sessions in a multi-process deployment.
 
 ```typescript
 import { PilotSwarmClient, PilotSwarmWorker, defineTool } from "pilotswarm-sdk";
@@ -140,6 +145,7 @@ Common entry points:
 - [Example Applications](docs/examples.md) — includes the DevOps Command Center sample for layered apps
 - [Getting Started](docs/getting-started.md) — install, PostgreSQL, `.env`, and first run
 - [Configuration](docs/configuration.md) — environment variables, blob storage, worker/client options
+- [Codex Runtime](docs/codex-runtime.md) — subscription authentication, model selection, tools, durability, and VM operation
 - [Deploying to AKS](docs/deploying-to-aks.md) — Kubernetes deployment, scaling, and rolling updates
 - [Architecture](docs/architecture.md) — internal design and runtime flow
 
@@ -147,7 +153,8 @@ Common entry points:
 
 - Node.js >= 24
 - PostgreSQL
-- GitHub Copilot access token (worker-side only)
+- worker-side LLM access through one of: a GitHub token, a configured BYOK
+  provider, or an authenticated Codex CLI subscription (no Codex API key)
 - Azure Blob Storage (optional, for session dehydration across nodes)
 
 ## License

@@ -2310,7 +2310,7 @@ export function selectModelPickerModal(state, maxWidth = 72) {
             const labelRuns = fitRuns([
                 { text: "· ", color: "gray" },
                 { text: model.modelName || model.qualifiedName || model.id, color: "white", bold: Boolean(model.isDefault) },
-                ...(model.cost ? [{ text: ` [${model.cost}]`, color: "gray" }] : []),
+                ...(model.cost ? [{ text: ` [cost:${model.cost}]`, color: "gray" }] : []),
                 ...(model.isDefault ? [{ text: " ← current default", color: "gray" }] : []),
             ], contentWidth);
 
@@ -2337,6 +2337,12 @@ export function selectModelPickerModal(state, maxWidth = 72) {
                 color: "gray",
             }],
             ...(selectedItem.cost ? [[{ text: `Cost: ${selectedItem.cost}`, color: "gray" }]] : []),
+            ...(Array.isArray(selectedItem.supportedReasoningEfforts) && selectedItem.supportedReasoningEfforts.length
+                ? [[{ text: `Reasoning: ${selectedItem.supportedReasoningEfforts.join(", ")}`, color: "gray" }]]
+                : []),
+            ...(selectedItem.defaultReasoningEffort
+                ? [[{ text: `Default reasoning: ${selectedItem.defaultReasoningEffort}`, color: "gray" }]]
+                : []),
             [{ text: "", color: "gray" }],
             [{
                 text: selectedItem.description || "No description available for this model.",
@@ -2351,6 +2357,60 @@ export function selectModelPickerModal(state, maxWidth = 72) {
         rowItemIndexes,
         selectedRowIndex,
         detailsTitle: "Model Details",
+        detailsLines,
+        idealWidth: Math.min(
+            Math.max(
+                46,
+                rows.reduce((max, row) => {
+                    if (Array.isArray(row)) return Math.max(max, flattenRunsLength(row));
+                    return Math.max(max, String(row?.text || "").length);
+                }, 0) + 4,
+            ),
+            maxWidth,
+        ),
+    };
+}
+
+export function selectReasoningEffortPickerModal(state, maxWidth = 64) {
+    const modal = state.ui.modal;
+    if (!modal || modal.type !== "reasoningEffortPicker") return null;
+
+    const items = Array.isArray(modal.items) ? modal.items : [];
+    const selectedIndex = Math.max(0, Number(modal.selectedIndex) || 0);
+    const contentWidth = Math.max(24, maxWidth - 4);
+    const rows = items.map((item, index) => {
+        const isSelected = index === selectedIndex;
+        const labelRuns = fitRuns([
+            { text: "· ", color: "gray" },
+            { text: item?.label || item?.effort || item?.id || "effort", color: "white", bold: Boolean(item?.isDefault) },
+            ...(item?.isDefault ? [{ text: " ← model default", color: "gray" }] : []),
+        ], contentWidth);
+        return isSelected
+            ? buildActiveHighlightLine(labelRuns.map((run) => run.text).join("").padEnd(contentWidth, " "))
+            : labelRuns;
+    });
+
+    const selectedItem = items[selectedIndex] || null;
+    const modelItem = modal.modelItem || null;
+    const modelLabel = modelItem?.modelName || modelItem?.qualifiedName || modal.sessionOptions?.model || null;
+    const detailsLines = selectedItem
+        ? [
+            [{ text: selectedItem.label || selectedItem.effort || selectedItem.id, color: "white", bold: true }],
+            ...(modelLabel ? [[{ text: `Model: ${modelLabel}`, color: "gray" }]] : []),
+            ...(selectedItem.isDefault ? [[{ text: "This is the model default.", color: "gray" }]] : []),
+            [{ text: "", color: "gray" }],
+            [{
+                text: "Higher reasoning efforts trade latency and cost for deeper deliberation.",
+                color: "gray",
+            }],
+        ]
+        : [[{ text: "No reasoning effort selected.", color: "gray" }]];
+
+    return {
+        title: modal.title || "Select reasoning effort",
+        rows,
+        selectedRowIndex: selectedIndex,
+        detailsTitle: "Reasoning Effort",
         detailsLines,
         idealWidth: Math.min(
             Math.max(

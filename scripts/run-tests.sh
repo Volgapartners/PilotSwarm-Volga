@@ -14,6 +14,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+REPO_ROOT="$PWD"
 
 SDK_DIR="packages/sdk"
 ENV_FILE=".env"
@@ -45,6 +46,9 @@ Notes:
     - Positional suite names and --suite=<name> can be mixed.
     - Suite names are substring matches against files under packages/sdk/test/local.
     - Unknown options fail fast.
+    - A full run (no suite filter) also runs the eval-harness tests
+      (vitest against packages/eval-harness/test/**) before the SDK
+      suites. Set SKIP_EVAL_HARNESS_TESTS=1 to skip.
 EOF
 }
 
@@ -60,6 +64,16 @@ done
 # Build
 echo "🔨 Building TypeScript..."
 (cd "$SDK_DIR" && npm run build) || { echo "❌ Build failed"; exit 1; }
+
+run_eval_harness_tests() {
+    if [ "${SKIP_EVAL_HARNESS_TESTS:-0}" = "1" ]; then
+        echo "⏭  Skipping eval-harness tests (SKIP_EVAL_HARNESS_TESTS=1)."
+        return 0
+    fi
+    echo "🧪 Running eval-harness tests (vitest)..."
+    (cd "$REPO_ROOT" && npm run --silent test --workspace=pilotswarm-eval-harness) \
+        || { echo "❌ eval-harness tests failed"; exit 1; }
+}
 
 # Suppress duroxide Rust WARN logs in tests (AKS workers use INFO via their own env)
 export RUST_LOG="${RUST_LOG:-error}"
@@ -118,5 +132,6 @@ fi
 if [ ${#TARGET_FILES[@]} -gt 0 ]; then
     exec npx vitest "${VITEST_ARGS[@]}" "${TARGET_FILES[@]}"
 else
+    run_eval_harness_tests
     exec npx vitest "${VITEST_ARGS[@]}"
 fi

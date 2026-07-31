@@ -11,7 +11,7 @@ export type TurnAction =
     | { type: "cron"; action: "set"; intervalSeconds: number; reason: string; events?: CapturedEvent[] }
     | { type: "cron"; action: "cancel"; events?: CapturedEvent[] }
     | { type: "input_required"; question: string; choices?: string[]; allowFreeform?: boolean; events?: CapturedEvent[] }
-    | { type: "spawn_agent"; task: string; model?: string; systemMessage?: string | { mode: "append" | "replace"; content: string }; toolNames?: string[]; agentName?: string; title?: string; content?: string; events?: CapturedEvent[] }
+    | { type: "spawn_agent"; task: string; model?: string; reasoningEffort?: string; systemMessage?: string | { mode: "append" | "replace"; content: string }; toolNames?: string[]; agentName?: string; title?: string; content?: string; events?: CapturedEvent[] }
     | { type: "message_agent"; agentId: string; message: string; events?: CapturedEvent[] }
     | { type: "check_agents"; events?: CapturedEvent[] }
     | { type: "wait_for_agents"; agentIds: string[]; events?: CapturedEvent[] }
@@ -60,7 +60,7 @@ export type TurnResult =
     | ({ type: "cron"; action: "set"; intervalSeconds: number; reason: string; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
     | ({ type: "cron"; action: "cancel"; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
     | ({ type: "input_required"; question: string; choices?: string[]; allowFreeform?: boolean; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
-    | ({ type: "spawn_agent"; task: string; model?: string; systemMessage?: string | { mode: "append" | "replace"; content: string }; toolNames?: string[]; agentName?: string; title?: string; content?: string; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
+    | ({ type: "spawn_agent"; task: string; model?: string; reasoningEffort?: string; systemMessage?: string | { mode: "append" | "replace"; content: string }; toolNames?: string[]; agentName?: string; title?: string; content?: string; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
     | ({ type: "message_agent"; agentId: string; message: string; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
     | ({ type: "check_agents"; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
     | ({ type: "wait_for_agents"; agentIds: string[]; events?: CapturedEvent[] } & QueuedTurnActionCarrier & PromptGuardrailCarrier)
@@ -96,6 +96,7 @@ export interface TurnOptions {
             agent_name?: string;
             task?: string;
             model?: string;
+            reasoning_effort?: string;
             system_message?: string;
             tool_names?: string[];
             title?: string;
@@ -133,6 +134,13 @@ export interface SerializableSessionConfig {
      * names to actual Tool objects from its registry at activity execution time.
      */
     toolNames?: string[];
+    /**
+     * Optional reasoning-effort hint for models that support tunable
+     * reasoning depth (e.g. Codex `codex-*` models: "low" | "medium" |
+     * "high" | "xhigh" | "max" | "ultra"). Serializable — travels through
+     * duroxide and is forwarded to the Codex runtime.
+     */
+    reasoningEffort?: string;
     /**
      * Internal: identity of the bound agent for namespace access control.
      * Set from the agent definition's `id` field. Used by fact tool handlers

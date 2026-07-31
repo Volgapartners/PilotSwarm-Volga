@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { SessionBlobStore } from "../../src/blob-store.ts";
 
@@ -15,6 +16,49 @@ function makeConnectionString() {
 }
 
 describe("SessionBlobStore", () => {
+    it("downloads hydration archives to a unique local directory and atomically replaces stale state", async () => {
+        const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pilotswarm-blob-hydrate-"));
+        const sessionStateDir = path.join(baseDir, "session-state");
+        const archiveSource = path.join(baseDir, "archive-source");
+        const sessionId = "blob-hydrate-safe";
+        const sourceSessionDir = path.join(archiveSource, sessionId);
+        const liveSessionDir = path.join(sessionStateDir, sessionId);
+        const archivePath = path.join(baseDir, `${sessionId}.tar.gz`);
+        fs.mkdirSync(sourceSessionDir, { recursive: true });
+        fs.writeFileSync(
+            path.join(sourceSessionDir, "codex-thread.json"),
+            JSON.stringify({ codexThreadId: "blob-thread-restored" }),
+        );
+        execFileSync("tar", ["-czf", archivePath, "-C", archiveSource, sessionId]);
+        fs.mkdirSync(liveSessionDir, { recursive: true });
+        fs.writeFileSync(path.join(liveSessionDir, "old-state"), "OLD-KEEP-UNTIL-COMMIT");
+
+        const store = new SessionBlobStore(makeConnectionString(), "test-container", sessionStateDir);
+        let downloadedTo;
+        store.containerClient = {
+            getBlockBlobClient() {
+                return {
+                    async downloadToFile(destination) {
+                        downloadedTo = destination;
+                        fs.copyFileSync(archivePath, destination);
+                    },
+                };
+            },
+        };
+
+        try {
+            await store.hydrate(sessionId);
+
+            expect(downloadedTo.startsWith(`${sessionStateDir}${path.sep}`)).toBe(true);
+            expect(fs.existsSync(path.join(liveSessionDir, "old-state"))).toBe(false);
+            expect(JSON.parse(fs.readFileSync(path.join(liveSessionDir, "codex-thread.json"), "utf-8")))
+                .toEqual({ codexThreadId: "blob-thread-restored" });
+            expect(fs.readdirSync(sessionStateDir).filter((name) => name.startsWith(".hydrate-"))).toEqual([]);
+        } finally {
+            fs.rmSync(baseDir, { recursive: true, force: true });
+        }
+    });
+
     it("waits for the current session snapshot layout before archiving on dehydrate", async () => {
         const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pilotswarm-blob-store-"));
         const sessionStateDir = path.join(baseDir, "session-state");
@@ -112,5 +156,383 @@ describe("SessionBlobStore", () => {
         } finally {
             fs.rmSync(baseDir, { recursive: true, force: true });
         }
+    });
+
+    // ─── checkpoint snapshot-readiness gate ──────────────────────────
+
+    describe("checkpoint gates on snapshot readiness before archiving", () => {
+        // Regression: `dehydrate()` runs `waitForSessionSnapshot()` before
+        // it archives + uploads, but `checkpoint()` only checked that the
+        // session directory existed. A half-written or corrupt Codex
+        // marker (`codex-thread.json` with invalid JSON / empty
+        // `codexThreadId`) or a bad `rolloutSnapshotRelPath` (missing,
+        // symlinked, or escaping the session dir) therefore produced a
+        // tarball that OVERWROTE the last known-good `<id>.tar.gz` blob,
+        // destroying the only recoverable snapshot.
+        function mkStore(sessionStateDir) {
+            const store = new SessionBlobStore(makeConnectionString(), "test-container", sessionStateDir);
+            const uploads = [];
+            const metadataWrites = [];
+            store.containerClient = {
+                getBlockBlobClient(name) {
+                    return {
+                        async uploadFile(filePath) {
+                            uploads.push({ name, filePath });
+                        },
+                        async upload(body) {
+                            metadataWrites.push({ name, body: String(body) });
+                        },
+                        async deleteIfExists() { return { succeeded: true }; },
+                        async exists() { return true; },
+                        async downloadToFile() {
+                            throw new Error("downloadToFile should not be called in this test");
+                        },
+                        url: `https://example.test/${name}`,
+                    };
+                },
+                async *listBlobsFlat() {},
+            };
+            return { store, uploads, metadataWrites };
+        }
+
+        function seedCodexSession(sessionStateDir, sessionId, marker) {
+            const sessionDir = path.join(sessionStateDir, sessionId);
+            fs.mkdirSync(sessionDir, { recursive: true });
+            fs.writeFileSync(
+                path.join(sessionDir, "codex-thread.json"),
+                typeof marker === "string" ? marker : JSON.stringify(marker),
+                "utf-8",
+            );
+            return sessionDir;
+        }
+
+        it("uploads on checkpoint when the Codex marker is valid", async () => {
+            const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pilotswarm-ckpt-ok-"));
+            const sessionStateDir = path.join(baseDir, "session-state");
+            const sessionId = "ckpt-valid";
+            const sessionDir = seedCodexSession(sessionStateDir, sessionId, {
+                codexThreadId: "codex-thread-abc",
+                codexHome: "/nonexistent",
+            });
+            fs.writeFileSync(path.join(sessionDir, "rollout.jsonl"), "{}\n", "utf-8");
+
+            const { store, uploads, metadataWrites } = mkStore(sessionStateDir);
+            try {
+                await store.checkpoint(sessionId);
+
+                expect(uploads.map((u) => u.name)).toEqual([`${sessionId}.tar.gz`]);
+                expect(metadataWrites.map((m) => m.name)).toEqual([`${sessionId}.meta.json`]);
+                expect(JSON.parse(metadataWrites[0].body).reason).toBe("checkpoint");
+                // Local files stay in place — checkpoint keeps the session warm.
+                expect(fs.existsSync(sessionDir)).toBe(true);
+            } finally {
+                fs.rmSync(baseDir, { recursive: true, force: true });
+            }
+        }, 20_000);
+
+        it("uploads on checkpoint when a valid rollout snapshot is referenced", async () => {
+            const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pilotswarm-ckpt-rollout-ok-"));
+            const sessionStateDir = path.join(baseDir, "session-state");
+            const sessionId = "ckpt-rollout-valid";
+            const sessionDir = seedCodexSession(sessionStateDir, sessionId, {
+                codexThreadId: "codex-thread-abc",
+                rolloutSnapshotRelPath: "rollout/rollout.jsonl",
+            });
+            fs.mkdirSync(path.join(sessionDir, "rollout"), { recursive: true });
+            fs.writeFileSync(path.join(sessionDir, "rollout", "rollout.jsonl"), "{}\n", "utf-8");
+
+            const { store, uploads } = mkStore(sessionStateDir);
+            try {
+                await store.checkpoint(sessionId);
+                expect(uploads.map((u) => u.name)).toEqual([`${sessionId}.tar.gz`]);
+            } finally {
+                fs.rmSync(baseDir, { recursive: true, force: true });
+            }
+        }, 20_000);
+
+        const CORRUPT_CASES = [
+            {
+                name: "codex-thread.json is not valid JSON",
+                seed: (sessionStateDir, sessionId) => {
+                    seedCodexSession(sessionStateDir, sessionId, "{ not json");
+                },
+            },
+            {
+                name: "codex-thread.json has an empty codexThreadId",
+                seed: (sessionStateDir, sessionId) => {
+                    seedCodexSession(sessionStateDir, sessionId, { codexThreadId: "   " });
+                },
+            },
+            {
+                name: "rolloutSnapshotRelPath points at a missing file",
+                seed: (sessionStateDir, sessionId) => {
+                    seedCodexSession(sessionStateDir, sessionId, {
+                        codexThreadId: "codex-thread-abc",
+                        rolloutSnapshotRelPath: "rollout/rollout.jsonl",
+                    });
+                },
+            },
+            {
+                name: "rolloutSnapshotRelPath is a symlink",
+                seed: (sessionStateDir, sessionId) => {
+                    const sessionDir = seedCodexSession(sessionStateDir, sessionId, {
+                        codexThreadId: "codex-thread-abc",
+                        rolloutSnapshotRelPath: "rollout.jsonl",
+                    });
+                    const realTarget = path.join(sessionDir, "real-rollout.jsonl");
+                    fs.writeFileSync(realTarget, "{}\n", "utf-8");
+                    fs.symlinkSync(realTarget, path.join(sessionDir, "rollout.jsonl"));
+                },
+            },
+            {
+                name: "rolloutSnapshotRelPath escapes the session directory",
+                seed: (sessionStateDir, sessionId) => {
+                    seedCodexSession(sessionStateDir, sessionId, {
+                        codexThreadId: "codex-thread-abc",
+                        rolloutSnapshotRelPath: "../victim/rollout.jsonl",
+                    });
+                    const victimDir = path.join(sessionStateDir, "victim");
+                    fs.mkdirSync(victimDir, { recursive: true });
+                    fs.writeFileSync(path.join(victimDir, "rollout.jsonl"), "{}\n", "utf-8");
+                },
+            },
+        ];
+
+        for (const testCase of CORRUPT_CASES) {
+            it(`preserves the previous good blob when ${testCase.name}`, async () => {
+                const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pilotswarm-ckpt-bad-"));
+                const sessionStateDir = path.join(baseDir, "session-state");
+                const sessionId = "ckpt-corrupt";
+                testCase.seed(sessionStateDir, sessionId);
+
+                const { store, uploads, metadataWrites } = mkStore(sessionStateDir);
+                try {
+                    await store.checkpoint(sessionId);
+
+                    // No archive was uploaded, so the last known-good blob
+                    // (and its metadata) survives untouched.
+                    expect(uploads).toEqual([]);
+                    expect(metadataWrites).toEqual([]);
+                    expect(store.snapshotSizeBySession.size).toBe(0);
+                    // Local state is never removed by checkpoint.
+                    expect(fs.existsSync(path.join(sessionStateDir, sessionId))).toBe(true);
+                } finally {
+                    fs.rmSync(baseDir, { recursive: true, force: true });
+                }
+            }, 30_000);
+        }
+
+        it("still skips without touching blob storage when the session dir is missing", async () => {
+            const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pilotswarm-ckpt-missing-"));
+            const sessionStateDir = path.join(baseDir, "session-state");
+            fs.mkdirSync(sessionStateDir, { recursive: true });
+
+            const { store, uploads, metadataWrites } = mkStore(sessionStateDir);
+            try {
+                await store.checkpoint("ckpt-absent");
+                expect(uploads).toEqual([]);
+                expect(metadataWrites).toEqual([]);
+            } finally {
+                fs.rmSync(baseDir, { recursive: true, force: true });
+            }
+        });
+    });
+
+    // ─── R5: shared session-id validation across every public method ──
+
+    describe("(R5) session-id validation is enforced at the first line of every public method", () => {
+        // Regression: SessionBlobStore did not use the shared validator.
+        // A malformed sessionId (`../victim`, absolute path, cross-
+        // separator, empty, `.`, `..`) reached blob-name construction,
+        // `getBlockBlobClient`, log calls, local fs paths, temp tar
+        // names, the `snapshotSizeBySession` map, and SAS URL minting
+        // before anything raised. Every public method must reject
+        // BEFORE producing any side effect.
+        const UNSAFE_IDS = [
+            "../victim",
+            "..\\victim",
+            "a/b",
+            "a\\b",
+            ".",
+            "..",
+            "",
+            "/absolute/victim",
+        ];
+
+        function tempDirs(prefix) {
+            const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+            const sessionStateDir = path.join(baseDir, "session-state");
+            fs.mkdirSync(sessionStateDir, { recursive: true });
+            return { baseDir, sessionStateDir };
+        }
+
+        function makeSpyContainerClient(recorder) {
+            const spy = {
+                calls: recorder,
+                getBlockBlobClient(name) {
+                    recorder.push({ op: "getBlockBlobClient", name });
+                    return new Proxy({}, {
+                        get(_target, prop) {
+                            return async (...args) => {
+                                recorder.push({ op: `blob.${String(prop)}`, name, args });
+                                if (prop === "exists") return false;
+                                if (prop === "deleteIfExists") return { succeeded: false };
+                                if (prop === "downloadToFile") return;
+                                if (prop === "download") throw new Error("mock download not implemented");
+                                if (prop === "getProperties") throw new Error("mock getProperties not implemented");
+                                return;
+                            };
+                        },
+                    });
+                },
+                async *listBlobsFlat(...args) {
+                    recorder.push({ op: "listBlobsFlat", args });
+                },
+            };
+            return spy;
+        }
+
+        function captureConsole(recorder) {
+            const original = {
+                info: console.info,
+                warn: console.warn,
+                error: console.error,
+            };
+            console.info = (...args) => { recorder.push({ level: "info", args }); };
+            console.warn = (...args) => { recorder.push({ level: "warn", args }); };
+            console.error = (...args) => { recorder.push({ level: "error", args }); };
+            return () => {
+                console.info = original.info;
+                console.warn = original.warn;
+                console.error = original.error;
+            };
+        }
+
+        // Every public method that accepts a sessionId as the first arg.
+        // Some methods also take a filename; we pass a benign one so
+        // the sessionId is the ONLY unsafe input.
+        const METHODS = [
+            { name: "dehydrate", invoke: (s, id) => s.dehydrate(id, { reason: "r5" }) },
+            { name: "hydrate", invoke: (s, id) => s.hydrate(id) },
+            { name: "checkpoint", invoke: (s, id) => s.checkpoint(id) },
+            { name: "getSnapshotSizeBytes", invoke: (s, id) => s.getSnapshotSizeBytes(id) },
+            { name: "exists", invoke: (s, id) => s.exists(id) },
+            { name: "delete", invoke: (s, id) => s.delete(id) },
+            { name: "uploadArtifact", invoke: (s, id) => s.uploadArtifact(id, "note.md", "hello", "text/markdown") },
+            { name: "downloadArtifact", invoke: (s, id) => s.downloadArtifact(id, "note.md") },
+            { name: "downloadArtifactText", invoke: (s, id) => s.downloadArtifactText(id, "note.md") },
+            { name: "listArtifacts", invoke: (s, id) => s.listArtifacts(id) },
+            { name: "deleteArtifact", invoke: (s, id) => s.deleteArtifact(id, "note.md") },
+            { name: "artifactExists", invoke: (s, id) => s.artifactExists(id, "note.md") },
+            {
+                name: "generateArtifactSasUrl",
+                invoke: (s, id) => Promise.resolve().then(() => s.generateArtifactSasUrl(id, "note.md", 1)),
+            },
+            { name: "deleteArtifacts", invoke: (s, id) => s.deleteArtifacts(id) },
+        ];
+
+        for (const method of METHODS) {
+            it(`${method.name} rejects unsafe session ids before any container client, log, or local fs side effect`, async () => {
+                const { baseDir, sessionStateDir } = tempDirs(`pilotswarm-r5-${method.name}-`);
+                // Sentinel that would be created if hydrate/dehydrate
+                // ever touched a `../` path relative to sessionStateDir.
+                // Put it in an INDEPENDENT tmpdir so `rmSync(baseDir)`
+                // never cleans it up out from under our assertion.
+                const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "pilotswarm-r5-victim-"));
+                const outsideVictim = path.join(outsideDir, "victim-sentinel.txt");
+                fs.writeFileSync(outsideVictim, "R5-OUTSIDE-KEEP");
+
+                const clientCalls = [];
+                const containerClient = makeSpyContainerClient(clientCalls);
+                const store = new SessionBlobStore(makeConnectionString(), "test-container", sessionStateDir);
+                store.containerClient = containerClient;
+
+                const logCalls = [];
+                const restoreConsole = captureConsole(logCalls);
+
+                try {
+                    for (const bad of UNSAFE_IDS) {
+                        const settled = await method.invoke(store, bad).then(
+                            (value) => ({ kind: "resolved", value }),
+                            (err) => ({ kind: "rejected", err }),
+                        );
+                        expect(settled.kind).toBe("rejected");
+                        expect(String(settled.err?.message || "")).toMatch(/^Invalid PilotSwarm session id/);
+                    }
+                } finally {
+                    restoreConsole();
+                }
+
+                // Zero container client / listBlobsFlat activity.
+                expect(clientCalls).toEqual([]);
+                // Zero log output — a rejection before logBlobStore ran.
+                expect(logCalls).toEqual([]);
+                // snapshotSizeBySession map untouched.
+                expect(store.snapshotSizeBySession.size).toBe(0);
+                // Outside sentinel intact.
+                expect(fs.readFileSync(outsideVictim, "utf-8")).toBe("R5-OUTSIDE-KEEP");
+
+                fs.rmSync(baseDir, { recursive: true, force: true });
+                fs.rmSync(outsideDir, { recursive: true, force: true });
+            });
+        }
+
+        it("normal UUID-like session ids still succeed end-to-end (dehydrate + exists + delete)", async () => {
+            const { baseDir, sessionStateDir } = tempDirs("pilotswarm-r5-good-");
+            const sid = "019dcfc8-cafe-7133-a002-45ec3742e777";
+            const sessionDir = path.join(sessionStateDir, sid);
+            fs.mkdirSync(path.join(sessionDir, "checkpoints"), { recursive: true });
+            fs.writeFileSync(path.join(sessionDir, "workspace.yaml"), "cwd: /tmp\n", "utf-8");
+
+            const uploads = [];
+            const store = new SessionBlobStore(makeConnectionString(), "test-container", sessionStateDir);
+            store.containerClient = {
+                getBlockBlobClient(name) {
+                    return {
+                        async uploadFile(filePath) { uploads.push({ name, filePath }); },
+                        async upload() {},
+                        async deleteIfExists() { return { succeeded: true }; },
+                        async exists() { return true; },
+                        async downloadToFile() {},
+                        url: `https://example.test/${name}`,
+                    };
+                },
+                async *listBlobsFlat() {},
+            };
+
+            await store.dehydrate(sid, { reason: "r5-happy" });
+            expect(uploads.map((u) => u.name)).toContain(`${sid}.tar.gz`);
+            expect(await store.exists(sid)).toBe(true);
+            await store.delete(sid);
+            fs.rmSync(baseDir, { recursive: true, force: true });
+        });
+
+        it("blob name construction never receives a malformed session id (guard against traversal in `${sessionId}.tar.gz` blob name)", async () => {
+            // Belt-and-braces: even if a future refactor moved
+            // validation into a helper called AFTER blob name
+            // interpolation, this test still catches the leak by
+            // proving `getBlockBlobClient` is never invoked with any
+            // string containing the malformed id.
+            const { baseDir, sessionStateDir } = tempDirs("pilotswarm-r5-blobname-");
+            const clientCalls = [];
+            const containerClient = makeSpyContainerClient(clientCalls);
+            const store = new SessionBlobStore(makeConnectionString(), "test-container", sessionStateDir);
+            store.containerClient = containerClient;
+
+            for (const bad of UNSAFE_IDS) {
+                await expect(store.exists(bad)).rejects.toThrow(/^Invalid PilotSwarm session id/);
+                await expect(store.delete(bad)).rejects.toThrow(/^Invalid PilotSwarm session id/);
+                await expect(store.getSnapshotSizeBytes(bad)).rejects.toThrow(/^Invalid PilotSwarm session id/);
+            }
+
+            for (const call of clientCalls) {
+                if (call.op === "getBlockBlobClient") {
+                    for (const bad of UNSAFE_IDS) {
+                        expect(call.name).not.toContain(bad);
+                    }
+                }
+            }
+            fs.rmSync(baseDir, { recursive: true, force: true });
+        });
     });
 });

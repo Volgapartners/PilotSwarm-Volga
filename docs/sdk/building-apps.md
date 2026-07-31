@@ -51,7 +51,6 @@ const getWeather = defineTool("get_weather", {
 
 const worker = new PilotSwarmWorker({
   store: process.env.DATABASE_URL!,
-  githubToken: process.env.GITHUB_TOKEN!,
   pluginDirs: ["./plugin"],
 });
 worker.registerTools([getWeather]);
@@ -70,6 +69,16 @@ const session = await client.createSession({
 const result = await session.sendAndWait("What is the weather in Seattle?");
 console.log(result);
 ```
+
+The worker needs one LLM path, normally through its model-provider catalog:
+
+- a GitHub token for a `github` provider
+- an API key for a configured BYOK provider
+- a worker-side authenticated Codex CLI for a `codex` provider
+
+Codex subscription mode uses `CODEX_HOME` login state and does not require an
+API key. The client needs none of these credentials. See
+[Codex Runtime](../codex-runtime.md).
 
 ## Recommended App Layout
 
@@ -120,10 +129,26 @@ Typical `createSession()` fields:
 Your worker can also contribute defaults to every session through:
 
 - `pluginDirs`
-- `skillDirectories`
+- `skillDirectories` (native Copilot SDK loading on Copilot-backed sessions)
 - `customAgents`
 - `mcpServers`
 - `systemMessage`
+
+Model IDs are provider-qualified. The prefix selects the runtime as well as
+the provider:
+
+```text
+github-copilot:<model>
+codex-subscription:gpt-5.6-sol
+azure-openai:<deployment>
+```
+
+The client API and tool registration pattern stay unchanged when a session
+uses Codex. The worker running that session must have an installed,
+authenticated Codex CLI. PilotSwarm-composed framework, app, and agent
+instructions still reach Codex as text, but direct Copilot SDK
+`skillDirectories`, hooks, and permission callbacks are not Codex parity. See
+[Codex Runtime](../codex-runtime.md).
 
 `default.agent.md` in your app plugin is layered underneath the embedded PilotSwarm framework base prompt. It extends the app-wide instructions for your sessions; it does not replace PilotSwarm's framework rules.
 
@@ -169,7 +194,6 @@ You can also pass config directly:
 ```ts
 const worker = new PilotSwarmWorker({
   store,
-  githubToken,
   systemMessage: "You are a support agent.",
   customAgents: [
     {
@@ -207,6 +231,9 @@ For remote mode:
 - the worker environment still needs the tools and plugin files
 - the client does not execute tools
 - blob storage is recommended if you want reliable dehydration across nodes
+- every eligible worker must register every custom tool named by a client
+- for Codex subscription mode, prefer one dedicated headless worker per
+  `CODEX_HOME` and run the portal/TUI with `WORKERS=0`
 
 ## Layered-App Checklist
 

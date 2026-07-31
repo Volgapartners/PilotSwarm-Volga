@@ -6,9 +6,10 @@
 
 - **Node.js >= 24** (required for `--env-file` support)
 - **PostgreSQL** (local or managed — Azure Database for PostgreSQL, AWS RDS, etc.)
-- **LLM provider credentials** — at least one of:
+- **Worker-side LLM access** — at least one of:
   - `GITHUB_TOKEN` (easiest — gives access to Claude, GPT, etc. via GitHub Copilot)
-  - Azure OpenAI, Azure AI Services, or any OpenAI-compatible API key
+  - Azure OpenAI, Azure AI Services, or another configured BYOK provider
+  - an authenticated Codex CLI subscription on the worker (no API key)
 
 Optional:
 - **Azure Blob Storage** — for session dehydration/hydration across nodes
@@ -34,7 +35,8 @@ DATABASE_URL=postgresql://user:password@localhost:5432/pilotswarm
 # Easiest: use GITHUB_TOKEN for GitHub Copilot access
 GITHUB_TOKEN=ghp_xxxxxxxxxxxx
 # Or: BYOK with Azure OpenAI / other providers
-# AZURE_OPENAI_KEY=your-key
+# AZURE_OAI_KEY=your-key
+# Or: authenticate the Codex CLI as the worker user and set CODEX_HOME
 
 # Optional — session dehydration to blob storage
 AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=...
@@ -200,7 +202,6 @@ import { PilotSwarmClient } from "pilotswarm-sdk";
 
 const client = new PilotSwarmClient({
     store: process.env.DATABASE_URL,
-    blobEnabled: true,  // enable session dehydration
 });
 await client.start();
 
@@ -219,7 +220,10 @@ The client and worker share the same PostgreSQL database. The client enqueues wo
 new PilotSwarmWorker({
     // Required
     store: string,           // PostgreSQL connection string
-    githubToken: string,     // GitHub Copilot token
+
+    // Provider-dependent authentication
+    githubToken?: string,    // GitHub Copilot token; not needed for BYOK/Codex
+    modelProvidersPath?: string, // provider catalog; PS_MODEL_PROVIDERS_PATH also works
 
     // Optional
     logLevel: "info",        // "none" | "error" | "warning" | "info" | "debug" | "all"
@@ -243,8 +247,9 @@ new PilotSwarmClient({
     // Required
     store: string,            // PostgreSQL connection string
 
-    // Optional
-    blobEnabled: false,       // enable session dehydration across nodes
+    // Optional durability timing
+    // Client-created sessions are durable by default. The worker's local
+    // filesystem or shared SessionStateStore determines recovery scope.
     waitThreshold: 30,        // seconds — passed to orchestration
     dehydrateThreshold: 10,   // seconds — waits above this trigger dehydration
     dehydrateOnIdle: 120,     // seconds to wait before dehydrating idle sessions
@@ -258,7 +263,9 @@ new PilotSwarmClient({
 
 ## Azure Blob Storage
 
-Session dehydration stores the full LLM conversation history in blob storage, allowing sessions to move between worker nodes. Without it, sessions are pinned to a single worker.
+Session dehydration stores the full LLM conversation history in blob storage,
+allowing sessions to recover on another worker host. Without a shared session
+store, the built-in filesystem recovery remains host-local.
 
 ### Setup
 
@@ -287,6 +294,10 @@ This enables true multi-node scaling — sessions can migrate between workers tr
 
 PilotSwarm uses the local `.model_providers.json` to configure LLM providers. Most setups copy that file from the checked-in `.model_providers.example.json` template first. API keys are stored in `.env` and referenced via `env:VAR_NAME` syntax.
 
+Workers need one usable authentication path: a GitHub token, a configured
+BYOK credential, or a worker-side Codex CLI login. Codex does not use an API
+key. Clients do not need provider credentials.
+
 > **Easiest way to get started:** Set `GITHUB_TOKEN` in `.env`. This gives you access to all models available through GitHub Copilot (Claude, GPT-4.1, GPT-5.1, etc.) with no additional configuration needed.
 
 For BYOK (bring-your-own-key) providers like Azure OpenAI, edit the local `.model_providers.json` and set the corresponding API key in `.env`.
@@ -299,6 +310,95 @@ gh auth token
 ```
 
 The token is only needed on the **worker** side. Clients don't need it.
+
+### Codex Subscription Provider (`type: "codex"`)
+
+For the complete setup, security, durability, VM, and troubleshooting guide,
+see [Codex Runtime](./codex-runtime.md).
+
+The `codex` provider type points at a locally installed
+[`codex` CLI](https://github.com/openai/codex) and reuses that
+operator's ChatGPT/Codex subscription — no API key. Add a block like
+this to `.model_providers.json`:
+
+```json
+{
+    "id": "codex-subscription",
+    "type": "codex",
+    "codexHome": "env:CODEX_HOME",
+    "codexBinaryPath": "env:CODEX_BINARY_PATH",
+    "models": [
+        {
+            "name": "gpt-5.6-sol",
+            "description": "Codex GPT-5.6 Sol",
+            "cost": "medium",
+            "supportedReasoningEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultReasoningEffort": "low"
+        }
+    ]
+}
+```
+
+Requirements:
+
+- The `codex` binary must be on `PATH`, or `codexBinaryPath` must point
+  at it. Homebrew (`brew install --cask codex`) and npm
+  (`npm i -g @openai/codex`) are both supported.
+- Log in once with `codex login` on a workstation, or
+  `codex login --device-auth` on a headless worker. That command
+  writes `auth.json` inside `CODEX_HOME` (defaults to `~/.codex`).
+  PilotSwarm never reads, copies, or logs that file.
+- `CODEX_HOME` must exist with mode `0700` before the worker starts;
+  the runtime refuses to spin up otherwise.
+- Trusted single-operator use only. Multi-user Plus/Pro subscription
+  sharing is out of scope for v1.
+
+Selecting a codex model:
+
+```ts
+const session = await client.createSession({
+    model: "codex-subscription:gpt-5.6-sol",
+    reasoningEffort: "ultra",
+});
+```
+
+The same qualified model IDs appear in the existing TUI and portal model
+selector after the worker reloads the provider catalog. The provider prefix
+selects the runtime; the suffix selects the model within Codex. When a model
+declares multiple `supportedReasoningEfforts`, the UI prompts for one after
+model selection and marks `defaultReasoningEffort`.
+
+Codex sessions run through the `codex app-server` stdio JSON-RPC
+protocol and reuse the same `PilotSwarmSession` API and durable
+orchestration behavior as Copilot-backed sessions. PilotSwarm:
+
+- Declares the full PilotSwarm tool set (including durable primitives
+  like `wait`, `ask_user`, and `spawn_agent`) to Codex via
+  `thread/start.dynamicTools`, so the model can call them.
+- Persists the Codex `threadId` under
+  `<sessionStateDir>/<sessionId>/codex-thread.json` so worker restarts
+  can resume with `thread/resume`.
+- On disconnect/checkpoint, copies the Codex rollout JSONL out of
+  `CODEX_HOME/sessions/…` into
+  `<sessionStateDir>/<sessionId>/codex-rollout.jsonl` so the standard
+  `FilesystemSessionStore` snapshot can archive it. `auth.json` is
+  never inspected, copied, or archived.
+- On cross-worker hydrate, calls `thread/resume` with `path` pointing
+  at the restored rollout snapshot so Codex can rebuild the thread
+  without needing the original `CODEX_HOME/sessions` layout.
+- Passes plugin MCP servers through Codex's native `mcp_servers`
+  configuration using a stricter no-secret-persistence translation. In
+  particular, HTTP URLs must be literal and credentials must use supported
+  whole-value environment references. Local/stdio servers are dropped when
+  their args contain `${VAR}` or sensitive auth/token/secret/password/bearer/key
+  flags or values, because Codex persists args and has no safe arg indirection. See
+  [Codex Runtime](./codex-runtime.md#codex-native-mcp-security-translation).
+
+Model names must be real Codex model ids. The app-server `model/list`
+response is authoritative — for codex-cli 0.145.0 the
+subscription-side defaults are `gpt-5.6-sol`, `gpt-5.6-terra`,
+`gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, and `gpt-5.4-mini`. Legacy Codex ids like
+`gpt-5-codex` are NOT valid against the current app-server.
 
 ## npm Scripts
 

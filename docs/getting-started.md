@@ -1,7 +1,7 @@
 # Getting Started — From Zero to Running
 
 This guide walks through setting up a fully working PilotSwarm environment
-from scratch — the durable execution runtime for GitHub Copilot SDK agents.
+from scratch — the durable execution runtime for Copilot SDK and Codex-backed agents.
 
 If you want the fastest possible first-run path, start with the
 [Starter Docker Quickstart](./getting-started-docker-appliance.md) and come
@@ -10,9 +10,11 @@ back here when you want the full source-based setup.
 By the end you'll have:
 
 - A PostgreSQL database (local or Azure)
-- LLM access via model providers (GitHub Copilot, Azure OpenAI, or any OpenAI-compatible endpoint)
+- Worker-side LLM access through one of: GitHub Copilot, a Codex
+  subscription, Azure OpenAI, or another configured BYOK endpoint
 - A working `.env` and local `.model_providers.json` copied from `.model_providers.example.json`
-- The TUI running with embedded workers (local mode)
+- The TUI running with embedded workers for GitHub/BYOK local mode, or
+  client-only beside a dedicated Codex worker
 - Optionally: AKS workers + Azure Blob Storage for production
 
 ---
@@ -144,9 +146,14 @@ psql "$DATABASE_URL" -c "SELECT 1"
 
 ---
 
-## Step 3: Get a GitHub Token
+## Step 3: Choose Worker LLM Access
 
-The worker needs a GitHub Copilot token to call the LLM API.
+The worker needs one usable LLM path. The client does not need provider
+credentials.
+
+### Option A: GitHub Copilot
+
+Use a GitHub token for the `github-copilot` provider:
 
 ```bash
 # Login if not already
@@ -159,13 +166,31 @@ gh auth token
 This prints a `ghu_...` token. The runtime refreshes it automatically via `gh auth token`
 in `run.sh`, so you don't need to worry about expiry for local dev.
 
+### Option B: BYOK
+
+Configure an Azure OpenAI, Anthropic, or other supported provider in
+`.model_providers.json`, then set only the API key variables referenced by that
+provider. The checked-in Azure OpenAI example uses `AZURE_OAI_KEY`.
+
+### Option C: Codex Subscription
+
+Install and authenticate the Codex CLI as the worker operating-system user.
+Codex subscription mode uses `CODEX_HOME` login state and requires no API key.
+The detailed setup is in [Codex Runtime](./codex-runtime.md).
+
 ---
 
 ## Step 4: Create Your `.env` File
 
-PilotSwarm uses the local `.model_providers.json` for LLM configuration and `.env` for secrets (API keys, database URL). The repo checks in `.model_providers.example.json` as the template so personal endpoint URLs can stay out of git.
+PilotSwarm uses the local `.model_providers.json` for LLM configuration and
+`.env` for the database URL, provider keys, and runtime paths. The repo checks
+in `.model_providers.example.json` as the template so personal endpoint URLs
+can stay out of git.
 
 > **Easiest way to get started:** Set `GITHUB_TOKEN` — this gives you access to all models available through GitHub Copilot (Claude, GPT-4.1, etc.) with no additional setup. You can add BYOK providers later.
+
+Codex subscription users can instead install and authenticate the Codex CLI on
+the worker. See [Codex Runtime](./codex-runtime.md).
 
 ### For local PostgreSQL
 
@@ -188,11 +213,30 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/durable_copilot
 GITHUB_TOKEN=ghu_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # Option B: Azure OpenAI / BYOK (no GitHub subscription needed)
-AZURE_OPENAI_KEY=your-azure-openai-key
+AZURE_OAI_KEY=your-azure-openai-key
 # Add more provider keys as needed — see .model_providers.json
 ```
 
-> **Note:** You only need credentials for the providers you want to use. Providers without valid API keys are automatically hidden from the model picker and agent tools.
+> **Note:** You only need credentials for the providers you want to use.
+> API-key providers without valid keys are hidden from the model picker and
+> agent tools. Codex uses worker-side CLI login instead; a configured model may
+> be visible before login, but turns fail until the worker is authenticated.
+
+### Option C: Codex Subscription
+
+Codex authentication is managed by the Codex CLI rather than `.env`:
+
+```bash
+npm install -g @openai/codex@0.145.0
+codex login                    # workstation
+# codex login --device-auth    # headless worker
+chmod 700 ~/.codex
+```
+
+Keep the `codex-subscription` block from `.model_providers.example.json`, set
+`CODEX_HOME` and `CODEX_BINARY_PATH`, then select a qualified model such as
+`codex-subscription:gpt-5.6-sol`. See
+[Codex Runtime](./codex-runtime.md) for production and VM guidance.
 
 ### For Azure PostgreSQL
 
@@ -203,9 +247,14 @@ cat > .env.remote << 'EOF'
 # Required
 DATABASE_URL=postgresql://copilotadmin:<password>@my-copilot-pg.postgres.database.azure.com:5432/postgres?sslmode=require
 
-# LLM provider keys (at least one required)
+# Choose one worker LLM path. GitHub-provider example:
 GITHUB_TOKEN=ghu_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-# AZURE_OPENAI_KEY=your-azure-openai-key
+# Or BYOK:
+# AZURE_OAI_KEY=your-azure-openai-key
+# Or worker-side Codex login (no API key):
+# CODEX_HOME=/home/<service-user>/.codex
+# CODEX_BINARY_PATH=/path/to/codex
+# PS_MODEL_PROVIDERS_PATH=/etc/<service-name>/model_providers.json
 
 # Optional — Azure Blob Storage for session dehydration (multi-node)
 # AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=...
@@ -245,6 +294,21 @@ node packages/cli/bin/tui.js local --env .env
 # or
 node packages/cli/bin/tui.js local --env .env.remote
 ```
+
+For a Codex subscription, do not let the default local TUI start multiple
+workers against one `CODEX_HOME`. Start one dedicated worker and keep the TUI
+client-only:
+
+```bash
+# Terminal 1
+node --env-file=.env packages/sdk/examples/worker.js
+
+# Terminal 2
+WORKERS=0 node packages/cli/bin/tui.js local --env .env --workers 0
+```
+
+Every custom tool requested by a Codex session must be registered on the
+dedicated worker. See [Codex Runtime](./codex-runtime.md#concurrency-and-deployment-topology).
 
 You should see the TUI with:
 
@@ -337,7 +401,8 @@ export ACR_NAME=mycopilotacr
 Or step by step:
 
 ```bash
-# 1. Create namespace + secrets
+# 1. Create namespace + secrets.
+# This example uses GitHub Copilot; substitute the keys for your BYOK provider.
 kubectl apply -f deploy/k8s/namespace.yaml
 
 kubectl create secret generic copilot-runtime-secrets \
@@ -370,8 +435,9 @@ kubectl get pods -n copilot-runtime -l app.kubernetes.io/component=worker
 node packages/cli/bin/tui.js remote --env .env.remote
 ```
 
-The TUI connects to the same PostgreSQL as the AKS workers. No `GITHUB_TOKEN`
-is needed on the client side because workers handle all LLM calls.
+The TUI connects to the same PostgreSQL as the AKS workers. No GitHub token,
+BYOK key, or Codex login is needed on the client side because workers handle
+all LLM calls.
 
 ---
 
@@ -453,7 +519,8 @@ TEAM_NS=copilot-alpha
 
 kubectl create namespace $TEAM_NS
 
-# Store secrets
+# Store secrets. This example uses GitHub Copilot; substitute the keys for
+# your BYOK provider.
 kubectl create secret generic copilot-runtime-secrets \
     -n $TEAM_NS \
     --from-literal=DATABASE_URL="postgresql://..." \
@@ -515,13 +582,18 @@ spec:
 # ─── Required ─────────────────────────────────────────────────────
 DATABASE_URL=postgresql://user:pass@host:5432/dbname
 
-# ─── LLM Provider Keys (at least one required) ───────────────────
-GITHUB_TOKEN=ghu_...                    # GitHub Copilot (easiest to get started)
-AZURE_OPENAI_KEY=...                    # Azure OpenAI
+# ─── Worker LLM Access (choose at least one path) ────────────────
+GITHUB_TOKEN=ghu_...                    # GitHub Copilot
+AZURE_OAI_KEY=...                       # Azure OpenAI / BYOK
 AZURE_MODEL_ROUTER_KEY=...              # Azure Model Router
 AZURE_FW_GLM5_KEY=...                   # Azure AI Services (GLM-5, etc.)
 AZURE_KIMI_K25_KEY=...                  # Azure AI Services (Kimi-K2.5, etc.)
 # Only set keys for providers you use. Others are auto-hidden.
+
+# Codex subscription mode needs no API key; configure these on the worker.
+CODEX_HOME=/home/<service-user>/.codex
+CODEX_BINARY_PATH=/path/to/codex
+PS_MODEL_PROVIDERS_PATH=/etc/<service-name>/model_providers.json
 
 # ─── Optional: Blob Storage (multi-node) ──────────────────────────
 AZURE_STORAGE_CONNECTION_STRING=...     # enables session dehydration
@@ -533,7 +605,8 @@ SYSTEM_MESSAGE="You are a helpful assistant."  # or path to .md file
 
 # ─── Optional: Plugin ─────────────────────────────────────────────
 PLUGIN_DIRS=./plugin                    # skills, agents, MCP config
-WORKER_MODULE=./my-worker.js            # custom worker module
+# Local TUI custom tools use --worker <module>. Headless workers
+# register handlers in worker code; WORKER_MODULE is not a public env key.
 
 # ─── Optional: AKS / K8s ──────────────────────────────────────────
 K8S_NAMESPACE=copilot-runtime               # for kubectl log streaming
